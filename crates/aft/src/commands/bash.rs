@@ -236,9 +236,25 @@ fn spawn_command(
     ctx: &AppContext,
 ) -> Result<ExecutionResult, String> {
     let started = Instant::now();
+    // Detach stdin from the child process. Without this, stdin is inherited
+    // from the AFT bridge process — and the AFT bridge's stdin is the NDJSON
+    // protocol pipe from OpenCode/Pi. If a child process tries to read from
+    // stdin (PowerShell `Read-Host`, git/npm credential prompts, package
+    // managers asking for confirmation, etc.), it would either:
+    //   (a) block waiting for input that never arrives — manifesting as a
+    //       bridge transport timeout (the symptom in issue #26 was a 65s
+    //       timeout on Windows bash);
+    //   (b) read bytes from the protocol pipe — desync the bridge or feed
+    //       random JSON command text into the child as user input.
+    //
+    // OpenCode's native bash does the equivalent (`stdin: "ignore"`).
+    // Background bash already null-detaches in
+    // `crates/aft/src/bash_background/registry.rs`; foreground bash was
+    // the asymmetric case that produced the issue #26 hang.
     let mut child = shell_command(command)
         .current_dir(workdir)
         .envs(env)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -285,10 +301,24 @@ fn spawn_command(
 
 #[cfg(windows)]
 fn shell_command(command: &str) -> Command {
+    // -NonInteractive is critical: it tells PowerShell that no human is at
+    // the console, so any cmdlet that would prompt (Read-Host, Get-Credential,
+    // PSGallery trust prompts, Install-Module confirmation, etc.) fails fast
+    // instead of hanging forever waiting for input. This mirrors OpenCode's
+    // native bash on Windows (packages/opencode/src/tool/bash.ts:283) and
+    // pairs with stdin=null in spawn_command above to fully detach the child
+    // from any input source.
+    //
+    // -ExecutionPolicy Bypass is intentional and not in OpenCode's flag set:
+    // it lets unsigned .ps1 scripts run, which AFT users routinely need for
+    // local dev scripts. The security tradeoff is acceptable because the
+    // bash command is already an explicit tool invocation chosen by the user
+    // or agent.
     let mut cmd = Command::new("powershell.exe");
     cmd.args([
         "-NoLogo",
         "-NoProfile",
+        "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
