@@ -39,11 +39,17 @@ fn count_occurrences(text: &str, needle: &str) -> usize {
 }
 
 fn file_result<'a>(resp: &'a Value, suffix: &str) -> &'a Value {
+    // Windows reports paths with backslashes (`src\one.ts`); normalize for
+    // suffix matching so the test stays platform-agnostic.
     resp["files"]
         .as_array()
         .expect("files array")
         .iter()
-        .find(|entry| entry["file"].as_str().expect("file path").ends_with(suffix))
+        .find(|entry| {
+            let path = entry["file"].as_str().expect("file path");
+            let normalized = path.replace('\\', "/");
+            normalized.ends_with(suffix)
+        })
         .unwrap_or_else(|| panic!("missing file result for suffix {suffix}: {resp:?}"))
 }
 

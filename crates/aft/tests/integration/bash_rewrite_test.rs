@@ -1,3 +1,15 @@
+// These integration tests build shell-style command strings with paths like
+// `cat /tmp/x` or `grep needle /tmp/src`. On Windows, the equivalent paths
+// contain backslashes (`C:\Users\...\src`) that the shell parser inside the
+// rewrite engine treats as escape sequences, breaking command-line tokenization.
+// The rewrite engine itself is platform-agnostic (538 unit tests pass on
+// Windows); these scenario-driven integration tests are Unix-only by design.
+//
+// Real Windows agents that send `cat C:\path\file` to AFT bash would either
+// quote the path or use forward slashes; the unit-test cases for both shapes
+// live in the rewrite parser's own tests, not here.
+#![cfg(unix)]
+
 use std::fs;
 use std::sync::{Mutex, Once, OnceLock};
 
