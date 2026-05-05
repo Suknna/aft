@@ -2,7 +2,15 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { error, getLogFilePath, log, sessionWarn, warn } from "./active-logger.js";
+import {
+  error,
+  getLogFilePath,
+  log,
+  sessionError,
+  sessionLog,
+  sessionWarn,
+  warn,
+} from "./active-logger.js";
 import type { BgCompletion } from "./protocol.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
@@ -281,16 +289,21 @@ export class BinaryBridge {
       throw new Error("params cannot contain reserved key 'id'");
     }
 
-    this.ensureSpawned();
-
-    // Capture session_id early so auto-configure can reuse the initiating
-    // session's notification client when the deferred configure warning frame
-    // arrives later. One project bridge can serve many sessions, so keep this
-    // per-session instead of one bridge-wide "last client".
+    // Capture session_id BEFORE ensureSpawned so the spawn-time log line gets
+    // tagged with the triggering session. Bridges are project-keyed and serve
+    // many sessions over their lifetime, but the spawn itself is attributable
+    // to whichever session's tool call triggered it.
     const requestSessionId =
       typeof params.session_id === "string" && params.session_id.length > 0
         ? params.session_id
         : undefined;
+
+    this.ensureSpawned(requestSessionId);
+
+    // Auto-configure can reuse the initiating session's notification client
+    // when the deferred configure warning frame arrives later. One project
+    // bridge can serve many sessions, so keep this per-session instead of one
+    // bridge-wide "last client".
     if (requestSessionId && options?.configureWarningClient !== undefined) {
       this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
     }
@@ -400,7 +413,7 @@ export class BinaryBridge {
         // its own timeout on the Rust side and shouldn't lose warm bridge
         // state when its response is merely late).
         if (!keepBridgeOnTimeout) {
-          this.handleTimeout();
+          this.handleTimeout(requestSessionId);
         }
       }, effectiveTimeoutMs);
 
@@ -524,13 +537,17 @@ export class BinaryBridge {
     }
   }
 
-  private ensureSpawned(): void {
+  private ensureSpawned(triggeringSessionId?: string): void {
     if (this.isAlive()) return;
-    this.spawnProcess();
+    this.spawnProcess(triggeringSessionId);
   }
 
-  private spawnProcess(): void {
-    log(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+  private spawnProcess(triggeringSessionId?: string): void {
+    if (triggeringSessionId) {
+      sessionLog(triggeringSessionId, `Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+    } else {
+      log(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+    }
     const semantic = this.configOverrides.semantic;
     const semanticBackend = (() => {
       if (semantic && typeof semantic === "object" && !Array.isArray(semantic)) {
@@ -731,7 +748,7 @@ export class BinaryBridge {
     }
   }
 
-  private handleTimeout(): void {
+  private handleTimeout(triggeringSessionId?: string): void {
     // A single request timed out. Kill the hung process so the bridge can
     // respawn on the next call — but do NOT reject other pending requests
     // here (#21). Each pending request has its own timer and will reject
@@ -754,10 +771,19 @@ export class BinaryBridge {
     // rejection error. Clear the ring so the next spawn doesn't inherit it.
     const tail = this.formatStderrTail();
     this.stderrTail = [];
+    const killedMsg = tail
+      ? `Bridge killed after timeout.${tail}`
+      : `Bridge killed after timeout (see ${getLogFilePath()})`;
     if (tail) {
-      error(`Bridge killed after timeout.${tail}`);
+      if (triggeringSessionId) {
+        sessionError(triggeringSessionId, killedMsg);
+      } else {
+        error(killedMsg);
+      }
+    } else if (triggeringSessionId) {
+      sessionWarn(triggeringSessionId, killedMsg);
     } else {
-      warn(`Bridge killed after timeout (see ${getLogFilePath()})`);
+      warn(killedMsg);
     }
     // Peer requests are NOT rejected here. They will either:
     // 1. Resolve if the binary somehow still delivers their response (unlikely
