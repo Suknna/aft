@@ -2,6 +2,14 @@
 //!
 //! Mirrors OpenCode's resolver: prefer modern PowerShell (`pwsh.exe`), fall
 //! back to Windows PowerShell (`powershell.exe`), then to `cmd.exe`.
+//!
+//! Compiled on all platforms so the cross-platform retry-decision unit
+//! tests in `commands::bash::try_spawn_with_fallback` can run on macOS/Linux
+//! dev machines. Production callers (`commands::bash::spawn_shell_command`
+//! and `bash_background::registry::detached_shell_command_for`) are
+//! `#[cfg(windows)]`.
+
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::path::Path;
 use std::process::Command;
@@ -232,6 +240,11 @@ fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+// Used by `wrapper_script` for `WindowsShell::Cmd`; that wrapper is
+// only invoked from `bash_background::registry::detached_shell_command_for`
+// which is `#[cfg(windows)]`. The function compiles on all platforms so
+// `wrapper_script` stays cross-platform-testable.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn cmd_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }

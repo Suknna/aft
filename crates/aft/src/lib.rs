@@ -72,7 +72,10 @@ pub mod search_index;
 pub mod semantic_index;
 pub mod symbol_cache_disk;
 pub mod symbols;
-#[cfg(windows)]
+// Compiled on all platforms so cross-platform unit tests in
+// `commands::bash::try_spawn_with_fallback` can exercise the retry
+// decision logic without a real Windows runtime. The module itself only
+// uses portable APIs; only its callers are Windows-gated.
 pub mod windows_shell;
 
 #[cfg(test)]

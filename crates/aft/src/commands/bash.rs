@@ -349,9 +349,8 @@ fn spawn_shell_command(
 ) -> Result<std::process::Child, String> {
     use crate::windows_shell::shell_candidates;
     let candidates = shell_candidates();
-    let mut last_error: Option<String> = None;
-    for (idx, shell) in candidates.iter().enumerate() {
-        match shell
+    try_spawn_with_fallback(&candidates, |shell| {
+        shell
             .command(command)
             .current_dir(workdir)
             .envs(env)
@@ -359,7 +358,32 @@ fn spawn_shell_command(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-        {
+    })
+}
+
+/// Generic retry loop for the Windows shell-fallback path. Walks the
+/// `candidates` list, calling `try_one(shell)` for each; on `NotFound`
+/// continues to the next candidate, on success returns the child, on
+/// other errors returns immediately. Extracted from `spawn_shell_command`
+/// so tests can exercise the retry decision logic without a real
+/// `Command::spawn` (mock closures simulate per-shell outcomes).
+///
+/// `Child` is generic so tests can substitute a unit type or mock value;
+/// production callers always pass `std::process::Child`. Compiled on all
+/// platforms so the retry-decision unit tests can run on macOS/Linux dev
+/// machines, even though only the Windows `spawn_shell_command` body
+/// invokes it in production.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn try_spawn_with_fallback<C, F>(
+    candidates: &[crate::windows_shell::WindowsShell],
+    mut try_one: F,
+) -> Result<C, String>
+where
+    F: FnMut(&crate::windows_shell::WindowsShell) -> std::io::Result<C>,
+{
+    let mut last_error: Option<String> = None;
+    for (idx, shell) in candidates.iter().enumerate() {
+        match try_one(shell) {
             Ok(child) => {
                 if idx > 0 {
                     log::warn!(
@@ -624,5 +648,163 @@ mod tests {
         assert_eq!(WindowsShell::Pwsh.binary(), "pwsh.exe");
         assert_eq!(WindowsShell::Powershell.binary(), "powershell.exe");
         assert_eq!(WindowsShell::Cmd.binary(), "cmd.exe");
+    }
+
+    /// Issue #27 P2 test gap: foreground retry path. When the first
+    /// candidate returns NotFound at runtime spawn time, the loop must
+    /// move to the next candidate. The first SUCCESSFUL spawn wins.
+    /// Uses the generic `try_spawn_with_fallback` so the test runs on
+    /// macOS/Linux dev machines without a real Windows spawn.
+    #[test]
+    fn try_spawn_with_fallback_retries_on_notfound_until_success() {
+        use crate::windows_shell::WindowsShell;
+        use std::cell::RefCell;
+        use std::io::{Error, ErrorKind};
+
+        let candidates = [
+            WindowsShell::Pwsh,
+            WindowsShell::Powershell,
+            WindowsShell::Cmd,
+        ];
+        let attempts: RefCell<Vec<WindowsShell>> = RefCell::new(Vec::new());
+
+        let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |shell| {
+            attempts.borrow_mut().push(*shell);
+            match shell {
+                WindowsShell::Pwsh | WindowsShell::Powershell => {
+                    Err(Error::new(ErrorKind::NotFound, "blocked"))
+                }
+                WindowsShell::Cmd => Ok("ok-from-cmd"),
+            }
+        });
+
+        assert_eq!(result, Ok("ok-from-cmd"));
+        assert_eq!(
+            attempts.into_inner(),
+            vec![
+                WindowsShell::Pwsh,
+                WindowsShell::Powershell,
+                WindowsShell::Cmd,
+            ],
+            "retry loop must walk candidates in order until one succeeds"
+        );
+    }
+
+    /// Issue #27 P2 test gap: short-circuit on first success. When pwsh
+    /// spawns successfully, the loop must NOT call try_one for the
+    /// remaining candidates — that would waste resources and could double-
+    /// spawn shells.
+    #[test]
+    fn try_spawn_with_fallback_stops_at_first_success() {
+        use crate::windows_shell::WindowsShell;
+        use std::cell::RefCell;
+
+        let candidates = [
+            WindowsShell::Pwsh,
+            WindowsShell::Powershell,
+            WindowsShell::Cmd,
+        ];
+        let attempts: RefCell<usize> = RefCell::new(0);
+
+        let result: Result<u32, String> = try_spawn_with_fallback(&candidates, |_shell| {
+            *attempts.borrow_mut() += 1;
+            Ok(42)
+        });
+
+        assert_eq!(result, Ok(42));
+        assert_eq!(
+            attempts.into_inner(),
+            1,
+            "first success must short-circuit; later candidates not attempted"
+        );
+    }
+
+    /// Issue #27 P2 test gap: non-NotFound errors return immediately.
+    /// PermissionDenied, OutOfMemory, etc. are not remediated by trying a
+    /// different shell — those would just fail in the same way. Returning
+    /// early avoids wasted work and surfaces the real error.
+    #[test]
+    fn try_spawn_with_fallback_returns_immediately_on_non_notfound_error() {
+        use crate::windows_shell::WindowsShell;
+        use std::cell::RefCell;
+        use std::io::{Error, ErrorKind};
+
+        let candidates = [
+            WindowsShell::Pwsh,
+            WindowsShell::Powershell,
+            WindowsShell::Cmd,
+        ];
+        let attempts: RefCell<Vec<WindowsShell>> = RefCell::new(Vec::new());
+
+        let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |shell| {
+            attempts.borrow_mut().push(*shell);
+            Err(Error::new(ErrorKind::PermissionDenied, "denied by ACL"))
+        });
+
+        assert!(result.is_err(), "PermissionDenied must error out");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("pwsh.exe"),
+            "error must name the failing shell: {err}"
+        );
+        assert!(
+            err.contains("denied by ACL"),
+            "error must include underlying io error: {err}"
+        );
+        assert_eq!(
+            attempts.into_inner(),
+            vec![WindowsShell::Pwsh],
+            "non-NotFound must NOT retry with later candidates"
+        );
+    }
+
+    /// Issue #27 P2 test gap: all candidates fail with NotFound. This is
+    /// the worst case where no shell on the system is reachable — the
+    /// final error must include the candidate list so users debugging
+    /// issue #27-class problems can see what was attempted.
+    #[test]
+    fn try_spawn_with_fallback_reports_all_candidates_when_none_succeed() {
+        use crate::windows_shell::WindowsShell;
+        use std::io::{Error, ErrorKind};
+
+        let candidates = [WindowsShell::Pwsh, WindowsShell::Cmd];
+
+        let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |_shell| {
+            Err(Error::new(ErrorKind::NotFound, "no shell"))
+        });
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("pwsh.exe"),
+            "error must list pwsh.exe candidate: {err}"
+        );
+        assert!(
+            err.contains("cmd.exe"),
+            "error must list cmd.exe candidate: {err}"
+        );
+        assert!(
+            err.contains("no Windows shell could be spawned"),
+            "error message must indicate exhaustion: {err}"
+        );
+    }
+
+    /// Edge case: empty candidate list. Should return an error mentioning
+    /// "no candidates were attempted" rather than panic on empty iteration.
+    #[test]
+    fn try_spawn_with_fallback_handles_empty_candidates_list() {
+        use crate::windows_shell::WindowsShell;
+
+        let candidates: [WindowsShell; 0] = [];
+        let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |_shell| {
+            panic!("try_one must not be called for empty candidates")
+        });
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no candidates were attempted"),
+            "empty list must report no-attempt error: {err}"
+        );
     }
 }

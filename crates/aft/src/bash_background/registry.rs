@@ -164,19 +164,15 @@ impl BgTaskRegistry {
         write_task(&paths.json, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
 
-        let stdout = create_capture_file(&paths.stdout)
+        // Pre-create capture files so the watchdog/buffer can always
+        // open them for reading. The spawn helper opens its own handles
+        // per attempt because each `Command::spawn()` consumes them.
+        create_capture_file(&paths.stdout)
             .map_err(|e| format!("failed to create stdout capture file: {e}"))?;
-        let stderr = create_capture_file(&paths.stderr)
+        create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = detached_shell_command(command, &paths.exit)
-            .current_dir(&workdir)
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|e| format!("failed to spawn background bash command: {e}"))?;
+        let child = spawn_detached_child(command, &paths, &workdir, &env)?;
 
         let child_pid = child.id();
         metadata.mark_running(child_pid, child_pid as i32);
@@ -243,19 +239,17 @@ impl BgTaskRegistry {
         write_task(&paths.json, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
 
-        let stdout = create_capture_file(&paths.stdout)
+        // Capture files are pre-created so the watchdog/buffer can always
+        // open them for reading even if the child hasn't written anything
+        // yet. The spawn helper opens its own handles per attempt because
+        // each `Command::spawn()` consumes them, and on Windows we may
+        // retry across multiple shell candidates if the first one fails.
+        create_capture_file(&paths.stdout)
             .map_err(|e| format!("failed to create stdout capture file: {e}"))?;
-        let stderr = create_capture_file(&paths.stderr)
+        create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
 
-        let child = detached_shell_command(command, &paths.exit)
-            .current_dir(&workdir)
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|e| format!("failed to spawn background bash command: {e}"))?;
+        let child = spawn_detached_child(command, &paths, &workdir, &env)?;
 
         let child_pid = child.id();
         metadata.status = BgTaskStatus::Running;
@@ -950,8 +944,11 @@ fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
 }
 
 #[cfg(windows)]
-fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
-    let shell = resolve_windows_shell();
+fn detached_shell_command_for(
+    shell: crate::windows_shell::WindowsShell,
+    command: &str,
+    exit_path: &Path,
+) -> Command {
     let wrapper = shell.wrapper_script(command, exit_path);
     // bg_command() applies shell-specific invocation flags that the
     // wrapper relies on. For Cmd, this is `/V:ON` to enable delayed
@@ -965,6 +962,97 @@ fn detached_shell_command(command: &str, exit_path: &Path) -> Command {
     const DETACHED_BG_FLAGS: u32 = 0x0000_0200 | 0x0000_0008 | 0x0100_0000;
     cmd.creation_flags(DETACHED_BG_FLAGS);
     cmd
+}
+
+/// Spawn a detached background bash child process.
+///
+/// On Unix this is a single spawn against `/bin/sh`. On Windows it walks
+/// `WindowsShell::shell_candidates()` (pwsh.exe → powershell.exe →
+/// cmd.exe) and retries with the next candidate when the previous one
+/// fails to spawn with `NotFound` — the same runtime safety net the
+/// foreground bash path has, so issue #27 callers landing on cmd.exe
+/// fallback can also use background bash. The wrapper script is
+/// regenerated per attempt because PowerShell wrappers embed the shell
+/// binary by name; the stdout/stderr capture handles are also reopened
+/// per attempt because `Command::spawn()` consumes them.
+///
+/// Errors other than `NotFound` (PermissionDenied, OutOfMemory, etc.)
+/// return immediately without retry — they indicate a problem with the
+/// resolved shell that retrying with a different shell won't fix.
+fn spawn_detached_child(
+    command: &str,
+    paths: &TaskPaths,
+    workdir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<std::process::Child, String> {
+    #[cfg(not(windows))]
+    {
+        let stdout = create_capture_file(&paths.stdout)
+            .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
+        let stderr = create_capture_file(&paths.stderr)
+            .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
+        detached_shell_command(command, &paths.exit)
+            .current_dir(workdir)
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|e| format!("failed to spawn background bash command: {e}"))
+    }
+    #[cfg(windows)]
+    {
+        use crate::windows_shell::shell_candidates;
+        let candidates = shell_candidates();
+        let mut last_error: Option<String> = None;
+        for (idx, shell) in candidates.iter().enumerate() {
+            // Re-open capture handles per attempt; spawn() consumes them.
+            let stdout = create_capture_file(&paths.stdout)
+                .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
+            let stderr = create_capture_file(&paths.stderr)
+                .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
+            let mut cmd = detached_shell_command_for(*shell, command, &paths.exit);
+            cmd.current_dir(workdir)
+                .envs(env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            match cmd.spawn() {
+                Ok(child) => {
+                    if idx > 0 {
+                        log::warn!(
+                            "[aft] background bash spawn fell back to {} after {} earlier candidate(s) failed; \
+                             the cached PATH probe disagreed with runtime spawn — likely PATH \
+                             inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
+                            shell.binary(),
+                            idx
+                        );
+                    }
+                    return Ok(child);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::warn!(
+                        "[aft] background bash spawn: {} returned NotFound at runtime — trying next candidate",
+                        shell.binary()
+                    );
+                    last_error = Some(format!("{}: {e}", shell.binary()));
+                    continue;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "failed to spawn background bash command via {}: {e}",
+                        shell.binary()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "failed to spawn background bash command: no Windows shell could be spawned. \
+             Last error: {}. PATH-probed candidates: {:?}",
+            last_error.unwrap_or_else(|| "no candidates were attempted".to_string()),
+            candidates.iter().map(|s| s.binary()).collect::<Vec<_>>()
+        ))
+    }
 }
 
 fn random_slug() -> String {
@@ -1028,6 +1116,173 @@ mod tests {
         registry.cleanup_finished(Duration::ZERO);
 
         assert!(registry.inner.tasks.lock().unwrap().is_empty());
+    }
+
+    /// Issue #27 Oracle review P1 + P2 test gap: verify that the live
+    /// watchdog path (reap_child) marks a task Failed when the child
+    /// has exited but no exit marker was written. Before this fix the
+    /// task would remain `Running` until timeout, even though the
+    /// process was definitely dead.
+    ///
+    /// Cross-platform: uses a quick-exiting command that does NOT go
+    /// through the wrapper script (we manually clear the exit marker
+    /// after spawn to simulate the wrapper crashing before write).
+    #[test]
+    fn reap_child_marks_failed_when_child_exits_without_exit_marker() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+            )
+            .unwrap();
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        // Wait for the child to actually exit and the wrapper to either
+        // write the marker or fail. Then nuke the marker to simulate
+        // wrapper crash before write. Poll up to 5s; this is plenty for a
+        // `true`/`cmd /c exit 0` invocation.
+        let started = Instant::now();
+        loop {
+            let exited = {
+                let mut state = task.state.lock().unwrap();
+                if let Some(child) = state.child.as_mut() {
+                    matches!(child.try_wait(), Ok(Some(_)))
+                } else {
+                    true
+                }
+            };
+            if exited {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "child should exit quickly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Wrapper likely wrote the marker by now; remove it to simulate
+        // a wrapper crash that exited before persisting the exit code.
+        let _ = std::fs::remove_file(&task.paths.exit);
+
+        // Sanity: task is still Running per metadata (replay/poll hasn't
+        // observed the missing marker yet).
+        assert!(
+            task.is_running(),
+            "precondition: metadata.status == Running"
+        );
+        assert!(
+            !task.paths.exit.exists(),
+            "precondition: exit marker absent"
+        );
+
+        // Invoke the watchdog's reap_child directly. The fix should mark
+        // the task Failed with the documented reason string, instead of
+        // just dropping the child handle and leaving status=Running.
+        registry.reap_child(&task);
+
+        let state = task.state.lock().unwrap();
+        assert!(
+            state.metadata.status.is_terminal(),
+            "reap_child must transition to terminal when PID dead and no marker. \
+             Got status={:?}",
+            state.metadata.status
+        );
+        assert_eq!(
+            state.metadata.status,
+            BgTaskStatus::Failed,
+            "must specifically be Failed (not Killed): status={:?}",
+            state.metadata.status
+        );
+        assert_eq!(
+            state.metadata.status_reason.as_deref(),
+            Some("process exited without exit marker"),
+            "reason must match replay path's wording: {:?}",
+            state.metadata.status_reason
+        );
+        assert!(
+            state.child.is_none(),
+            "child handle must be released after reap"
+        );
+        assert!(state.detached, "task must be marked detached after reap");
+    }
+
+    /// Companion to the above: when the exit marker DOES exist on disk
+    /// at reap_child time (race window — wrapper finished writing
+    /// between try_wait and the marker check), reap_child must NOT mark
+    /// the task Failed. Instead it leaves status=Running and lets the
+    /// next poll_task() cycle finalize via the marker.
+    #[test]
+    fn reap_child_preserves_running_when_exit_marker_exists() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+            )
+            .unwrap();
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        // Wait for child to exit AND for the marker to land. Both happen
+        // shortly after the wrapper finishes — but we want both observed.
+        let started = Instant::now();
+        loop {
+            let exited = {
+                let mut state = task.state.lock().unwrap();
+                if let Some(child) = state.child.as_mut() {
+                    matches!(child.try_wait(), Ok(Some(_)))
+                } else {
+                    true
+                }
+            };
+            if exited && task.paths.exit.exists() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "child should exit and write marker quickly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // reap_child sees: child exited, marker exists. It should:
+        //  - drop state.child / set state.detached = true
+        //  - NOT change status (poll_task will finalize via marker next tick)
+        registry.reap_child(&task);
+
+        let state = task.state.lock().unwrap();
+        assert!(
+            state.child.is_none(),
+            "child handle still released even when marker exists"
+        );
+        assert!(
+            state.detached,
+            "task still marked detached even when marker exists"
+        );
+        // Status remains Running because reap_child defers to poll_task
+        // when a marker exists. It would be wrong for reap to record the
+        // marker outcome (poll_task does that with proper exit-code
+        // parsing).
+        assert_eq!(
+            state.metadata.status,
+            BgTaskStatus::Running,
+            "reap_child must defer to poll_task when marker exists"
+        );
     }
 
     #[test]
@@ -1205,6 +1460,72 @@ mod tests {
         assert!(
             args_strs.contains(&"Get-Date"),
             "Pwsh::bg_command must include the user command body"
+        );
+    }
+
+    /// Issue #27 Oracle review P1 + P2 test gap: end-to-end proof that the
+    /// **cmd.exe-specific** wrapper path captures the user command's
+    /// run-time exit code correctly. The existing
+    /// `windows_spawn_writes_exit_marker_for_nonzero_exit` test would also
+    /// pass with the buggy `%ERRORLEVEL%` wrapper if the Windows machine
+    /// had pwsh.exe or powershell.exe on PATH (which is typical) — the
+    /// outer wrapper would be PowerShell, not cmd, and PowerShell's
+    /// `$LASTEXITCODE` captures the inner `cmd /c exit 42` correctly.
+    ///
+    /// This test directly spawns via `WindowsShell::Cmd.bg_command()` to
+    /// force the cmd-wrapper code path, then writes the exit marker and
+    /// asserts it contains "42" not "0". With the pre-fix `%ERRORLEVEL%`
+    /// wrapper, this test would fail because `%ERRORLEVEL%` parse-time
+    /// expansion would record cmd's startup ERRORLEVEL (typically 0)
+    /// regardless of what the user command returned.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_wrapper_records_real_exit_code() {
+        use crate::windows_shell::WindowsShell;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("test.exit");
+        let stdout_path = dir.path().join("test.stdout");
+        let stderr_path = dir.path().join("test.stderr");
+
+        // Pre-create capture files so spawn can attach them as stdio.
+        create_capture_file(&stdout_path).unwrap();
+        create_capture_file(&stderr_path).unwrap();
+        let stdout = create_capture_file(&stdout_path).unwrap();
+        let stderr = create_capture_file(&stderr_path).unwrap();
+
+        let wrapper = WindowsShell::Cmd.wrapper_script("cmd /c exit 42", &exit_path);
+        let mut cmd = WindowsShell::Cmd.bg_command(&wrapper);
+        cmd.current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+
+        let mut child = cmd.spawn().expect("cmd.exe must spawn for this test");
+        child.wait().expect("child must complete");
+
+        // Wait for marker file (atomic rename).
+        let started = Instant::now();
+        loop {
+            if exit_path.exists() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "exit marker not written within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let content = fs::read_to_string(&exit_path).expect("read exit marker");
+        assert_eq!(
+            content.trim(),
+            "42",
+            "Cmd wrapper must capture user command's real exit code via !ERRORLEVEL!. \
+             Got {:?} (would be 0 if %ERRORLEVEL% parse-time expansion bug regressed)",
+            content
         );
     }
 }
