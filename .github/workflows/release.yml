@@ -65,13 +65,55 @@ jobs:
       - name: Build all JS packages (gate publish)
         run: bun run --filter '*' build
 
-  # Run the full E2E matrix (Linux Docker + Windows native) at release time.
-  # Reuses the same workflow tests.yml runs at PR time — single source of
-  # truth, so PR-time and release-time e2e can never drift. Build/publish
-  # jobs below `needs:` this job, so an e2e regression blocks the release.
+  # macOS unit-test gate — mirrors the Linux `test` job's cargo + plugin test
+  # coverage on a real macOS runner. The build-darwin-* jobs below only run
+  # `cargo build --release`, not `cargo test`, so this is the only place where
+  # macOS-specific code paths are actually exercised at release time:
+  #   - FSEvents watcher behavior (different coalescing latency from inotify)
+  #   - /var vs /private/var symlink canonicalization
+  #   - Broken-symlink-chain fallback in context.rs
+  #   - bash_background SIGTERM behavior on Apple Silicon
+  # Lint and `bun run --filter '*' build` only run in the Linux `test` job —
+  # they are platform-independent so duplicating them on macOS adds no signal.
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Install JS dependencies
+        run: bun install
+
+      - name: Build aft-bridge (consumers need its dist/ for typecheck)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: TypeScript typecheck
+        run: bun run typecheck
+
+      - name: Plugin tests
+        run: bun run test
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
+  # Run the full E2E matrix (Linux Docker + Windows native + macOS native) at
+  # release time. Reuses the same workflow tests.yml runs at PR time — single
+  # source of truth, so PR-time and release-time e2e can never drift.
+  # Build/publish jobs below `needs:` this job, so an e2e regression blocks
+  # the release.
   e2e:
     name: E2E
-    needs: [test]
+    needs: [test, test-macos]
     uses: ./.github/workflows/_e2e-suite.yml
 
   publish-crates:

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-# E2E test: AFT plugin running inside OpenCode on Linux x64
+# E2E test: AFT plugin running inside OpenCode.
+#
+# Used by both:
+#   - tests/docker/Dockerfile.linux-x64 (Linux Docker E2E in CI)
+#   - tests/macos-e2e/run.sh             (macOS native E2E in CI)
 #
 # Uses aimock for deterministic OpenAI-compatible mock LLM.
 # Simulates a realistic multi-turn agent session that exercises:
@@ -11,6 +15,14 @@
 #
 # Each scenario runs a full OpenCode session with 8 tool call turns,
 # giving background threads enough time to build indices.
+#
+# Platform-specific behavior is controlled by the AFT_E2E_PLATFORM env
+# var (defaults to "linux"):
+#   AFT_E2E_PLATFORM=linux  →  fake libonnxruntime.so in /usr/local/lib
+#   AFT_E2E_PLATFORM=macos  →  fake libonnxruntime.dylib in /tmp
+# Each platform's runner script is responsible for installing OpenCode,
+# Bun, aimock, writing configs, and placing the AFT binary + plugin
+# before invoking this script.
 # ------------------------------------------------------------------
 
 set -euo pipefail
@@ -22,7 +34,28 @@ NC='\033[0m'
 
 PASS=0
 FAIL=0
-PLUGIN_LOG="/tmp/aft-plugin.log"
+PLUGIN_LOG="${AFT_E2E_PLUGIN_LOG:-/tmp/aft-plugin.log}"
+PLATFORM="${AFT_E2E_PLATFORM:-linux}"
+
+# Platform-specific paths for the broken-ONNX scenario.
+case "$PLATFORM" in
+    linux)
+        FAKE_ORT_PATH="/usr/local/lib/libonnxruntime.so"
+        PLATFORM_DISPLAY="Linux x64 (Debian)"
+        ;;
+    macos)
+        # /tmp on macOS is a symlink to /private/tmp; we use a path the
+        # plugin can find via DYLD_LIBRARY_PATH or the AFT-managed cache.
+        # We don't drop into /usr/local/lib because SIP-protected paths
+        # need root, and macOS GH Actions runners don't grant it.
+        FAKE_ORT_PATH="${RUNNER_TEMP:-/tmp}/libonnxruntime.dylib"
+        PLATFORM_DISPLAY="macOS native"
+        ;;
+    *)
+        echo "Unknown AFT_E2E_PLATFORM: $PLATFORM (expected linux|macos)" >&2
+        exit 2
+        ;;
+esac
 
 check() {
     local label="$1"
@@ -49,8 +82,13 @@ warn_check() {
     fi
 }
 
+# AFT_E2E_MOCK_SERVER points to the mock-server.js entry. The Docker setup
+# places it at /test/mock-server.js; the macOS runner places it relative to
+# the repo checkout. Both wire this through env so we don't hardcode paths.
+MOCK_SERVER="${AFT_E2E_MOCK_SERVER:-/test/mock-server.js}"
+
 start_aimock() {
-    node /test/mock-server.js > /tmp/aimock.log 2>&1 &
+    node "$MOCK_SERVER" > /tmp/aimock.log 2>&1 &
     AIMOCK_PID=$!
     for i in $(seq 1 15); do
         if curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1; then
@@ -92,7 +130,7 @@ run_opencode_session() {
 }
 
 echo "════════════════════════════════════════"
-echo "  AFT E2E Test — Linux x64 (Debian)"
+echo "  AFT E2E Test — $PLATFORM_DISPLAY"
 echo "════════════════════════════════════════"
 echo ""
 
@@ -181,45 +219,60 @@ cat /tmp/aimock.log 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 stop_aimock
 
 # ══════════════════════════════════════════════════════════════════
-# Scenario 2: Broken libonnxruntime.so (reproduces issue #4)
-# A fake .so in /usr/local/lib that the plugin detects and sets
-# as ORT_DYLIB_PATH — the binary should NOT crash when loading it.
+# Scenario 2: Broken ONNX Runtime library (reproduces issue #4)
+# A fake shared library that the plugin detects and sets as
+# ORT_DYLIB_PATH — the binary should NOT crash when loading it.
+# Library suffix and path differ per platform; FAKE_ORT_PATH was
+# resolved at the top of the script.
 # ══════════════════════════════════════════════════════════════════
 
 echo ""
-echo "── Scenario 2: Broken libonnxruntime.so (issue #4) ──"
+echo "── Scenario 2: Broken ONNX Runtime library (issue #4) ──"
 echo ""
 
-# Install fake broken .so
-echo "not a real shared library" > /usr/local/lib/libonnxruntime.so
-chmod 755 /usr/local/lib/libonnxruntime.so
-echo "  Installed fake libonnxruntime.so in /usr/local/lib"
+# Install fake broken library at $FAKE_ORT_PATH (linux: /usr/local/lib/libonnxruntime.so,
+# macos: $RUNNER_TEMP/libonnxruntime.dylib).
+echo "not a real shared library" > "$FAKE_ORT_PATH"
+chmod 755 "$FAKE_ORT_PATH"
+echo "  Installed fake $(basename "$FAKE_ORT_PATH") at $FAKE_ORT_PATH"
 
 rm -f "$PLUGIN_LOG"
 
 start_aimock
 check "aimock started (s2)" "curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1"
 
-echo "Running session with broken .so..."
+echo "Running session with broken library..."
 RESULT_FILE="/tmp/result-scenario2.txt"
-run_opencode_session \
-    "Read the file src/main.py and then grep for all function definitions." \
-    "$RESULT_FILE" \
+# On macOS, the AFT plugin probes a fixed list of system paths
+# (/usr/local/lib, /opt/homebrew/lib) for libonnxruntime.dylib. Since
+# we cannot write into /usr/local/lib on a vanilla GH Actions runner
+# without sudo, we point ORT_DYLIB_PATH directly at our fake instead.
+# Linux scenario keeps the implicit /usr/local/lib detection path.
+if [ "$PLATFORM" = "macos" ]; then
+    ORT_DYLIB_PATH="$FAKE_ORT_PATH" \
+    run_opencode_session \
+        "Read the file src/main.py and then grep for all function definitions." \
+        "$RESULT_FILE"
+else
+    run_opencode_session \
+        "Read the file src/main.py and then grep for all function definitions." \
+        "$RESULT_FILE"
+fi
 
 EXIT_CODE=$?
 
-check "session completed (broken .so)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
-warn_check "no crash (broken .so)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
-check "no plugin crash (broken .so)" "! grep -qi 'SIGABRT\|thread.*panicked' '$PLUGIN_LOG' 2>/dev/null"
+check "session completed (broken lib)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+warn_check "no crash (broken lib)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+check "no plugin crash (broken lib)" "! grep -qi 'SIGABRT\|thread.*panicked' '$PLUGIN_LOG' 2>/dev/null"
 
-# Verify the plugin detected the system .so
+# Verify the plugin detected the system library
 warn_check "system ORT detected" "grep -q 'ONNX Runtime found at system path\|ORT_DYLIB_PATH' '$PLUGIN_LOG' 2>/dev/null"
 
 echo ""
 echo "  Plugin log (last 30 lines):"
 tail -30 "$PLUGIN_LOG" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 
-rm -f /usr/local/lib/libonnxruntime.so
+rm -f "$FAKE_ORT_PATH"
 stop_aimock
 
 # ══════════════════════════════════════════════════════════════════

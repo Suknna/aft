@@ -92,6 +92,50 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
 
   # ---------------------------------------------------------------------------
+  # Rust + plugin tests on macOS
+  # Catches macOS-specific code paths: FSEvents watcher behavior (different
+  # coalescing latency from inotify), /var vs /private/var symlink
+  # canonicalization, broken-symlink-chain fallback, bash_background SIGTERM
+  # behavior, and Apple Silicon-specific Rust compilation. The build-darwin-*
+  # jobs in release.yml only run `cargo build` — this is the only place we
+  # actually execute tests on macOS in CI.
+  # ---------------------------------------------------------------------------
+  rust-macos:
+    name: Unit tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Cargo build (debug — needed by plugin e2e tests)
+        run: cargo build -p agent-file-tools
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun test (all packages)
+        run: bun run test
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
+  # ---------------------------------------------------------------------------
   # Rust integration tests on Windows
   # Catches platform-conditional code paths (#[cfg(target_os = "windows")])
   # and Windows process/path/signal differences. Same suite as Linux but on a

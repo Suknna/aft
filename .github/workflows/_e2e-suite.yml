@@ -1,8 +1,9 @@
 name: E2E Suite
 
 # Reusable workflow that runs the full E2E test matrix:
-#   - Linux Docker e2e — OpenCode + plugin + binary stack against aimock
-#   - Windows native e2e — same stack on real Windows runner (no containers)
+#   - Linux Docker e2e   — OpenCode + plugin + binary stack against aimock
+#   - macOS native e2e   — same stack on a real macOS-arm64 runner
+#   - Windows native e2e — same stack on a real Windows runner (no containers)
 #
 # Called from:
 #   - tests.yml (PR + main push) — catches regressions at PR time
@@ -13,9 +14,10 @@ name: E2E Suite
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
 # locking, or platform-conditional code paths SHOULD touch the matching
 # integration test or e2e scenario here. The Linux harness has caught real
-# regressions before; the Windows e2e is here to extend that coverage to
-# issue-#26-class Windows-specific bugs (bash timeouts, lock recovery, path
-# separators).
+# regressions before; the Windows e2e covers issue-#26-class Windows-specific
+# bugs (bash timeouts, lock recovery, path separators); the macOS e2e covers
+# FSEvents watcher behavior, /var vs /private/var symlink canonicalization,
+# .dylib loading paths for ONNX, and Apple Silicon native codegen for aft.
 
 on:
   workflow_call:
@@ -114,3 +116,45 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
+
+  # ---------------------------------------------------------------------------
+  # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
+  # a real macOS-arm64 runner. No containers (GH Actions macOS runners can't
+  # run Docker reliably). Uses the same shared bash harness as Linux Docker
+  # via tests/macos-e2e/run.sh, which sets up host deps natively and then
+  # invokes tests/docker/test-e2e.sh with AFT_E2E_PLATFORM=macos.
+  #
+  # Catches: FSEvents watcher behavior, /var vs /private/var canonicalization,
+  # broken-symlink-chain fallback, .dylib loading, and Apple Silicon codegen.
+  # ---------------------------------------------------------------------------
+  e2e-macos:
+    name: E2E (macOS native)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (macOS native)
+        run: cargo build --release -p agent-file-tools
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+
+      - name: Build OpenCode plugin dist
+        run: bun run --cwd packages/opencode-plugin build
+
+      - name: Run macOS E2E suite
+        run: bash tests/macos-e2e/run.sh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
+          AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
