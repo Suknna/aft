@@ -120,10 +120,26 @@ Write-Host ""
 
 Write-Host "-- Installing OpenCode + aimock --"
 
-# OpenCode via npm (the docs explicitly support this on Windows).
-& npm install -g opencode-ai 2>&1 | Out-Null
+# OpenCode via npm (the docs explicitly support this on Windows). Pin the
+# version through .github/opencode-version.txt so all three E2E harnesses
+# (Linux Docker, macOS native, Windows native) exercise the same OpenCode
+# release. The weekly bump-opencode.yml workflow auto-bumps this pin via
+# PR so we don't drift behind upstream over time.
+$RepoRoot = Resolve-Path "$PSScriptRoot\..\.."
+$OpencodeVersionFile = Join-Path $RepoRoot ".github\opencode-version.txt"
+if (-not (Test-Path $OpencodeVersionFile)) {
+    Write-Host "Missing pin file: $OpencodeVersionFile" -ForegroundColor Red
+    exit 2
+}
+$OpencodeVersion = (Get-Content $OpencodeVersionFile -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($OpencodeVersion)) {
+    Write-Host "Empty pin file: $OpencodeVersionFile" -ForegroundColor Red
+    exit 2
+}
+Write-Host "Installing opencode-ai@$OpencodeVersion"
+& npm install -g "opencode-ai@$OpencodeVersion" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Failed to install opencode-ai via npm" -ForegroundColor Red
+    Write-Host "Failed to install opencode-ai@$OpencodeVersion via npm" -ForegroundColor Red
     exit 2
 }
 

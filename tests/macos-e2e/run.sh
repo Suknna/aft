@@ -51,14 +51,22 @@ echo "  AFT binary:   $AFT_BINARY_PATH"
 echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 
 # ---- Install OpenCode ------------------------------------------------------
-# Pin to a known-good version. The OpenCode installer's `latest` resolution
-# hits api.github.com anonymously, which is rate-limited to 60 req/hr per
-# egress IP — and macOS GH Actions runners share egress, so concurrent runs
-# (or repeated re-runs) hit the limit and the installer prints
-# "Failed to fetch version information" then exits 1. Pinning sidesteps the
-# probe entirely. Bump alongside the Linux Docker image so both harnesses
-# exercise the same OpenCode version.
-OPENCODE_VERSION="${OPENCODE_VERSION:-1.14.39}"
+# Single source of truth: .github/opencode-version.txt. All three E2E
+# harnesses (Linux Docker, macOS native, Windows native) read from this
+# file so PR-time CI cannot drift between platforms. The weekly
+# .github/workflows/bump-opencode.yml job opens a PR when upstream
+# OpenCode releases a new version, so the pin auto-refreshes with full
+# CI validation before merge.
+#
+# Why pinning is necessary on macOS specifically: the installer's
+# `latest` resolution hits api.github.com anonymously, and macOS GH
+# Actions runners share egress IPs that frequently exhaust the
+# 60 req/hr anonymous rate limit. Pinning sidesteps the probe entirely.
+OPENCODE_VERSION="${OPENCODE_VERSION:-$(cat "$REPO_ROOT/.github/opencode-version.txt" | tr -d '[:space:]')}"
+if [ -z "$OPENCODE_VERSION" ]; then
+    echo "Could not read OpenCode version from .github/opencode-version.txt" >&2
+    exit 2
+fi
 echo "── Installing OpenCode v${OPENCODE_VERSION} ──"
 curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
 export PATH="$HOME/.opencode/bin:$PATH"

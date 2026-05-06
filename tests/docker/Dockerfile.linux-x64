@@ -17,8 +17,19 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
-# Install OpenCode (standalone binary via install script)
-RUN curl -fsSL https://opencode.ai/install | bash
+# Install OpenCode at the version pinned by .github/opencode-version.txt.
+# The build context's pin file is COPY'd in and the value is passed via ARG
+# so all three E2E harnesses (Linux Docker, macOS native, Windows native)
+# share one source of truth. Bumps go through the auto-PR opened by
+# .github/workflows/bump-opencode.yml so a bad upstream release fails CI
+# on the PR before merge.
+ARG OPENCODE_VERSION
+COPY .github/opencode-version.txt /tmp/opencode-version.txt
+RUN OPENCODE_VERSION="${OPENCODE_VERSION:-$(tr -d '[:space:]' < /tmp/opencode-version.txt)}" && \
+    if [ -z "$OPENCODE_VERSION" ]; then echo "OPENCODE_VERSION must be set" >&2; exit 1; fi && \
+    echo "Installing OpenCode v${OPENCODE_VERSION}" && \
+    curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION" && \
+    rm /tmp/opencode-version.txt
 ENV PATH="/root/.opencode/bin:$PATH"
 
 # Install aimock globally
