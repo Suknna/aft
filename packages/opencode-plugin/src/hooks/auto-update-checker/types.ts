@@ -25,6 +25,24 @@ export interface AutoUpdateCheckerOptions {
   npmRegistryUrl?: string;
   fetchTimeoutMs?: number;
   signal?: AbortSignal;
+  /**
+   * Plugin-storage directory for the on-disk last-checked timestamp.
+   * Multi-project plugin reloads coordinate through this file so npm
+   * is hit at most once per `checkIntervalMs` window across all
+   * concurrent plugin instances on the same machine.
+   */
+  storageDir?: string;
+  /**
+   * Minimum time between npm registry checks across all plugin
+   * instances. Honored via the on-disk timestamp file. Default: 1 hour.
+   */
+  checkIntervalMs?: number;
+  /**
+   * Delay before the first check after plugin init. Default: 5s — gives
+   * OpenCode time to finish its own startup work and avoids racing TUI
+   * boot.
+   */
+  initDelayMs?: number;
 }
 
 export interface PluginEntryInfo {

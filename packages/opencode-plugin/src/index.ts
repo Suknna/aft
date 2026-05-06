@@ -765,6 +765,10 @@ const plugin: Plugin = async (input) => {
     enabled: true,
     autoUpdate: aftConfig.auto_update ?? true,
     signal: autoUpdateAbort.signal,
+    // Multi-project plugin reloads coordinate via this on-disk timestamp
+    // so the npm registry is hit at most once per check window across
+    // every concurrent plugin instance on the machine.
+    storageDir: ctx.storageDir,
   });
 
   // Workflow hints: short system-prompt block teaching token-efficient

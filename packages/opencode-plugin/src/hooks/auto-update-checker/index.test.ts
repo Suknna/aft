@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const logMock = mock(() => {});
 const warnMock = mock(() => {});
@@ -53,8 +56,11 @@ async function waitForCalls(fn: { mock: { calls: unknown[] } }, minCalls = 1): P
   }
 }
 
+let testStorageDir: string;
+
 describe("auto-update-checker/index", () => {
   beforeEach(() => {
+    testStorageDir = mkdtempSync(join(tmpdir(), "aft-update-test-"));
     logMock.mockClear();
     warnMock.mockClear();
 
@@ -94,10 +100,10 @@ describe("auto-update-checker/index", () => {
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-    );
-    await hook({ event: { type: "session.created", properties: {} } });
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
     await waitForCalls(showToast);
 
     expect(showToast).toHaveBeenCalledWith({
@@ -112,24 +118,93 @@ describe("auto-update-checker/index", () => {
     expect(checkerMocks.getLatestVersion).not.toHaveBeenCalled();
   });
 
-  test("runs once for root session and ignores child sessions", async () => {
+  test("event hook is a no-op (does not trigger duplicate checks)", async () => {
     checkerMocks.getLocalDevVersion.mockImplementation(() => "0.17.2-dev");
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
+
     const hook = createAutoUpdateCheckerHook(
       ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
+      { storageDir: testStorageDir, initDelayMs: 0 },
     );
-
-    await hook({
-      event: { type: "session.created", properties: { info: { parentID: "parent" } } },
-    });
-    expect(showToast).not.toHaveBeenCalled();
-
-    await hook({ event: { type: "session.created", properties: { info: {} } } });
     await waitForCalls(showToast);
+    expect(showToast).toHaveBeenCalledTimes(1);
+
+    // Firing events afterwards should not trigger any additional checks.
     await hook({ event: { type: "session.created", properties: { info: {} } } });
+    await hook({ event: { type: "session.idle", properties: { info: {} } } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(showToast).toHaveBeenCalledTimes(1);
+  });
+
+  test("disabled hook never schedules a check", async () => {
+    checkerMocks.getLocalDevVersion.mockImplementation(() => "0.17.2-dev");
+    const { createAutoUpdateCheckerHook } = await freshIndexImport();
+    const { ctx, showToast } = createCtx();
+
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      enabled: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  test("on-disk timestamp dedupes concurrent plugin instances", async () => {
+    checkerMocks.getLocalDevVersion.mockImplementation(() => "0.17.2-dev");
+    const { createAutoUpdateCheckerHook } = await freshIndexImport();
+    const { ctx: ctx1, showToast: showToast1 } = createCtx();
+    const { ctx: ctx2, showToast: showToast2 } = createCtx();
+
+    // First instance claims the slot and runs the check.
+    createAutoUpdateCheckerHook(ctx1 as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
+    await waitForCalls(showToast1);
+    expect(showToast1).toHaveBeenCalledTimes(1);
+
+    // Second instance, same storageDir, fired immediately afterwards
+    // sees the recent timestamp and skips its check entirely.
+    createAutoUpdateCheckerHook(ctx2 as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(showToast2).not.toHaveBeenCalled();
+  });
+
+  test("expired timestamp allows a new check to run", async () => {
+    checkerMocks.getLocalDevVersion.mockImplementation(() => "0.17.2-dev");
+    const { createAutoUpdateCheckerHook } = await freshIndexImport();
+    const { ctx, showToast } = createCtx();
+
+    // Pre-write a stale timestamp (2 hours ago) into the dedup file.
+    const stale = Date.now() - 2 * 60 * 60 * 1000;
+    writeFileSync(
+      join(testStorageDir, "last-update-check.json"),
+      JSON.stringify({ lastCheckedMs: stale }),
+      "utf-8",
+    );
+
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      storageDir: testStorageDir,
+      checkIntervalMs: 60 * 60 * 1000, // 1h interval
+      initDelayMs: 0,
+    });
+    await waitForCalls(showToast);
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+
+    // Verify the timestamp file was updated to a recent value.
+    const after = JSON.parse(
+      readFileSync(join(testStorageDir, "last-update-check.json"), "utf-8"),
+    ) as { lastCheckedMs: number };
+    expect(after.lastCheckedMs).toBeGreaterThan(stale);
   });
 
   test("shows success toast after updating the active install root", async () => {
@@ -144,14 +219,12 @@ describe("auto-update-checker/index", () => {
 
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-      {
-        showStartupToast: false,
-      },
-    );
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      showStartupToast: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
 
-    await hook({ event: { type: "session.created", properties: {} } });
     await waitForCalls(showToast);
 
     expect(cacheMocks.preparePackageUpdate).toHaveBeenCalledWith(
@@ -184,14 +257,12 @@ describe("auto-update-checker/index", () => {
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-      {
-        showStartupToast: false,
-        autoUpdate: false,
-      },
-    );
-    await hook({ event: { type: "session.created", properties: {} } });
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      showStartupToast: false,
+      autoUpdate: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
     await waitForCalls(showToast);
 
     expect(showToast).toHaveBeenCalledWith({
@@ -218,13 +289,11 @@ describe("auto-update-checker/index", () => {
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-      {
-        showStartupToast: false,
-      },
-    );
-    await hook({ event: { type: "session.created", properties: {} } });
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      showStartupToast: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
     await waitForCalls(showToast);
 
     expect(showToast).toHaveBeenCalledWith({
@@ -251,13 +320,11 @@ describe("auto-update-checker/index", () => {
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-      {
-        showStartupToast: false,
-      },
-    );
-    await hook({ event: { type: "session.created", properties: {} } });
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      showStartupToast: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
     await waitForCalls(showToast);
 
     expect(showToast).toHaveBeenCalledWith({
@@ -284,13 +351,11 @@ describe("auto-update-checker/index", () => {
     const { createAutoUpdateCheckerHook } = await freshIndexImport();
     const { ctx, showToast } = createCtx();
 
-    const hook = createAutoUpdateCheckerHook(
-      ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
-      {
-        showStartupToast: false,
-      },
-    );
-    await hook({ event: { type: "session.created", properties: {} } });
+    createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+      showStartupToast: false,
+      storageDir: testStorageDir,
+      initDelayMs: 0,
+    });
     await waitForCalls(showToast);
 
     expect(showToast).toHaveBeenCalledWith({

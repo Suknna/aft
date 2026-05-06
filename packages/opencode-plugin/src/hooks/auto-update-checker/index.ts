@@ -1,3 +1,5 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import { log, warn } from "../../logger.js";
@@ -19,8 +21,42 @@ type OpenCodeEvent = {
 
 type ToastVariant = "info" | "warning" | "error" | "success";
 
-type ResolvedAutoUpdateCheckerOptions = Required<Omit<AutoUpdateCheckerOptions, "enabled">>;
+type ResolvedAutoUpdateCheckerOptions = Required<
+  Omit<AutoUpdateCheckerOptions, "enabled" | "storageDir">
+> & { storageDir: string | null };
 
+const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_INIT_DELAY_MS = 5_000;
+const TIMESTAMP_FILENAME = "last-update-check.json";
+
+/**
+ * Auto-update checker.
+ *
+ * Trigger model (rewritten in v0.19.7):
+ *
+ * The check fires from plugin initialization itself via a `setTimeout`
+ * scheduled when this hook is created. We do NOT gate on
+ * `session.created` events — that gate was unreliable because:
+ *
+ *   - TUI restart with a resumed session never fires `session.created`
+ *     (the event fires on session creation, not on plugin reload).
+ *   - Multi-project plugin reloads each get their own plugin lifetime
+ *     with `hasChecked = false`, so only whichever project happens to
+ *     create a fresh session first ever runs the check.
+ *   - Sidebar/status polling and idle TUI use also never fire
+ *     `session.created`.
+ *
+ * Multi-project coordination is now handled by an on-disk timestamp at
+ * `<storageDir>/last-update-check.json`. Every plugin instance reads
+ * the timestamp before checking; if it's within `checkIntervalMs` of
+ * now, the check is skipped. The first instance to claim the slot
+ * writes the timestamp atomically (temp + rename) so concurrent
+ * instances don't all hit npm.
+ *
+ * The returned event hook is preserved as a no-op so existing tests
+ * that pass synthetic events keep working — the hook itself never
+ * triggers a check now.
+ */
 export function createAutoUpdateCheckerHook(
   ctx: PluginInput,
   options: AutoUpdateCheckerOptions = {},
@@ -32,38 +68,110 @@ export function createAutoUpdateCheckerHook(
     npmRegistryUrl = NPM_REGISTRY_URL,
     fetchTimeoutMs = NPM_FETCH_TIMEOUT,
     signal = new AbortController().signal,
+    storageDir = null,
+    checkIntervalMs = DEFAULT_CHECK_INTERVAL_MS,
+    initDelayMs = DEFAULT_INIT_DELAY_MS,
   } = options;
 
-  let hasChecked = false;
+  if (!enabled) {
+    return async (_input: { event: OpenCodeEvent }) => {
+      // Disabled — never check.
+    };
+  }
 
-  return async ({ event }: { event: OpenCodeEvent }) => {
-    if (!enabled) return;
-    if (event.type !== "session.created") return;
-    if (hasChecked) return;
-    if (getParentId(event.properties)) return;
+  // Schedule the check on plugin init, not on any event. The setTimeout
+  // intentionally returns control to OpenCode immediately so plugin init
+  // never blocks on the npm round-trip.
+  const initTimer = setTimeout(() => {
+    void maybeRunCheck(ctx, {
+      showStartupToast,
+      autoUpdate,
+      npmRegistryUrl,
+      fetchTimeoutMs,
+      signal,
+      storageDir,
+      checkIntervalMs,
+      initDelayMs,
+    }).catch((err) => {
+      warn(`[auto-update-checker] Background update check failed: ${String(err)}`);
+    });
+  }, initDelayMs);
 
-    hasChecked = true;
+  // Don't keep the Node event loop alive just for this timer.
+  if (typeof initTimer === "object" && initTimer !== null && "unref" in initTimer) {
+    (initTimer as { unref: () => void }).unref();
+  }
 
-    setTimeout(() => {
-      void runStartupCheck(ctx, {
-        showStartupToast,
-        autoUpdate,
-        npmRegistryUrl,
-        fetchTimeoutMs,
-        signal,
-      }).catch((err) => {
-        warn(`[auto-update-checker] Background update check failed: ${String(err)}`);
-      });
-    }, 0);
+  // Cancel the pending check if the host aborts (plugin shutdown).
+  signal.addEventListener(
+    "abort",
+    () => {
+      clearTimeout(initTimer);
+    },
+    { once: true },
+  );
+
+  // Event hook is now a no-op. Kept for API/test compatibility.
+  return async (_input: { event: OpenCodeEvent }) => {
+    // Intentionally empty — see hook comment.
   };
 }
 
-function getParentId(properties: unknown): string | null {
-  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return null;
-  const info = (properties as { info?: unknown }).info;
-  if (!info || typeof info !== "object" || Array.isArray(info)) return null;
-  const parentID = (info as { parentID?: unknown }).parentID;
-  return typeof parentID === "string" && parentID.length > 0 ? parentID : null;
+async function maybeRunCheck(
+  ctx: PluginInput,
+  options: ResolvedAutoUpdateCheckerOptions,
+): Promise<void> {
+  if (options.signal.aborted) return;
+
+  // Honor the cross-process dedup window first. If another plugin
+  // instance recently checked, skip silently.
+  if (!claimCheckSlot(options.storageDir, options.checkIntervalMs)) {
+    log("[auto-update-checker] Skipping check (another instance ran one recently)");
+    return;
+  }
+
+  await runStartupCheck(ctx, options);
+}
+
+/**
+ * Try to claim the next check slot via the on-disk timestamp file.
+ *
+ * Returns true if this caller should run the check. Returns false if
+ * another instance already claimed the slot inside `intervalMs` of now,
+ * or if the storage directory isn't usable (we fail open in that case
+ * by returning true — the worst outcome is a duplicate npm hit, not a
+ * missed check).
+ *
+ * Race semantics: read → check window → write. With concurrent plugin
+ * inits, two callers can race here and both pass the window check before
+ * either writes. That's tolerable: at worst we hit npm twice in one
+ * launch. The atomic temp+rename write ensures the file is always
+ * fully-formed JSON for the next read, even mid-race.
+ */
+function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean {
+  if (!storageDir) return true; // No storage available — fail open.
+  try {
+    const file = join(storageDir, TIMESTAMP_FILENAME);
+    if (existsSync(file)) {
+      try {
+        const raw = JSON.parse(readFileSync(file, "utf-8")) as { lastCheckedMs?: unknown };
+        const last = typeof raw.lastCheckedMs === "number" ? raw.lastCheckedMs : 0;
+        if (Number.isFinite(last) && Date.now() - last < intervalMs) {
+          return false;
+        }
+      } catch {
+        // Corrupt timestamp file — overwrite it below.
+      }
+    }
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({ lastCheckedMs: Date.now() }), "utf-8");
+    renameSync(tmp, file);
+    return true;
+  } catch (err) {
+    warn(`[auto-update-checker] Could not coordinate via timestamp file: ${String(err)}`);
+    return true;
+  }
 }
 
 async function runStartupCheck(
