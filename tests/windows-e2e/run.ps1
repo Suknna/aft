@@ -268,13 +268,17 @@ $AftConfig = @"
 "@
 Set-Content -Path (Join-Path $ConfigDir "aft.jsonc") -Value $AftConfig
 
-# Inject the locally-built binary into the cache. The plugin-version-aware
-# resolver looks up `~/.cache/aft/bin/v<plugin_version>/aft.exe` first.
-# On Windows, $env:USERPROFILE\.cache\aft\bin\... is the canonical layout
-# we already use in resolver.ts.
+# Inject the locally-built binary into the cache. The aft-bridge resolver's
+# `getCacheDir()` returns `$env:LOCALAPPDATA\aft\bin` on Windows — *not*
+# `$env:USERPROFILE\.cache\aft\bin` — because that's the canonical Windows
+# user-cache location. Writing to the wrong path silently falls through to
+# the npm platform package / PATH / cargo-bin chain, which on a CI runner
+# can resolve to whatever stale binary OpenCode shipped (we observed
+# v0.19.6 winning here, completely defeating the test).
 $PluginPkgPath = Join-Path $env:AFT_PLUGIN_DIST "..\package.json" | Resolve-Path
 $PluginVersion = (Get-Content $PluginPkgPath -Raw | ConvertFrom-Json).version
-$BinDir = Join-Path $env:USERPROFILE ".cache\aft\bin\v$PluginVersion"
+$CacheBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } elseif ($env:APPDATA) { $env:APPDATA } else { Join-Path $env:USERPROFILE "AppData\Local" }
+$BinDir = Join-Path $CacheBase "aft\bin\v$PluginVersion"
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Copy-Item -Path $env:AFT_BINARY_PATH -Destination (Join-Path $BinDir "aft.exe") -Force
 
