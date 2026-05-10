@@ -548,16 +548,67 @@ fn match_to_json(grep_match: &GrepMatch) -> serde_json::Value {
 }
 
 fn string_array_param(params: &serde_json::Value, key: &str) -> Vec<String> {
-    params
-        .get(key)
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(value) = params.get(key) else {
+        return Vec::new();
+    };
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .flat_map(|raw| split_brace_aware(&raw))
+            .filter(|item| !item.is_empty())
+            .collect();
+    }
+    if let Some(raw) = value.as_str() {
+        return split_brace_aware(raw)
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Split a comma-separated glob string into multiple globs while preserving
+/// brace alternations (`**/*.{ts,tsx}`). Treats `,` as a separator only when
+/// the surrounding `{` / `}` depth is zero, mirroring the plugin-layer
+/// `splitIncludeArg` so direct binary callers (bash rewrite, CLI users,
+/// future hosts) get the same robustness.
+///
+/// Defends against issue #33: agents passing `"**/*.{ts,tsx},**/*.{js,jsx}"`
+/// would previously be naively split by some caller into the two broken
+/// fragments `**/*.{ts` and `**/*.{js`, both rejected by the globset parser.
+/// This helper is brace-aware so the brace groups stay intact.
+fn split_brace_aware(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    for ch in raw.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                buf.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = buf.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    let tail = buf.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
 }
 
 fn line_starts(content: &str) -> Vec<usize> {
@@ -684,5 +735,73 @@ mod tests {
             text,
             "Found 0 match(es) across 0 file(s). [index: fallback]"
         );
+    }
+
+    // Issue #33 regression: brace-aware include/exclude splitting at the Rust
+    // boundary. Defends direct binary callers (bash rewrite, CLI users) and
+    // hosts that pass a comma-separated string instead of an already-split
+    // array of globs.
+    #[test]
+    fn split_preserves_single_brace_group() {
+        assert_eq!(split_brace_aware("**/*.{ts,tsx}"), vec!["**/*.{ts,tsx}"]);
+    }
+
+    #[test]
+    fn split_handles_top_level_commas_with_braces() {
+        assert_eq!(
+            split_brace_aware("**/*.{ts,tsx},**/*.{js,jsx}"),
+            vec!["**/*.{ts,tsx}", "**/*.{js,jsx}"],
+        );
+    }
+
+    #[test]
+    fn split_strips_whitespace_around_top_level_separators() {
+        assert_eq!(
+            split_brace_aware("**/*.{ts,tsx}, **/*.{js,jsx}"),
+            vec!["**/*.{ts,tsx}", "**/*.{js,jsx}"],
+        );
+    }
+
+    #[test]
+    fn split_handles_nested_braces() {
+        assert_eq!(
+            split_brace_aware("**/{a,{b,c},d}.ts"),
+            vec!["**/{a,{b,c},d}.ts"],
+        );
+    }
+
+    #[test]
+    fn split_tolerates_unbalanced_brace_without_panic() {
+        // Don't crash on malformed input; treat the unclosed brace as part
+        // of the buffer and let the globset parser surface the real error.
+        let result = split_brace_aware("**/*.{ts,tsx");
+        assert_eq!(result, vec!["**/*.{ts,tsx"]);
+    }
+
+    #[test]
+    fn split_returns_empty_for_blank_input() {
+        assert!(split_brace_aware("").is_empty());
+        assert!(split_brace_aware("   ").is_empty());
+    }
+
+    #[test]
+    fn string_array_param_accepts_string_with_braces() {
+        let params = serde_json::json!({"include": "**/*.{ts,tsx},**/*.{js,jsx}"});
+        let result = string_array_param(&params, "include");
+        assert_eq!(result, vec!["**/*.{ts,tsx}", "**/*.{js,jsx}"]);
+    }
+
+    #[test]
+    fn string_array_param_accepts_array_input() {
+        let params = serde_json::json!({"include": ["**/*.ts", "**/*.tsx"]});
+        let result = string_array_param(&params, "include");
+        assert_eq!(result, vec!["**/*.ts", "**/*.tsx"]);
+    }
+
+    #[test]
+    fn string_array_param_normalizes_array_with_brace_strings() {
+        let params = serde_json::json!({"include": ["**/*.{ts,tsx}", "*.json"]});
+        let result = string_array_param(&params, "include");
+        assert_eq!(result, vec!["**/*.{ts,tsx}", "*.json"]);
     }
 }
