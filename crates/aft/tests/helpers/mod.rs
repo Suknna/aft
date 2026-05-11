@@ -199,18 +199,53 @@ impl AftProcess {
 
     /// Read frames until a `configure_warnings` push frame arrives, then
     /// return it. Panics if a non-frame response (one with an `id`) arrives
-    /// before the frame, or if EOF is hit.
+    /// before the frame, or if EOF is hit, or if no frame arrives within 60s.
+    ///
+    /// Uses non-blocking reads with a short poll interval on Unix so the
+    /// deadline actually fires when the frame never arrives. On Windows the
+    /// helper falls back to a blocking read with one final timeout check;
+    /// if the frame is missing on Windows we have no choice but to block
+    /// (no portable non-blocking pipe read available).
     fn wait_for_configure_warnings_frame(&mut self) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let poll_interval = std::time::Duration::from_millis(100);
         loop {
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for configure_warnings push frame");
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                panic!(
+                    "timed out waiting for configure_warnings push frame after 60s — \
+                     background configure-warnings worker either crashed or progress_sender \
+                     was not installed"
+                );
             }
-            let value = self.read_json_line();
-            if value.get("type").and_then(|kind| kind.as_str()) == Some("configure_warnings") {
-                return value;
+            let remaining = deadline - now;
+            let timeout = std::cmp::min(remaining, poll_interval);
+            #[cfg(unix)]
+            {
+                if let Some(value) = self.try_read_next_timeout(timeout) {
+                    if value.get("type").and_then(|kind| kind.as_str())
+                        == Some("configure_warnings")
+                    {
+                        return value;
+                    }
+                    // Other push frames (progress, bash_completed) are skipped silently.
+                    continue;
+                }
+                // No data within poll_interval — loop and re-check deadline.
             }
-            // Other push frames (progress, bash_completed) are skipped silently.
+            #[cfg(not(unix))]
+            {
+                // No portable non-blocking pipe read on Windows; fall back to
+                // a single blocking read. If the frame never arrives the test
+                // will hang until the cargo test harness or job-level timeout
+                // kills it. This was the pre-fix behavior on all platforms.
+                let _ = timeout;
+                let value = self.read_json_line();
+                if value.get("type").and_then(|kind| kind.as_str()) == Some("configure_warnings") {
+                    return value;
+                }
+                // Other push frames (progress, bash_completed) are skipped silently.
+            }
         }
     }
 
