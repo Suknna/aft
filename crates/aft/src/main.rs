@@ -452,13 +452,23 @@ fn drain_watcher_events(ctx: &AppContext) {
                     // .next, coverage, __pycache__, venv, …) to the user's
                     // gitignore. Matches the same source of truth as `git status`
                     // and ripgrep/fd, instead of an ever-growing hardcoded list.
+                    //
+                    // The `ignore` crate panics if the query path isn't lexically
+                    // under the matcher's root. We guard two ways:
+                    // 1. `rebuild_gitignore` canonicalizes its root.
+                    // 2. Here we only query when the event path is under that
+                    //    same root. If it isn't (e.g. a stray event from outside
+                    //    the project), we keep the path — it's the conservative
+                    //    "no rule matched, don't skip" outcome.
                     if let Some(matcher) = ctx.gitignore() {
-                        let is_dir = path.is_dir();
-                        if matcher
-                            .matched_path_or_any_parents(&path, is_dir)
-                            .is_ignore()
-                        {
-                            continue;
+                        if path.starts_with(matcher.path()) {
+                            let is_dir = path.is_dir();
+                            if matcher
+                                .matched_path_or_any_parents(&path, is_dir)
+                                .is_ignore()
+                            {
+                                continue;
+                            }
                         }
                     }
                     paths.insert(path);

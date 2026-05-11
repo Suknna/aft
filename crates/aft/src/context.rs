@@ -333,13 +333,21 @@ impl AppContext {
     pub fn rebuild_gitignore(&self) {
         use ignore::gitignore::GitignoreBuilder;
         use std::path::Path;
-        let root = match self.config().project_root.clone() {
+        let root_raw = match self.config().project_root.clone() {
             Some(r) => r,
             None => {
                 *self.gitignore.borrow_mut() = None;
                 return;
             }
         };
+        // Canonicalize the root so symlink-prefix mismatches don't cause
+        // `Gitignore::matched_path_or_any_parents` to panic on watcher event
+        // paths. macOS routinely surfaces `/private/var/...` while `project_root`
+        // arrives as `/var/...` (a symlink to `/private/var`); the `ignore`
+        // crate's matcher panics when a query path isn't lexically under the
+        // matcher's root. Canonicalizing both ends (here for root, naturally
+        // for watcher events on macOS) keeps them in the same prefix space.
+        let root = std::fs::canonicalize(&root_raw).unwrap_or(root_raw);
         let mut builder = GitignoreBuilder::new(&root);
         // Add root .gitignore (the most common case)
         let root_ignore = Path::new(&root).join(".gitignore");
@@ -984,14 +992,22 @@ mod gitignore_tests {
     }
 
     /// Helper: returns true when the matcher would skip `path` (as if it
-    /// arrived via a watcher event for this project root).
+    /// arrived via a watcher event for this project root). Canonicalizes
+    /// the query path so symlink prefixes (e.g. macOS `/var` → `/private/var`)
+    /// don't trip the `ignore` crate's "path is expected to be under the
+    /// root" panic — production code does the same guard via
+    /// `path.starts_with(matcher.path())` in `drain_watcher_events`.
     fn is_ignored(ctx: &AppContext, path: &Path) -> bool {
         let Some(matcher) = ctx.gitignore() else {
             return false;
         };
-        let is_dir = path.is_dir();
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !canonical.starts_with(matcher.path()) {
+            return false;
+        }
+        let is_dir = canonical.is_dir();
         matcher
-            .matched_path_or_any_parents(path, is_dir)
+            .matched_path_or_any_parents(&canonical, is_dir)
             .is_ignore()
     }
 
