@@ -38,6 +38,7 @@ use super::{BgTaskInfo, BgTaskStatus};
 const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STALE_RUNNING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Tail-bytes captured into BashCompletedFrame and BgCompletion records so the
 /// plugin can inline a preview into the system-reminder. Sized for ~3-4 lines
@@ -485,6 +486,7 @@ impl BgTaskRegistry {
         project_root: &Path,
         storage_dir: &Path,
     ) -> Option<Arc<BgTask>> {
+        let canonical_project = canonicalized_path(project_root);
         let root = storage_dir.join("bash-tasks");
         let entries = fs::read_dir(&root).ok()?;
         for entry in entries.flatten() {
@@ -499,14 +501,23 @@ impl BgTaskRegistry {
             let Ok(metadata) = read_task(&path) else {
                 continue;
             };
-            if metadata.project_root.as_deref() != Some(project_root) {
+            let metadata_project = metadata.project_root.as_deref().map(canonicalized_path);
+            if metadata_project.as_deref() != Some(canonical_project.as_path()) {
                 continue;
             }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
                     .state
                     .lock()
-                    .map(|state| state.metadata.project_root.as_deref() == Some(project_root))
+                    .map(|state| {
+                        state
+                            .metadata
+                            .project_root
+                            .as_deref()
+                            .map(canonicalized_path)
+                            .as_deref()
+                            == Some(canonical_project.as_path())
+                    })
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
@@ -538,77 +549,78 @@ impl BgTaskRegistry {
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
 
-        let root = storage_dir.join("bash-tasks");
-        if !root.exists() {
-            return Ok(0);
-        }
-
-        let session_dirs = fs::read_dir(&root).map_err(|e| {
-            format!(
-                "failed to read background task root {}: {e}",
-                root.display()
-            )
-        })?;
         let mut deleted = 0usize;
-        for session_entry in session_dirs.flatten() {
-            let session_dir = session_entry.path();
-            if !session_dir.is_dir() {
-                continue;
-            }
-            let task_entries = match fs::read_dir(&session_dir) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    log::warn!(
-                        "failed to read background task session dir {}: {error}",
-                        session_dir.display()
-                    );
+
+        let root = storage_dir.join("bash-tasks");
+        if root.exists() {
+            let session_dirs = fs::read_dir(&root).map_err(|e| {
+                format!(
+                    "failed to read background task root {}: {e}",
+                    root.display()
+                )
+            })?;
+            for session_entry in session_dirs.flatten() {
+                let session_dir = session_entry.path();
+                if !session_dir.is_dir() {
                     continue;
                 }
-            };
-            for task_entry in task_entries.flatten() {
-                let json_path = task_entry.path();
-                if json_path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    != Some("json")
-                {
-                    continue;
-                }
-                if json_modified_within(&json_path, PERSISTED_GC_GRACE) {
-                    continue;
-                }
-                let metadata = match read_task(&json_path) {
-                    Ok(metadata) => metadata,
+                let task_entries = match fs::read_dir(&session_dir) {
+                    Ok(entries) => entries,
                     Err(error) => {
                         log::warn!(
-                            "quarantining corrupt background task metadata {}: {error}",
-                            json_path.display()
+                            "failed to read background task session dir {}: {error}",
+                            session_dir.display()
                         );
-                        quarantine_corrupt_task_json(storage_dir, &session_dir, &json_path)?;
                         continue;
                     }
                 };
-                if !(metadata.status.is_terminal() && metadata.completion_delivered) {
-                    continue;
-                }
-                let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
-                match delete_task_bundle(&paths) {
-                    Ok(()) => {
-                        deleted += 1;
-                        log::debug!(
-                            "deleted persisted background task bundle {}",
-                            metadata.task_id
-                        );
+                for task_entry in task_entries.flatten() {
+                    let json_path = task_entry.path();
+                    if json_path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        != Some("json")
+                    {
+                        continue;
                     }
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to delete background task bundle {}: {error}",
-                            metadata.task_id
-                        ));
+                    if modified_within(&json_path, PERSISTED_GC_GRACE) {
+                        continue;
+                    }
+                    let metadata = match read_task(&json_path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            log::warn!(
+                                "quarantining corrupt background task metadata {}: {error}",
+                                json_path.display()
+                            );
+                            quarantine_corrupt_task_json(storage_dir, &session_dir, &json_path)?;
+                            continue;
+                        }
+                    };
+                    if !(metadata.status.is_terminal() && metadata.completion_delivered) {
+                        continue;
+                    }
+                    let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
+                    match delete_task_bundle(&paths) {
+                        Ok(()) => {
+                            deleted += 1;
+                            log::debug!(
+                                "deleted persisted background task bundle {}",
+                                metadata.task_id
+                            );
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "failed to delete background task bundle {}: {error}",
+                                metadata.task_id
+                            );
+                            continue;
+                        }
                     }
                 }
             }
         }
+        gc_quarantine(storage_dir);
         Ok(deleted)
     }
 
@@ -683,41 +695,51 @@ impl BgTaskRegistry {
 
     pub fn cleanup_finished(&self, older_than: Duration) {
         let cutoff = Instant::now().checked_sub(older_than);
-        if let Ok(mut tasks) = self.inner.tasks.lock() {
-            let removable = tasks
-                .iter()
-                .filter_map(|(task_id, task)| {
-                    let delivered_terminal = task
-                        .state
-                        .lock()
-                        .map(|state| {
-                            state.metadata.status.is_terminal()
-                                && state.metadata.completion_delivered
-                        })
-                        .unwrap_or(false);
-                    if !delivered_terminal {
-                        return None;
-                    }
+        let removable_paths: Vec<(String, TaskPaths)> =
+            if let Ok(mut tasks) = self.inner.tasks.lock() {
+                let removable = tasks
+                    .iter()
+                    .filter_map(|(task_id, task)| {
+                        let delivered_terminal = task
+                            .state
+                            .lock()
+                            .map(|state| {
+                                state.metadata.status.is_terminal()
+                                    && state.metadata.completion_delivered
+                            })
+                            .unwrap_or(false);
+                        if !delivered_terminal {
+                            return None;
+                        }
 
-                    let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
-                    let expired = match (terminal_at, cutoff) {
-                        (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
-                        (Some(_), None) => true,
-                        (None, _) => false,
-                    };
-                    expired.then(|| task_id.clone())
-                })
-                .collect::<Vec<_>>();
+                        let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
+                        let expired = match (terminal_at, cutoff) {
+                            (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        };
+                        expired.then(|| task_id.clone())
+                    })
+                    .collect::<Vec<_>>();
 
-            for task_id in removable {
-                if let Some(task) = tasks.remove(&task_id) {
-                    match delete_task_bundle(&task.paths) {
-                        Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
-                        Err(error) => log::warn!(
-                            "failed to delete persisted background task bundle {task_id}: {error}"
-                        ),
-                    }
-                }
+                removable
+                    .into_iter()
+                    .filter_map(|task_id| {
+                        tasks
+                            .remove(&task_id)
+                            .map(|task| (task_id, task.paths.clone()))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        for (task_id, paths) in removable_paths {
+            match delete_task_bundle(&paths) {
+                Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
+                Err(error) => log::warn!(
+                    "failed to delete persisted background task bundle {task_id}: {error}"
+                ),
             }
         }
     }
@@ -880,11 +902,12 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
+        let started = started_instant_from_unix_millis(metadata.started_at);
         let task = Arc::new(BgTask {
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
-            started: Instant::now(),
+            started,
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             state: Mutex::new(BgTaskState {
@@ -1210,13 +1233,75 @@ impl Default for BgTaskRegistry {
     }
 }
 
-fn json_modified_within(path: &Path, grace: Duration) -> bool {
+fn modified_within(path: &Path, grace: Duration) -> bool {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .map(|age| age < grace)
         .unwrap_or(false)
+}
+
+fn canonicalized_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn started_instant_from_unix_millis(started_at: u64) -> Instant {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(started_at);
+    let elapsed_ms = now_ms.saturating_sub(started_at);
+    Instant::now()
+        .checked_sub(Duration::from_millis(elapsed_ms))
+        .unwrap_or_else(Instant::now)
+}
+
+fn gc_quarantine(storage_dir: &Path) {
+    let quarantine_root = storage_dir.join("bash-tasks-quarantine");
+    let Ok(session_dirs) = fs::read_dir(&quarantine_root) else {
+        return;
+    };
+    for session_entry in session_dirs.flatten() {
+        let session_quarantine_dir = session_entry.path();
+        if !session_quarantine_dir.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(&session_quarantine_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::warn!(
+                    "failed to read background task quarantine dir {}: {error}",
+                    session_quarantine_dir.display()
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if modified_within(&path, QUARANTINE_GC_GRACE) {
+                continue;
+            }
+            let result = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => log::debug!(
+                    "deleted old background task quarantine entry {}",
+                    path.display()
+                ),
+                Err(error) => log::warn!(
+                    "failed to delete old background task quarantine entry {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        let _ = fs::remove_dir(&session_quarantine_dir);
+    }
+    let _ = fs::remove_dir(&quarantine_root);
 }
 
 fn quarantine_corrupt_task_json(
@@ -1255,7 +1340,44 @@ fn quarantine_corrupt_task_json(
             json_path.display(),
             target.display()
         )
-    })
+    })?;
+
+    for sibling in task_sibling_paths(json_path) {
+        if !sibling.exists() {
+            continue;
+        }
+        let Some(sibling_name) = sibling.file_name().and_then(|name| name.to_str()) else {
+            log::warn!(
+                "skipping background task sibling with invalid name during quarantine: {}",
+                sibling.display()
+            );
+            continue;
+        };
+        let sibling_target = quarantine_dir.join(format!("{sibling_name}.corrupt-{unix_ts}"));
+        if let Err(error) = fs::rename(&sibling, &sibling_target) {
+            log::warn!(
+                "failed to quarantine background task sibling {} to {}: {error}",
+                sibling.display(),
+                sibling_target.display()
+            );
+        }
+    }
+
+    let _ = fs::remove_dir(session_dir);
+    Ok(())
+}
+
+fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = json_path.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = json_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+    ["stdout", "stderr", "exit", "ps1", "bat", "sh"]
+        .into_iter()
+        .map(|extension| parent.join(format!("{stem}.{extension}")))
+        .collect()
 }
 
 impl BgTask {

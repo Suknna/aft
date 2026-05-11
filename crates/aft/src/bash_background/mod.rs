@@ -83,7 +83,8 @@ pub fn spawn(
         .config()
         .project_root
         .clone()
-        .or_else(|| std::env::current_dir().ok());
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
     match ctx.bash_background().spawn(
         command,

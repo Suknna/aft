@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aft::bash_background::persistence::{session_tasks_dir, task_paths, write_task, PersistedTask};
@@ -141,6 +143,12 @@ fn set_mtime(path: &Path, age: Duration) {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
     assert_eq!(rc, 0, "failed to set mtime for {}", path.display());
+}
+
+fn chmod(path: &Path, mode: u32) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 fn fake_task(
@@ -466,9 +474,9 @@ fn gc_persisted_quarantines_corrupt_json() {
     assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
 
     assert!(!paths.json.exists());
-    assert!(paths.stdout.exists());
-    assert!(paths.stderr.exists());
-    assert!(paths.exit.exists());
+    assert!(!paths.stdout.exists());
+    assert!(!paths.stderr.exists());
+    assert!(!paths.exit.exists());
     let quarantine_session = storage
         .path()
         .join("bash-tasks-quarantine")
@@ -477,8 +485,129 @@ fn gc_persisted_quarantines_corrupt_json() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert_eq!(quarantined.len(), 1);
-    assert!(quarantined[0].starts_with("bash-corrupt.json.corrupt-"));
+    assert_eq!(quarantined.len(), 4);
+    assert!(quarantined
+        .iter()
+        .any(|name| name.starts_with("bash-corrupt.json.corrupt-")));
+}
+
+#[test]
+fn maybe_gc_persisted_cleans_quarantine_older_than_30_days() {
+    let storage = tempfile::tempdir().unwrap();
+    let quarantine_session = storage
+        .path()
+        .join("bash-tasks-quarantine")
+        .join(aft::backup::hash_session(SESSION));
+    fs::create_dir_all(&quarantine_session).unwrap();
+    let old = quarantine_session.join("bash-old.json.corrupt-1");
+    let recent = quarantine_session.join("bash-recent.json.corrupt-2");
+    fs::write(&old, "old").unwrap();
+    fs::write(&recent, "recent").unwrap();
+    set_mtime(&old, Duration::from_secs(31 * 24 * 60 * 60));
+    set_mtime(&recent, Duration::from_secs(24 * 60 * 60));
+
+    assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
+
+    assert!(!old.exists());
+    assert!(recent.exists());
+}
+
+#[test]
+fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let failing = fake_task(
+        storage.path(),
+        project.path(),
+        "session-fail",
+        "bash-delete-fails",
+        BgTaskStatus::Completed,
+        true,
+    );
+    let succeeding = fake_task(
+        storage.path(),
+        project.path(),
+        "session-ok",
+        "bash-delete-succeeds",
+        BgTaskStatus::Completed,
+        true,
+    );
+    set_mtime(&failing.json, Duration::from_secs(25 * 60 * 60));
+    set_mtime(&succeeding.json, Duration::from_secs(25 * 60 * 60));
+    chmod(&failing.dir, 0o555);
+
+    let deleted = registry().maybe_gc_persisted(storage.path()).unwrap();
+
+    chmod(&failing.dir, 0o755);
+    assert_eq!(deleted, 1);
+    assert!(failing.json.exists());
+    assert!(!succeeding.json.exists());
+}
+
+#[test]
+fn quarantine_corrupt_json_moves_siblings_too() {
+    let storage = tempfile::tempdir().unwrap();
+    let paths = task_paths(storage.path(), SESSION, "bash-corrupt-siblings");
+    fs::create_dir_all(&paths.dir).unwrap();
+    fs::write(&paths.json, "not-json").unwrap();
+    for extension in ["stdout", "stderr", "exit", "ps1", "bat", "sh"] {
+        fs::write(
+            paths.dir.join(format!("bash-corrupt-siblings.{extension}")),
+            extension,
+        )
+        .unwrap();
+    }
+    set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+
+    assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
+
+    assert!(!paths.dir.exists());
+    let quarantine_session = storage
+        .path()
+        .join("bash-tasks-quarantine")
+        .join(aft::backup::hash_session(SESSION));
+    let quarantined = fs::read_dir(quarantine_session)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    for extension in ["json", "stdout", "stderr", "exit", "ps1", "bat", "sh"] {
+        assert!(
+            quarantined.iter().any(
+                |name| name.starts_with(&format!("bash-corrupt-siblings.{extension}.corrupt-"))
+            ),
+            "missing quarantined {extension} sibling in {quarantined:?}"
+        );
+    }
+}
+
+#[test]
+fn bash_status_cross_session_canonicalizes_paths() {
+    let canonical_project = tempfile::tempdir().unwrap();
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias_project = alias_parent.path().join("project-link");
+    std::os::unix::fs::symlink(canonical_project.path(), &alias_project).unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "bash-canonical";
+    fake_task(
+        storage.path(),
+        &alias_project,
+        "session-a",
+        task_id,
+        BgTaskStatus::Completed,
+        true,
+    );
+
+    let snapshot = registry()
+        .status(
+            task_id,
+            "session-b",
+            Some(canonical_project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("cross-session status should match canonical project paths");
+
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
 }
 
 #[test]
@@ -516,6 +645,92 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
     assert!(!paths.stdout.exists());
     assert!(!paths.stderr.exists());
     assert!(!paths.exit.exists());
+}
+
+#[test]
+fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let removable = registry
+        .spawn(
+            "sleep 5",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    let live = registry
+        .spawn(
+            "sleep 5",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            10,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+    registry.kill(&removable, SESSION).unwrap();
+    assert_eq!(
+        registry.drain_completions_for_session(Some(SESSION)).len(),
+        1
+    );
+    fs::write(
+        task_file(storage.path(), SESSION, &removable, "sh"),
+        vec![b'x'; 8 * 1024 * 1024],
+    )
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicU64::new(0));
+    let max_call_ms = Arc::new(AtomicU64::new(0));
+    let status_registry = registry.clone();
+    let status_storage = storage.path().to_path_buf();
+    let status_live = live.clone();
+    let status_stop = Arc::clone(&stop);
+    let status_calls = Arc::clone(&calls);
+    let status_max_call_ms = Arc::clone(&max_call_ms);
+    let status_thread = std::thread::spawn(move || {
+        while !status_stop.load(Ordering::SeqCst) {
+            let started = Instant::now();
+            let snapshot = status_registry.status(
+                &status_live,
+                SESSION,
+                None,
+                Some(status_storage.as_path()),
+                1024,
+            );
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            status_max_call_ms.fetch_max(elapsed_ms, Ordering::SeqCst);
+            status_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(snapshot.is_some(), "live task status disappeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    while calls.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    registry.cleanup_finished(Duration::ZERO);
+    stop.store(true, Ordering::SeqCst);
+    status_thread.join().unwrap();
+
+    assert!(
+        max_call_ms.load(Ordering::SeqCst) < 100,
+        "status calls were blocked for {}ms",
+        max_call_ms.load(Ordering::SeqCst)
+    );
+    let _ = registry.kill(&live, SESSION);
 }
 
 #[test]
@@ -917,4 +1132,52 @@ fn replay_stale_running_task_marks_killed_orphaned() {
     let replayed = read_json(storage.path(), SESSION, task_id);
     assert_eq!(replayed["status"], "killed");
     assert_eq!(replayed["status_reason"], "orphaned (>24h)");
+}
+
+#[test]
+fn replay_session_preserves_started_at_relative_offset() {
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let task_id = "bash-timeout-offset";
+    let paths = task_paths(storage.path(), SESSION, task_id);
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        SESSION.to_string(),
+        "sleep 99".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        Some(60_000),
+        true,
+        true,
+    );
+    metadata.status = BgTaskStatus::Running;
+    metadata.started_at = metadata.started_at.saturating_sub(61_000);
+    write_task(&paths.json, &metadata).unwrap();
+    fs::write(&paths.stdout, "").unwrap();
+    fs::write(&paths.stderr, "").unwrap();
+
+    let registry = registry();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+
+    let started = Instant::now();
+    loop {
+        let snapshot = registry
+            .status(
+                task_id,
+                SESSION,
+                Some(project.path()),
+                Some(storage.path()),
+                1024,
+            )
+            .expect("rehydrated task should be present");
+        if snapshot.info.status == BgTaskStatus::TimedOut {
+            assert_eq!(snapshot.exit_code, Some(124));
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "watchdog did not preserve elapsed timeout offset: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
