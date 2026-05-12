@@ -1422,9 +1422,23 @@ impl SemanticIndex {
             return;
         }
         let data_path = dir.join("semantic.bin");
-        let tmp_path = dir.join("semantic.bin.tmp");
+        let tmp_path = dir.join(format!(
+            "semantic.bin.tmp.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
         let bytes = self.to_bytes();
-        if let Err(e) = fs::write(&tmp_path, &bytes) {
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
             slog_warn!("failed to write semantic index: {}", e);
             let _ = fs::remove_file(&tmp_path);
             return;
@@ -1773,6 +1787,22 @@ impl SemanticIndex {
                 },
                 vector,
             });
+        }
+
+        if entries.len() != entry_count {
+            return Err(format!(
+                "semantic cache entry count drift: header={} decoded={}",
+                entry_count,
+                entries.len()
+            ));
+        }
+        for entry in &entries {
+            if !file_mtimes.contains_key(&entry.chunk.file) {
+                return Err(format!(
+                    "semantic cache metadata missing for entry file {}",
+                    entry.chunk.file.display()
+                ));
+            }
         }
 
         Ok(Self {

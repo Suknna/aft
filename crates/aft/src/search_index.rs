@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -16,6 +16,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Hir, HirKind};
 
 const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
 const INDEX_VERSION: u32 = 2;
@@ -25,6 +26,43 @@ const MAX_ENTRIES: usize = 10_000_000;
 const MIN_FILE_ENTRY_BYTES: usize = 25;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
+
+pub struct CacheLock {
+    path: PathBuf,
+}
+
+impl CacheLock {
+    pub fn acquire(cache_dir: &Path) -> std::io::Result<Self> {
+        fs::create_dir_all(cache_dir)?;
+        let path = cache_dir.join("cache.lock");
+        for _ in 0..200 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    let _ = file.sync_all();
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "timed out acquiring search cache lock",
+        ))
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
@@ -566,10 +604,15 @@ impl SearchIndex {
             return;
         }
 
-        let postings_path = cache_dir.join("postings.bin");
-        let lookup_path = cache_dir.join("lookup.bin");
-        let tmp_postings = cache_dir.join("postings.bin.tmp");
-        let tmp_lookup = cache_dir.join("lookup.bin.tmp");
+        let cache_path = cache_dir.join("cache.bin");
+        let tmp_cache = cache_dir.join(format!(
+            "cache.bin.tmp.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
 
         let active_ids = self.active_file_ids();
         let mut id_map = HashMap::new();
@@ -581,7 +624,7 @@ impl SearchIndex {
         }
 
         let write_result = (|| -> std::io::Result<()> {
-            let mut postings_writer = BufWriter::new(File::create(&tmp_postings)?);
+            let mut postings_writer = BufWriter::new(Cursor::new(Vec::new()));
 
             postings_writer.write_all(INDEX_MAGIC)?;
             write_u32(&mut postings_writer, INDEX_VERSION)?;
@@ -660,11 +703,15 @@ impl SearchIndex {
                     .map_err(|_| std::io::Error::other("postings blob too large"))?,
             )?;
             postings_writer.write_all(&postings_blob)?;
-            write_crc32(&mut postings_writer, &tmp_postings)?;
             postings_writer.flush()?;
-            drop(postings_writer);
+            let mut postings_blob_file = postings_writer
+                .into_inner()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .into_inner();
+            let checksum = crc32fast::hash(&postings_blob_file);
+            postings_blob_file.extend_from_slice(&checksum.to_le_bytes());
 
-            let mut lookup_writer = BufWriter::new(File::create(&tmp_lookup)?);
+            let mut lookup_writer = BufWriter::new(Cursor::new(Vec::new()));
             let entry_count = u32::try_from(lookup_entries.len())
                 .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
 
@@ -678,37 +725,66 @@ impl SearchIndex {
                 write_u32(&mut lookup_writer, count)?;
             }
 
-            write_crc32(&mut lookup_writer, &tmp_lookup)?;
             lookup_writer.flush()?;
-            drop(lookup_writer);
+            let mut lookup_blob_file = lookup_writer
+                .into_inner()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .into_inner();
+            let checksum = crc32fast::hash(&lookup_blob_file);
+            lookup_blob_file.extend_from_slice(&checksum.to_le_bytes());
 
-            fs::rename(&tmp_postings, &postings_path)?;
-            fs::rename(&tmp_lookup, &lookup_path)?;
+            let mut cache_writer = BufWriter::new(File::create(&tmp_cache)?);
+            write_u32(&mut cache_writer, CACHE_MAGIC)?;
+            write_u32(&mut cache_writer, INDEX_VERSION)?;
+            write_u64(
+                &mut cache_writer,
+                u64::try_from(postings_blob_file.len())
+                    .map_err(|_| std::io::Error::other("postings section too large"))?,
+            )?;
+            cache_writer.write_all(&postings_blob_file)?;
+            cache_writer.write_all(&lookup_blob_file)?;
+            cache_writer.flush()?;
+            cache_writer.get_ref().sync_all()?;
+            drop(cache_writer);
+            fs::rename(&tmp_cache, &cache_path)?;
 
             Ok(())
         })();
 
         if write_result.is_err() {
-            let _ = fs::remove_file(&tmp_postings);
-            let _ = fs::remove_file(&tmp_lookup);
+            let _ = fs::remove_file(&tmp_cache);
         }
     }
 
     pub fn read_from_disk(cache_dir: &Path) -> Option<Self> {
-        let postings_path = cache_dir.join("postings.bin");
-        let lookup_path = cache_dir.join("lookup.bin");
-
-        let mut postings_reader = BufReader::new(File::open(&postings_path).ok()?);
-        let mut lookup_reader = BufReader::new(File::open(&lookup_path).ok()?);
-        let postings_len_total =
-            usize::try_from(postings_reader.get_ref().metadata().ok()?.len()).ok()?;
-        let lookup_len_total =
-            usize::try_from(lookup_reader.get_ref().metadata().ok()?.len()).ok()?;
+        let cache_path = cache_dir.join("cache.bin");
+        let cache_bytes = fs::read(&cache_path).ok()?;
+        if cache_bytes.len() < 16 {
+            return None;
+        }
+        let mut header = Cursor::new(&cache_bytes);
+        if read_u32(&mut header).ok()? != CACHE_MAGIC {
+            return None;
+        }
+        if read_u32(&mut header).ok()? != INDEX_VERSION {
+            return None;
+        }
+        let postings_len_total = usize::try_from(read_u64(&mut header).ok()?).ok()?;
+        let start = usize::try_from(header.position()).ok()?;
+        let postings_end = start.checked_add(postings_len_total)?;
+        if postings_end > cache_bytes.len() {
+            return None;
+        }
+        let postings_bytes = &cache_bytes[start..postings_end];
+        let lookup_bytes = &cache_bytes[postings_end..];
+        let lookup_len_total = lookup_bytes.len();
+        let mut postings_reader = BufReader::new(Cursor::new(postings_bytes));
+        let mut lookup_reader = BufReader::new(Cursor::new(lookup_bytes));
         if postings_len_total < 4 || lookup_len_total < 4 {
             return None;
         }
-        verify_crc32(&postings_path).ok()?;
-        verify_crc32(&lookup_path).ok()?;
+        verify_crc32_bytes_slice(postings_bytes).ok()?;
+        verify_crc32_bytes_slice(lookup_bytes).ok()?;
 
         let mut magic = [0u8; 8];
         postings_reader.read_exact(&mut magic).ok()?;
@@ -871,18 +947,18 @@ impl SearchIndex {
         current_head: Option<String>,
         baseline: Option<SearchIndex>,
     ) -> Self {
-        if current_head.is_none() {
-            return SearchIndex::build_with_limit(root, max_file_size);
-        }
-
         if let Some(mut baseline) = baseline {
             baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             baseline.max_file_size = max_file_size;
 
-            if baseline.git_head == current_head {
+            if baseline.git_head == current_head || current_head.is_none() {
                 // HEAD matches, but files may have changed on disk since the index was
                 // last written (e.g., uncommitted edits, stash pop, manual file changes
                 // while OpenCode was closed). Verify mtimes and re-index stale files.
+                // Non-git projects also use this per-file (path, mtime, size)
+                // fingerprint so unchanged trees reuse the disk cache instead of
+                // rebuilding every configure.
+                baseline.git_head = current_head;
                 verify_file_mtimes(&mut baseline);
                 baseline.ready = true;
                 return baseline;
@@ -1732,15 +1808,7 @@ fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
-fn write_crc32(writer: &mut BufWriter<File>, path: &Path) -> std::io::Result<()> {
-    writer.flush()?;
-    let body = std::fs::read(path)?;
-    let checksum = crc32fast::hash(&body);
-    writer.write_all(&checksum.to_le_bytes())
-}
-
-fn verify_crc32(path: &Path) -> std::io::Result<()> {
-    let bytes = std::fs::read(path)?;
+fn verify_crc32_bytes_slice(bytes: &[u8]) -> std::io::Result<()> {
     let Some((body, stored)) = bytes.split_last_chunk::<4>() else {
         return Err(std::io::Error::other("search index checksum missing"));
     };
@@ -1981,11 +2049,11 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, None);
 
-        let postings_path = cache_dir.join("postings.bin");
-        let mut bytes = fs::read(&postings_path).expect("read postings");
+        let cache_path = cache_dir.join("cache.bin");
+        let mut bytes = fs::read(&cache_path).expect("read cache");
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0xff;
-        fs::write(&postings_path, bytes).expect("write corrupted postings");
+        fs::write(&cache_path, bytes).expect("write corrupted cache");
 
         assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
     }
@@ -2001,10 +2069,52 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, None);
 
-        assert!(cache_dir.join("postings.bin").is_file());
-        assert!(cache_dir.join("lookup.bin").is_file());
-        assert!(!cache_dir.join("postings.bin.tmp").exists());
-        assert!(!cache_dir.join("lookup.bin.tmp").exists());
+        assert!(cache_dir.join("cache.bin").is_file());
+        assert!(fs::read_dir(&cache_dir)
+            .expect("read cache dir")
+            .all(|entry| !entry
+                .expect("cache entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+    }
+
+    #[test]
+    fn concurrent_search_index_writes_do_not_corrupt() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("src.txt"), "abcdef\n").expect("write source");
+        let cache_dir = dir.path().join("cache");
+
+        let a_project = project.clone();
+        let a_cache = cache_dir.clone();
+        let a = std::thread::spawn(move || {
+            let _lock = CacheLock::acquire(&a_cache).expect("acquire cache lock a");
+            let index = SearchIndex::build(&a_project);
+            index.write_to_disk(&a_cache, None);
+        });
+        let b_project = project.clone();
+        let b_cache = cache_dir.clone();
+        let b = std::thread::spawn(move || {
+            let _lock = CacheLock::acquire(&b_cache).expect("acquire cache lock b");
+            let index = SearchIndex::build(&b_project);
+            index.write_to_disk(&b_cache, None);
+        });
+        a.join().expect("writer a");
+        b.join().expect("writer b");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir).is_some());
+    }
+
+    #[test]
+    fn search_index_atomic_rename_survives_partial_write() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("cache.bin.tmp.1.1"), b"partial").expect("write partial tmp");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
     }
 
     #[test]
@@ -2057,6 +2167,72 @@ mod tests {
         assert_eq!(clone_key.len(), 16);
         // Same repo (same root commit) → same cache key regardless of clone path
         assert_eq!(source_key, clone_key);
+    }
+
+    #[test]
+    fn git_head_unchanged_picks_up_local_edits() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("repo");
+        fs::create_dir_all(&project).expect("create repo dir");
+        let file = project.join("tracked.txt");
+        fs::write(&file, "oldtoken\n").expect("write file");
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .arg("init")
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let head = current_git_head(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = head.clone();
+        fs::write(&file, "newtoken\n").expect("edit tracked file");
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, head, Some(baseline));
+        let result = refreshed.search_grep("newtoken", true, &[], &[], &project, 10);
+
+        assert_eq!(result.total_matches, 1);
+    }
+
+    #[test]
+    fn non_git_project_reuses_cache_when_files_unchanged() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("file.txt"), "unchangedtoken\n").expect("write file");
+        let baseline = SearchIndex::build(&project);
+        let baseline_file_count = baseline.file_count();
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+
+        assert_eq!(refreshed.file_count(), baseline_file_count);
+        assert_eq!(
+            refreshed
+                .search_grep("unchangedtoken", true, &[], &[], &project, 10)
+                .total_matches,
+            1
+        );
     }
 
     #[test]
@@ -2194,8 +2370,17 @@ mod tests {
         lookup.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         lookup.extend_from_slice(&0u32.to_le_bytes());
 
-        fs::write(cache_dir.join("postings.bin"), postings).expect("write postings");
-        fs::write(cache_dir.join("lookup.bin"), lookup).expect("write lookup");
+        let postings_checksum = crc32fast::hash(&postings);
+        postings.extend_from_slice(&postings_checksum.to_le_bytes());
+        let lookup_checksum = crc32fast::hash(&lookup);
+        lookup.extend_from_slice(&lookup_checksum.to_le_bytes());
+        let mut cache = Vec::new();
+        cache.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+        cache.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        cache.extend_from_slice(&(postings.len() as u64).to_le_bytes());
+        cache.extend_from_slice(&postings);
+        cache.extend_from_slice(&lookup);
+        fs::write(cache_dir.join("cache.bin"), cache).expect("write cache");
 
         assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
     }

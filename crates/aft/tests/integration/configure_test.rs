@@ -54,6 +54,32 @@ fn configure_accepts_boolean_validate_on_edit() {
 }
 
 #[test]
+fn configure_warnings_frame_after_main_response() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-warning-order",
+            "command": "configure",
+            "project_root": dir.path(),
+            "lsp_auto_install_binaries": ["typescript-language-server"]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(configure["id"], "cfg-warning-order");
+    assert_eq!(configure["success"], true);
+    let frame = aft.merge_configure_warnings(configure.clone());
+    assert_eq!(frame["id"], "cfg-warning-order");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn configure_warns_for_missing_formatter_and_checker_tools() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();

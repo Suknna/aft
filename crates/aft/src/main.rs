@@ -97,6 +97,11 @@ fn main() {
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
                 let session_id_for_log = req.session_id.clone();
+                // For `configure`, the response frame must be the first frame a
+                // bridge observes for that request/session. The deferred
+                // configure_warnings worker in configure.rs deliberately waits
+                // until after dispatch returns so clients can register their
+                // configured state before processing async warning pushes.
                 let mut response =
                     log_ctx::with_session(session_id_for_log, || dispatch(req, &ctx));
                 attach_bg_completions(&mut response, &ctx, &session_id, &command);

@@ -19,7 +19,7 @@ use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
-    SearchIndex,
+    CacheLock, SearchIndex,
 };
 use crate::semantic_index::SemanticIndex;
 use crate::{slog_info, slog_warn};
@@ -1211,11 +1211,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     *ctx.semantic_embedding_model().borrow_mut() = None;
 
     let storage_dir = ctx.config().storage_dir.clone();
+    let mut search_index_cache_reused = false;
 
     if search_index {
         let cache_dir = resolve_cache_dir(&root_path, storage_dir.as_deref());
         let current_head = current_git_head(&root_path);
         let mut baseline = SearchIndex::read_from_disk(&cache_dir);
+        search_index_cache_reused = baseline.is_some();
 
         if let Some(index) = baseline.as_mut() {
             if current_head.is_some() && index.stored_git_head() == current_head.as_deref() {
@@ -1239,6 +1241,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_id_for_bg = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg, || {
+                let _cache_lock = match CacheLock::acquire(&cache_dir) {
+                    Ok(lock) => Some(lock),
+                    Err(error) => {
+                        slog_warn!("failed to acquire search cache lock: {}", error);
+                        None
+                    }
+                };
                 let index = SearchIndex::rebuild_or_refresh(
                     &root_clone,
                     search_index_max_file_size,
@@ -1360,6 +1369,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
                         let fingerprint = model.fingerprint(&semantic_config)?;
                         let fingerprint_key = fingerprint.as_string();
+                        let _semantic_cache_lock = semantic_storage.as_ref().and_then(|dir| {
+                            let semantic_cache_dir =
+                                dir.join("semantic").join(&semantic_project_key);
+                            match CacheLock::acquire(&semantic_cache_dir) {
+                                Ok(lock) => Some(lock),
+                                Err(error) => {
+                                    slog_warn!("failed to acquire semantic cache lock: {}", error);
+                                    None
+                                }
+                            }
+                        });
 
                         if let Some(ref dir) = semantic_storage {
                             if let Some(cached) = SemanticIndex::read_from_disk(
@@ -1583,6 +1603,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_id_for_frame = session_id_for_bg.clone();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg, || {
+                // The main configure response must be observable before this
+                // push frame. AFT's foreground loop writes responses
+                // immediately after `handle_configure` returns; yield briefly
+                // so tiny projects cannot race the response writer.
+                std::thread::sleep(std::time::Duration::from_millis(25));
                 let source_files: Vec<PathBuf> =
                     crate::callgraph::walk_project_files(&walk_root).collect();
                 let detected_languages: HashSet<LangId> = source_files
@@ -1627,6 +1652,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             "source_file_count_bounded": true,
             "warnings": [],
             "warnings_pending": true,
+            "search_index_cache_reused": search_index_cache_reused,
         }),
     )
 }

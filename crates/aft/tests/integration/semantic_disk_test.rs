@@ -182,6 +182,43 @@ fn read_from_corrupt_file_returns_none_and_logs_warning() {
 }
 
 #[test]
+fn semantic_cache_inconsistent_lengths_rebuilds() {
+    init_test_logger();
+
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let semantic_dir = storage.path().join("semantic").join("drift-project");
+    fs::create_dir_all(&semantic_dir).expect("create semantic dir");
+    let semantic_file = semantic_dir.join("semantic.bin");
+    let source = storage.path().join("src/lib.rs");
+
+    let mut bytes = Vec::new();
+    bytes.push(5u8);
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // dimension
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // one entry
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // no fingerprint
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // zero file metadata rows
+    push_string(&mut bytes, &source.to_string_lossy());
+    push_string(&mut bytes, "drift_symbol");
+    bytes.push(0u8);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(1u8);
+    push_string(&mut bytes, "fn drift_symbol() {}");
+    push_string(
+        &mut bytes,
+        "file:src/lib.rs kind:function name:drift_symbol",
+    );
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+    fs::write(&semantic_file, bytes).expect("write inconsistent semantic cache");
+
+    assert!(SemanticIndex::read_from_disk(storage.path(), "drift-project", None).is_none());
+    assert!(
+        !semantic_file.exists(),
+        "bad semantic cache should be removed"
+    );
+}
+
+#[test]
 fn stale_file_detected_after_deletion() {
     let project = tempfile::tempdir().expect("create project dir");
     let storage = tempfile::tempdir().expect("create storage dir");
