@@ -930,6 +930,28 @@ pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId
         }
     }
 
+    // TypeScript / JavaScript / TSX: `export function foo() {}` parses as
+    // `export_statement > function_declaration`. The function/class/etc.
+    // node alone starts AFTER the `export ` keyword, so symbol replace would
+    // produce a syntactically-broken `export export function foo() {}` if the
+    // agent's replacement content includes its own `export` (it almost always
+    // does, because they're replacing the *declaration*). Walk up to the
+    // export_statement so the range covers `export ...`/`export default ...`.
+    if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "export_statement" {
+                return node_range_with_decorators_inner(&parent, source, lang);
+            }
+        }
+    }
+
+    node_range_with_decorators_inner(node, source, lang)
+}
+
+/// Inner walk that handles preceding-sibling expansion (decorators, doc comments).
+/// Split from `node_range_with_decorators` so the export-statement parent path can
+/// recurse without re-checking the export wrapper.
+fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> Range {
     let mut range = node_range(node);
 
     let mut current = *node;
