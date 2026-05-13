@@ -57,11 +57,9 @@ struct TransactionOpError {
 ///       - `command` (string) — "write" or "edit_match"
 ///       - For "write": `content` (string)
 ///       - For "edit_match": `match` (string) + `replacement` (string)
-///   - `dry_run` (bool, optional) — preview without modifying disk
 ///
 /// On success: `{ ok, files_modified, results: [{ file, syntax_valid, formatted, format_skipped_reason }] }`
 /// On failure: `{ error: { code: "transaction_failed", message, failed_operation, rolled_back } }`
-/// On dry-run: `{ ok, dry_run, diffs: [{ file, diff, syntax_valid }] }`
 pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Parse operations ---
     let operations = match req.params.get("operations").and_then(|v| v.as_array()) {
@@ -93,13 +91,6 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             },
             Err(msg) => return Response::error(&req.id, "invalid_request", msg),
         }
-    }
-
-    let dry_run = edit::is_dry_run(&req.params);
-
-    // --- Dry-run path: compute diffs without touching disk ---
-    if dry_run {
-        return handle_dry_run(req, &parsed);
     }
 
     // --- Snapshot phase ---
@@ -428,60 +419,6 @@ fn compute_new_content(op: &ParsedOp) -> Result<String, TransactionOpError> {
 
             let (byte_start, byte_len) = find_single_fuzzy_match(&source, match_str, op)?;
             edit::replace_byte_range(&source, byte_start, byte_start + byte_len, replacement)
-                .map_err(|e| TransactionOpError {
-                    code: e.code(),
-                    message: e.to_string(),
-                })
-        }
-    }
-}
-
-/// Dry-run: compute per-file diffs without touching disk.
-fn handle_dry_run(req: &RawRequest, ops: &[ParsedOp]) -> Response {
-    let mut diffs: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
-
-    for op in ops {
-        let original = if op.file.exists() {
-            std::fs::read_to_string(&op.file).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let new_content = match compute_new_content_dry(op, &original) {
-            Ok(c) => c,
-            Err(err) => {
-                return Response::error(&req.id, err.code, err.message);
-            }
-        };
-
-        let dr = edit::dry_run_diff(&original, &new_content, &op.file);
-        diffs.push(serde_json::json!({
-            "file": op.file.display().to_string(),
-            "diff": dr.diff,
-            "syntax_valid": dr.syntax_valid,
-        }));
-    }
-
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "ok": true,
-            "dry_run": true,
-            "diffs": diffs,
-        }),
-    )
-}
-
-/// Compute new content for dry-run (uses provided original instead of re-reading).
-fn compute_new_content_dry(op: &ParsedOp, original: &str) -> Result<String, TransactionOpError> {
-    match &op.kind {
-        OpKind::Write { content } => Ok(content.clone()),
-        OpKind::EditMatch {
-            match_str,
-            replacement,
-        } => {
-            let (byte_start, byte_len) = find_single_fuzzy_match(original, match_str, op)?;
-            edit::replace_byte_range(original, byte_start, byte_start + byte_len, replacement)
                 .map_err(|e| TransactionOpError {
                     code: e.code(),
                     message: e.to_string(),
