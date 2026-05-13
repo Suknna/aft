@@ -22,6 +22,20 @@ export interface AftResponse {
  */
 const MAX_NOISE_LINES_IN_ERROR = 5;
 
+/**
+ * Return true if `parsed` is an aft response keyed by one of the request ids
+ * we sent. Push frames (`type: "configure_warnings"`, `type: "progress"`,
+ * `type: "bash_completed"`, etc.) have no `id` field and are excluded so the
+ * length-based response counter cannot mistake them for the response we want.
+ */
+function isResponseForRequest(parsed: unknown, expectedIds: Set<string>): boolean {
+  if (!parsed || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  const id = obj.id;
+  if (typeof id !== "string") return false;
+  return expectedIds.has(id);
+}
+
 export async function sendAftRequest(
   binaryPath: string,
   request: AftRequest,
@@ -68,6 +82,7 @@ export async function sendAftRequests(
       fn();
     };
 
+    const expectedIds = new Set(requests.map((req) => req.id));
     const handleLine = (line: string): void => {
       if (!line) return;
       // Fast-path the protocol: aft writes `{"id":...}` per response.
@@ -77,15 +92,29 @@ export async function sendAftRequests(
         noiseLines.push(line);
         return;
       }
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(line) as AftResponse;
-        responses.push(parsed);
-        if (responses.length === requests.length) {
-          finish(() => resolve(responses));
-        }
+        parsed = JSON.parse(line);
       } catch {
         // Looked like JSON but wasn't — also noise.
         noiseLines.push(line);
+        return;
+      }
+      // Skip push frames (configure_warnings, progress, bash_completed, etc.)
+      // and any other unsolicited JSON that isn't a response to one of our
+      // requests. These have no `id` field or have an id that doesn't match
+      // anything we sent. Issue #34: the configure_warnings frame for missing
+      // LSP binaries fired before the lsp_inspect response, so a strict
+      // length-based counter mistook it for the inspect response and the CLI
+      // reported "lsp_inspect failed" while strace caught the real response
+      // mid-write on the wire.
+      if (!isResponseForRequest(parsed, expectedIds)) {
+        return;
+      }
+      const response = parsed as AftResponse;
+      responses.push(response);
+      if (responses.length === requests.length) {
+        finish(() => resolve(responses));
       }
     };
 

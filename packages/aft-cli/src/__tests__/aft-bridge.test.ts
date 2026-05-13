@@ -221,6 +221,37 @@ describe("sendAftRequests — actionable errors when the binary fails", () => {
     expect(caught?.message).toContain("Got 1 valid response(s) before exit");
   });
 
+  test("skips push frames mixed with responses (issue #34 regression)", async () => {
+    // Issue #34: `aft doctor lsp` printed `lsp_inspect failed` even though
+    // the inspection succeeded. Root cause was the bridge emitting a
+    // configure_warnings push frame before the lsp_inspect response, and
+    // the response collector counted it as a response by length, dropping
+    // the real inspect response on the floor. Push frames have no `id` so
+    // they must be skipped, not counted.
+    const bin = makeFakeBinary(
+      "issue-34-push-frame",
+      `read line1
+      read line2
+      # Configure response
+      echo '{"id":"doctor-lsp-configure","success":true}'
+      # Push frame between responses — exactly what bit issue #34.
+      echo '{"type":"configure_warnings","project_root":"/x","warnings":[]}'
+      # The real inspect response we want
+      echo '{"id":"doctor-lsp-inspect","success":true,"file":"/x/y.py","diagnostics_count":2}'`,
+    );
+
+    const responses = await sendAftRequests(bin, [
+      { id: "doctor-lsp-configure", command: "configure" },
+      { id: "doctor-lsp-inspect", command: "lsp_inspect", file: "/x/y.py" },
+    ]);
+
+    expect(responses).toHaveLength(2);
+    expect(responses[0].id).toBe("doctor-lsp-configure");
+    expect(responses[1].id).toBe("doctor-lsp-inspect");
+    expect(responses[1].success).toBe(true);
+    expect(responses[1].diagnostics_count).toBe(2);
+  });
+
   test("does NOT crash with raw SyntaxError stack trace (issue #29 acceptance test)", async () => {
     // The failure mode: error message must not be a bare JS SyntaxError
     // stack. It must be a normal Error with a message that names the
