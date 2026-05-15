@@ -375,6 +375,17 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
+        // Ensure parent directory exists. This matters when restoring an
+        // operation that deleted a directory tree — the parent directories
+        // are gone by the time we try to write the file content back.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| AftError::IoError {
+                    path: parent.display().to_string(),
+                    message: e.to_string(),
+                })?;
+            }
+        }
         std::fs::write(path, &entry.content).map_err(|e| AftError::IoError {
             path: path.display().to_string(),
             message: e.to_string(),
@@ -1217,6 +1228,41 @@ mod tests {
         assert_eq!(restored.restored.len(), 1);
         assert_eq!(fs::read_to_string(&path_a).unwrap(), "a2");
         assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
+    }
+
+    #[test]
+    fn restore_recreates_missing_parent_directories() {
+        // Simulate aft_delete files: [dir/] with recursive: true:
+        // the parent directories are gone by the time we restore.
+        let dir = std::env::temp_dir().join("aft_backup_tests_recreate_parents");
+        let _ = fs::remove_dir_all(&dir);
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("inner.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut store = BackupStore::new();
+        let op_id = "op-recreate-parents-01";
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path, "original", Some(op_id))
+            .unwrap();
+
+        // Real-world delete sequence: tree is wiped before undo runs.
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!path.exists());
+        assert!(!nested.exists());
+        assert!(!dir.exists());
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 1);
+        assert!(
+            path.exists(),
+            "file should be restored even though both nested/ and dir/ were missing"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
