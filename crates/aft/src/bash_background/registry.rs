@@ -1950,6 +1950,21 @@ mod tests {
         // a wrapper crash that exited before persisting the exit code.
         let _ = std::fs::remove_file(&task.paths.exit);
 
+        // The watchdog thread may have already noticed the exit and marked
+        // the task terminal before this point — observed on fast Windows
+        // runners. We want to test `reap_child` directly on a task whose
+        // metadata is `Running` but whose child has exited without an exit
+        // marker, so explicitly reset the status here. This is the exact
+        // state shape we're testing the recovery logic for.
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+        }
+        // Clear the terminal_at marker too so mark_terminal_now() can fire
+        // again inside reap_child.
+        *task.terminal_at.lock().unwrap() = None;
+
         // Sanity: task is still Running per metadata (replay/poll hasn't
         // observed the missing marker yet).
         assert!(
@@ -2184,13 +2199,12 @@ mod tests {
         assert_eq!(shell.binary().as_ref(), "pwsh.exe");
     }
 
-    /// Issue #27 Oracle review P1: cmd wrapper MUST use `!ERRORLEVEL!` (not
-    /// `%ERRORLEVEL%`) to capture the user command's run-time exit code.
-    /// `%VAR%` is parse-time-expanded by cmd, so a wrapper using
-    /// `%ERRORLEVEL%` would record a stale value (typically 0 from cmd's
-    /// startup) regardless of what the user command returned. `!VAR!`
-    /// requires delayed expansion, which `WindowsShell::bg_command` enables
-    /// via `/V:ON`.
+    /// Issue #27 Oracle review P1, updated: cmd wrapper writes a `.bat` file
+    /// that batch-evaluates `%ERRORLEVEL%` on its own line (line-by-line
+    /// evaluation is the default for batch files; parse-time expansion only
+    /// applies to compound `&`-chained inline commands). Capturing
+    /// `%ERRORLEVEL%` into `set CODE=%ERRORLEVEL%` immediately after the user
+    /// command runs records the real run-time exit code.
     #[cfg(windows)]
     #[test]
     fn windows_shell_cmd_wrapper_writes_exit_marker_with_move() {
@@ -2198,43 +2212,52 @@ mod tests {
         let script =
             crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
 
-        // MUST use !ERRORLEVEL! (delayed expansion), NOT %ERRORLEVEL%
-        // (parse-time expansion). The latter would record a stale exit
-        // code regardless of what the user command actually returned.
+        // Batch wrapper: capture exit code into CODE on the line after the
+        // user command, then write CODE to a temp marker file before
+        // atomic-renaming it into place.
         assert!(
-            script.contains("& echo !ERRORLEVEL! >"),
-            "wrapper must use delayed expansion: {script}"
+            script.contains("set CODE=%ERRORLEVEL%"),
+            "wrapper must capture exit code into CODE: {script}"
         );
         assert!(
-            !script.contains("%ERRORLEVEL%"),
-            "wrapper must NOT use parse-time %ERRORLEVEL% expansion: {script}"
+            script.contains("echo %CODE% >"),
+            "wrapper must echo CODE to a temp marker file: {script}"
         );
-        assert!(script.contains("& move /Y"));
-        // move output should be redirected to nul to avoid polluting the
+        assert!(
+            script.contains("move /Y"),
+            "wrapper must use atomic move to write the marker: {script}"
+        );
+        // move output must be redirected to nul to avoid polluting the
         // user's captured stdout with "1 file(s) moved." lines.
         assert!(
             script.contains("> nul"),
             "wrapper must redirect move output to nul: {script}"
         );
+        // exit /B %CODE% propagates the real exit code so wait() sees it.
+        assert!(
+            script.contains("exit /B %CODE%"),
+            "wrapper must propagate the captured exit code: {script}"
+        );
         assert!(script.contains(r#""C:\Temp\bash-test.exit.tmp""#));
         assert!(script.contains(r#""C:\Temp\bash-test.exit""#));
     }
 
-    /// Issue #27 Oracle review P1: `bg_command()` for Cmd MUST prepend
-    /// `/V:ON` to enable delayed expansion AND `/S` to use simple-quote
-    /// parsing (so cmd's /C parser doesn't mangle the wrapper's internal
-    /// quotes from `cmd_quote`).
+    /// `bg_command()` for Cmd no longer needs `/V:ON` — the wrapper is now
+    /// written to a `.bat` file where batch-line evaluation captures
+    /// `%ERRORLEVEL%` correctly without delayed expansion. We still need
+    /// `/D` (skip AutoRun) and `/S` (simple quote-stripping for paths with
+    /// internal `"`-quoting from `cmd_quote`).
     #[cfg(windows)]
     #[test]
-    fn windows_shell_cmd_bg_command_enables_delayed_expansion() {
+    fn windows_shell_cmd_bg_command_uses_minimal_cmd_flags() {
         use crate::windows_shell::WindowsShell;
         let cmd = WindowsShell::Cmd.bg_command("echo wrapped");
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         let args_strs: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
         assert_eq!(
             args_strs,
-            vec!["/V:ON", "/D", "/S", "/C", "echo wrapped"],
-            "Cmd::bg_command must prepend /V:ON /D /S /C"
+            vec!["/D", "/S", "/C", "echo wrapped"],
+            "Cmd::bg_command must prepend /D /S /C"
         );
     }
 
