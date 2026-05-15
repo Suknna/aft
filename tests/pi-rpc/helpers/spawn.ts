@@ -75,7 +75,22 @@ function childEnv(configDir: string): Record<string, string> {
   result.OPENAI_API_KEY = "sk-mock";
   result.PI_OFFLINE = "1";
   result.PI_SKIP_VERSION_CHECK = "1";
-  result.PATH = `${join(REPO_ROOT, "target", "release")}${process.platform === "win32" ? ";" : ":"}${result.PATH ?? ""}`;
+  // Prepend BOTH target/release and target/debug to PATH so the Pi RPC
+  // tests find the aft binary regardless of which build the surrounding
+  // CI job produced:
+  //   - dedicated `pi-rpc-e2e` job:        cargo build --release  → target/release/aft
+  //   - workspace `Test` / `Test (macOS)`: cargo test --workspace → target/debug/aft
+  //
+  // Locally either may exist; release takes precedence to match the
+  // dedicated CI job's behavior. Mirrors the same fallback pattern used by
+  // packages/opencode-plugin/src/__tests__/e2e/helpers.ts and
+  // packages/pi-plugin/src/__tests__/e2e/helpers.ts (TARGET_DEBUG_BINARY).
+  const sep = process.platform === "win32" ? ";" : ":";
+  result.PATH = [
+    join(REPO_ROOT, "target", "release"),
+    join(REPO_ROOT, "target", "debug"),
+    result.PATH ?? "",
+  ].join(sep);
   return result;
 }
 
