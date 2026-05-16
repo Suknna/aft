@@ -248,6 +248,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 2 — serial apply. Backup + write must touch shared state (BackupStore
     // is `RefCell`-wrapped on AppContext) so this stays on the main thread.
+    let mut changes_to_apply: Vec<(FileChange, PathBuf, String)> = Vec::new();
     for change in computed {
         total_replacements += change.replacement_count;
         total_files += 1;
@@ -271,36 +272,77 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                     Err(resp) => return resp,
                 };
 
-            let backup_id = ctx
-                .backup()
-                .borrow_mut()
-                .snapshot_with_op(
-                    req.session(),
-                    validated_path.as_path(),
-                    "ast_replace",
-                    Some(&op_id),
-                )
-                .ok();
+            let backup_id = match ctx.backup().borrow_mut().snapshot_with_op(
+                req.session(),
+                validated_path.as_path(),
+                "ast_replace",
+                Some(&op_id),
+            ) {
+                Ok(id) => id,
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
 
+            changes_to_apply.push((change, validated_path, backup_id));
+        }
+    }
+
+    if !dry_run {
+        for (change, validated_path, _) in &changes_to_apply {
+            if let Err(e) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(validated_path.as_path())
+            {
+                return Response::error_with_data(
+                    &req.id,
+                    "io_error",
+                    format!(
+                        "ast_replace: failed to open '{}' for writing: {}; rolled_back: true",
+                        change.file_path.display(),
+                        e
+                    ),
+                    serde_json::json!({
+                        "rolled_back": true,
+                        "failed_file": change.file_path.display().to_string(),
+                    }),
+                );
+            }
+        }
+
+        let mut written_changes: Vec<(PathBuf, String)> = Vec::new();
+        for (change, validated_path, backup_id) in changes_to_apply {
             match std::fs::write(validated_path.as_path(), &change.new_content) {
                 Ok(()) => {
+                    written_changes.push((validated_path.clone(), change.original.clone()));
                     let mut entry = serde_json::json!({
                         "file": change.file_path.display().to_string(),
                         "replacements": change.replacement_count,
                     });
-                    if let Some(bid) = backup_id {
-                        if let Some(obj) = entry.as_object_mut() {
-                            obj.insert("backup_id".to_string(), serde_json::Value::String(bid));
-                        }
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert(
+                            "backup_id".to_string(),
+                            serde_json::Value::String(backup_id),
+                        );
                     }
                     file_results.push(entry);
                 }
                 Err(e) => {
-                    file_results.push(serde_json::json!({
-                        "file": change.file_path.display().to_string(),
-                        "ok": false,
-                        "error": e.to_string(),
-                    }));
+                    let rollback_error = rollback_written_changes(&written_changes);
+                    let rollback_ok = rollback_error.is_none();
+                    return Response::error_with_data(
+                        &req.id,
+                        "io_error",
+                        format!(
+                            "ast_replace: failed to write '{}': {}; rolled_back: {}",
+                            change.file_path.display(),
+                            e,
+                            rollback_ok
+                        ),
+                        serde_json::json!({
+                            "rolled_back": rollback_ok,
+                            "rollback_error": rollback_error,
+                            "failed_file": change.file_path.display().to_string(),
+                        }),
+                    );
                 }
             }
         }
@@ -328,6 +370,15 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     Response::success(&req.id, payload)
+}
+
+fn rollback_written_changes(written_changes: &[(PathBuf, String)]) -> Option<String> {
+    for (path, original) in written_changes.iter().rev() {
+        if let Err(e) = std::fs::write(path, original) {
+            return Some(format!("{}: {}", path.display(), e));
+        }
+    }
+    None
 }
 
 fn validate_matched_file_path(

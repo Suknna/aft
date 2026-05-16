@@ -87,7 +87,25 @@ fn delete_one_or_dir(
     recursive: bool,
     op_id: &str,
 ) -> Result<serde_json::Value, Response> {
-    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+    let requested_path = Path::new(file);
+    if is_symlink(requested_path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!("delete_file: failed to inspect '{}': {}", file, e),
+        )
+    })? {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "delete_file: refusing to delete symlink '{}'; symlink undo is not supported",
+                file
+            ),
+        ));
+    }
+
+    let path = match ctx.validate_path(&req.id, requested_path) {
         Ok(path) => path,
         Err(resp) => return Err(resp),
     };
@@ -97,6 +115,23 @@ fn delete_one_or_dir(
             &req.id,
             "file_not_found",
             format!("delete_file: file not found: {}", file),
+        ));
+    }
+
+    if is_symlink(&path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!("delete_file: failed to inspect '{}': {}", file, e),
+        )
+    })? {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "delete_file: refusing to delete symlink '{}'; symlink undo is not supported",
+                file
+            ),
         ));
     }
 
@@ -145,6 +180,14 @@ fn delete_one_or_dir(
         result["backup_id"] = serde_json::json!(id);
     }
     Ok(result)
+}
+
+fn is_symlink(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Recursively delete a directory after backing up every file inside.

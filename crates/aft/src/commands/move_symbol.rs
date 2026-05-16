@@ -28,6 +28,8 @@ use crate::symbols::SymbolKind;
 ///   results: [{ file, syntax_valid, formatted }] }`
 /// On failure after partial write: `{ error with failed_file, rolled_back }`
 pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
+
     // --- Extract and validate params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -414,6 +416,32 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let mut backup_ids: Vec<String> = Vec::new();
+    {
+        let mut files_to_backup: Vec<PathBuf> = vec![source_path.to_path_buf()];
+        if dest_path.exists() {
+            files_to_backup.push(dest_path.to_path_buf());
+        }
+        for (path, _, _) in &consumer_rewrites {
+            files_to_backup.push(path.clone());
+        }
+        files_to_backup.sort();
+        files_to_backup.dedup();
+
+        let mut backup_store = ctx.backup().borrow_mut();
+        for path in files_to_backup {
+            match backup_store.snapshot_with_op(
+                req.session(),
+                &path,
+                "move_symbol: pre-move backup",
+                Some(&op_id),
+            ) {
+                Ok(id) => backup_ids.push(id),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        }
+    }
+
     // --- Apply mutations ---
     // Track files for rollback
     let mut written_files: Vec<PathBuf> = Vec::new();
@@ -527,6 +555,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "files_modified": files_modified,
             "consumers_updated": consumers_updated,
             "checkpoint_name": checkpoint_name,
+            "backup_ids": backup_ids,
             "results": results,
         }),
     )

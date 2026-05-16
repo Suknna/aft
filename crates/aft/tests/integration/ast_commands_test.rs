@@ -234,6 +234,58 @@ fn ast_replace_operation_undo_restores_all_touched_files() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn ast_replace_unwritable_target_fails_without_partial_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = setup_project(&[
+        ("src/a.ts", "console.log(alpha);\n"),
+        ("src/z.ts", "console.log(beta);\n"),
+    ]);
+    let read_only = project.path().join("src/z.ts");
+    let original_a = read_file(project.path(), "src/a.ts");
+    let original_z = read_file(project.path(), "src/z.ts");
+
+    let mut perms = fs::metadata(&read_only).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-unwritable-target",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "logger.info($ARG)",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    let mut reset_perms = fs::metadata(&read_only).unwrap().permissions();
+    reset_perms.set_mode(0o644);
+    fs::set_permissions(&read_only, reset_perms).unwrap();
+
+    assert_eq!(
+        replace["success"], false,
+        "replace should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "io_error");
+    assert_eq!(
+        replace["rolled_back"], true,
+        "rollback should be reported: {replace:?}"
+    );
+    assert_eq!(read_file(project.path(), "src/a.ts"), original_a);
+    assert_eq!(read_file(project.path(), "src/z.ts"), original_z);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn ast_replace_dry_run_reports_counts_without_writing_files() {
     let original = "console.log(first);\nconsole.log(second);\n";

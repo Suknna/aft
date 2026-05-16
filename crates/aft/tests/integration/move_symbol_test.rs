@@ -413,6 +413,63 @@ fn move_symbol_checkpoint() {
     aft.shutdown();
 }
 
+#[test]
+fn move_symbol_operation_undo_restores_source_destination_and_consumers() {
+    let (_tmp, root) = setup_move_fixture();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let source = format!("{}/service.ts", root);
+    let dest = format!("{}/utils.ts", root);
+    let consumer_a = format!("{}/consumer_a.ts", root);
+    let consumer_e = format!("{}/features/consumer_e.ts", root);
+
+    let source_original = std::fs::read_to_string(&source).unwrap();
+    let dest_original = std::fs::read_to_string(&dest).unwrap();
+    let consumer_a_original = std::fs::read_to_string(&consumer_a).unwrap();
+    let consumer_e_original = std::fs::read_to_string(&consumer_e).unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"move-before-undo","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
+        source, dest
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(
+        resp["backup_ids"].as_array().unwrap().len() >= 4,
+        "move should snapshot source, destination, and consumers: {resp:?}"
+    );
+    assert_ne!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert_ne!(std::fs::read_to_string(&dest).unwrap(), dest_original);
+    assert_ne!(
+        std::fs::read_to_string(&consumer_a).unwrap(),
+        consumer_a_original
+    );
+    assert_ne!(
+        std::fs::read_to_string(&consumer_e).unwrap(),
+        consumer_e_original
+    );
+
+    let undo = aft.send(r#"{"id":"undo-move-symbol-operation","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert!(
+        undo["restored_count"].as_u64().unwrap() >= 4,
+        "undo should restore all touched files: {undo:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), dest_original);
+    assert_eq!(
+        std::fs::read_to_string(&consumer_a).unwrap(),
+        consumer_a_original
+    );
+    assert_eq!(
+        std::fs::read_to_string(&consumer_e).unwrap(),
+        consumer_e_original
+    );
+
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Error path tests
 // ---------------------------------------------------------------------------
