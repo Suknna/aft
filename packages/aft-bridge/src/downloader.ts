@@ -49,8 +49,9 @@ export function getCachedBinaryPath(version?: string): string | null {
 /**
  * Download the AFT binary for the current platform from GitHub releases.
  *
- * @param version - Git tag to download from (e.g. "v0.1.0"). If omitted,
- *   fetches the latest release tag via the GitHub API.
+ * @param version - Git tag to download from. Accepts either `"v0.1.0"` or
+ *   `"0.1.0"`; the `v` prefix is normalized internally. If omitted, fetches
+ *   the latest release tag via the GitHub API.
  * @returns Absolute path to the downloaded binary, or null on failure.
  */
 export async function downloadBinary(version?: string): Promise<string | null> {
@@ -69,11 +70,16 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   }
 
   // Resolve version if not provided
-  const tag = version ?? (await fetchLatestTag());
-  if (!tag) {
+  const rawTag = version ?? (await fetchLatestTag());
+  if (!rawTag) {
     error("Could not determine latest release version.");
     return null;
   }
+  // Normalize tag to always have the `v` prefix. GitHub release URLs and the
+  // versioned cache directory both expect `v`-prefixed tags. Without this,
+  // callers passing the bare version (e.g. `"0.25.1"`) construct broken
+  // URLs (404) and split the cache layout.
+  const tag = rawTag.startsWith("v") ? rawTag : `v${rawTag}`;
 
   // Version-specific cache: ~/.cache/aft/bin/<tag>/aft
   const versionedCacheDir = join(getCacheDir(), tag);
@@ -176,19 +182,28 @@ export async function downloadBinary(version?: string): Promise<string | null> {
 /**
  * Ensure the AFT binary is available: check cache, then download if needed.
  * This is the main entry point called by the resolver.
+ *
+ * @param version - Git tag (e.g. `"v0.25.1"` or `"0.25.1"` — both accepted).
+ *   Normalized to a `v`-prefixed tag internally so the on-disk cache layout
+ *   stays consistent regardless of caller convention.
  */
 export async function ensureBinary(version?: string): Promise<string | null> {
   if (version) {
+    // Normalize tag for cache lookup so a caller passing the bare version
+    // (e.g. `"0.25.1"`) finds the same cache entry that `downloadBinary`
+    // and `findBinarySync` write to (`~/.cache/aft/bin/v0.25.1/aft`).
+    const tag = version.startsWith("v") ? version : `v${version}`;
+
     // When a specific version is requested, ONLY check the versioned cache.
     // Do NOT fall back to legacy flat cache — it may contain a different version,
     // causing an infinite spawn-check-replace loop.
-    const versionCached = getCachedBinaryPath(version);
+    const versionCached = getCachedBinaryPath(tag);
     if (versionCached) {
-      log(`Found cached binary for ${version}: ${versionCached}`);
+      log(`Found cached binary for ${tag}: ${versionCached}`);
       return versionCached;
     }
-    log(`No cached binary for ${version}, downloading...`);
-    return downloadBinary(version);
+    log(`No cached binary for ${tag}, downloading...`);
+    return downloadBinary(tag);
   }
   // No version requested — download latest.
   log("No cached binary found, downloading latest...");
