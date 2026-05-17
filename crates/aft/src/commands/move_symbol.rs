@@ -417,9 +417,10 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let mut backup_ids: Vec<String> = Vec::new();
+    let dest_existed = dest_path.exists();
     {
         let mut files_to_backup: Vec<PathBuf> = vec![source_path.to_path_buf()];
-        if dest_path.exists() {
+        if dest_existed {
             files_to_backup.push(dest_path.to_path_buf());
         }
         for (path, _, _) in &consumer_rewrites {
@@ -440,6 +441,17 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
             }
         }
+        if !dest_existed {
+            match backup_store.snapshot_op_tombstone(
+                req.session(),
+                &op_id,
+                dest_path,
+                "move_symbol: destination file created during move",
+            ) {
+                Ok(id) => backup_ids.push(id),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        }
     }
 
     // --- Apply mutations ---
@@ -447,8 +459,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut written_files: Vec<PathBuf> = Vec::new();
     let mut new_files: Vec<PathBuf> = Vec::new();
     let mut results: Vec<serde_json::Value> = Vec::new();
-
-    let dest_existed = dest_path.exists();
 
     // 1. Write source file (symbol removed)
     match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
@@ -465,7 +475,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }));
         }
         Err(e) => {
-            restore_checkpoint(ctx, req.session(), &checkpoint_name);
+            if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
             return move_error(
                 &req.id,
                 file,
@@ -495,13 +509,22 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }));
         }
         Err(e) => {
-            restore_checkpoint(ctx, req.session(), &checkpoint_name);
-            cleanup_new_files(&new_files);
+            let mut files_to_delete = new_files.clone();
+            if !dest_existed {
+                files_to_delete.push(dest_path.to_path_buf());
+            }
+            let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
+            cleanup_new_files(&files_to_delete);
+            if restored {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
             return move_error(
                 &req.id,
                 destination,
                 &written_files,
-                &new_files,
+                &files_to_delete,
                 &format!("failed to write destination: {}", e),
             );
         }
@@ -525,8 +548,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 }));
             }
             Err(e) => {
-                restore_checkpoint(ctx, req.session(), &checkpoint_name);
+                let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
                 cleanup_new_files(&new_files);
+                if restored {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
                 return move_error(
                     &req.id,
                     &path.display().to_string(),
@@ -1199,7 +1227,7 @@ fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
 }
 
 /// Restore a checkpoint by name, scoped to the caller's session.
-fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) {
+fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> bool {
     let cp_store = ctx.checkpoint().borrow();
     if let Err(e) = cp_store.restore(session, name) {
         log::debug!(
@@ -1207,6 +1235,9 @@ fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) {
             name,
             e
         );
+        false
+    } else {
+        true
     }
 }
 

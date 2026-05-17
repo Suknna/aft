@@ -117,6 +117,18 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             snapshotted_files.push(op.file.clone());
         } else {
+            let tombstone_result = {
+                let mut store = ctx.backup().borrow_mut();
+                store.snapshot_op_tombstone(
+                    req.session(),
+                    &op_id,
+                    &op.file,
+                    "transaction: file created by transaction",
+                )
+            };
+            if let Err(e) = tombstone_result {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
             new_files.push(op.file.clone());
         }
     }
@@ -134,6 +146,11 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(c) => c,
             Err(err) => {
                 let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+                if failures.is_empty() {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
                 return transaction_error(
                     &req.id,
                     err.code,
@@ -165,6 +182,11 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             Err(e) => {
                 let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+                if failures.is_empty() {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
                 return transaction_error(
                     &req.id,
                     "transaction_failed",
@@ -182,6 +204,11 @@ pub fn handle_transaction(req: &RawRequest, ctx: &AppContext) -> Response {
     for (i, result) in results.iter().enumerate() {
         if result.file_result.syntax_valid == Some(false) {
             let failures = rollback(ctx, req.session(), &snapshotted_files, &new_files);
+            if failures.is_empty() {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
             return transaction_error(
                 &req.id,
                 "transaction_failed",

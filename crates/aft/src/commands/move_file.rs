@@ -106,6 +106,9 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(parent) = dst_path.parent() {
         if !parent.exists() {
             if let Err(e) = std::fs::create_dir_all(parent) {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
                 return Response::error(
                     &req.id,
                     "io_error",
@@ -113,6 +116,15 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
+    }
+
+    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
+        req.session(),
+        &op_id,
+        &dst_path,
+        "move_file: destination created during move",
+    ) {
+        return Response::error(&req.id, e.code(), e.to_string());
     }
 
     // Move the file
@@ -123,6 +135,9 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
             MoveOutcome::CopiedSourceDeleteFailed(message)
         }
         MoveOutcome::Failed(message) => {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), &op_id);
             return Response::error(
                 &req.id,
                 "io_error",
@@ -130,15 +145,6 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    if let Err(e) = ctx.backup().borrow_mut().snapshot_op_tombstone(
-        req.session(),
-        &op_id,
-        &dst_path,
-        "move_file: destination created during move",
-    ) {
-        return Response::error(&req.id, e.code(), e.to_string());
-    }
 
     log::debug!("move_file: {} -> {}", file, destination);
 

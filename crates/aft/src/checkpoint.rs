@@ -270,13 +270,42 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
                 path: path.display().to_string(),
             })?;
         if let Err(e) = write_restored_file(path, content, &mut created_dirs) {
-            for restored_path in restored_paths.iter().rev() {
-                if let Some(snapshot) = pre_restore_snapshot.get(restored_path) {
-                    let _ = restore_snapshot_file(restored_path, snapshot.as_deref());
+            let mut rollback_errors = Vec::new();
+            if let Some(snapshot) = pre_restore_snapshot.get(path) {
+                if let Err(rollback_error) = restore_snapshot_file(path, snapshot.as_deref()) {
+                    rollback_errors.push(format!("{}: {}", path.display(), rollback_error));
                 }
             }
-            rollback_created_dirs(&created_dirs);
-            return Err(e);
+            for restored_path in restored_paths.iter().rev() {
+                if let Some(snapshot) = pre_restore_snapshot.get(restored_path) {
+                    if let Err(rollback_error) =
+                        restore_snapshot_file(restored_path, snapshot.as_deref())
+                    {
+                        rollback_errors.push(format!(
+                            "{}: {}",
+                            restored_path.display(),
+                            rollback_error
+                        ));
+                    }
+                }
+            }
+            let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
+            if rollback_errors.is_empty() && dirs_rollback_ok {
+                return Err(e);
+            }
+            return Err(AftError::IoError {
+                path: path.display().to_string(),
+                message: format!(
+                    "{}; restore_checkpoint rollback_succeeded: {}; rollback_errors: {}",
+                    e,
+                    rollback_errors.is_empty() && dirs_rollback_ok,
+                    if rollback_errors.is_empty() {
+                        "none".to_string()
+                    } else {
+                        rollback_errors.join("; ")
+                    }
+                ),
+            });
         }
         restored_paths.push(path.clone());
     }
@@ -329,14 +358,20 @@ fn missing_parent_dirs(parent: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn rollback_created_dirs(dirs: &[PathBuf]) {
+fn rollback_created_dirs(dirs: &[PathBuf]) -> bool {
     let mut dirs = dirs.to_vec();
     dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
     dirs.dedup();
 
+    let mut ok = true;
     for dir in dirs {
-        let _ = std::fs::remove_dir(&dir);
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => ok = false,
+        }
     }
+    ok
 }
 
 fn current_timestamp() -> u64 {

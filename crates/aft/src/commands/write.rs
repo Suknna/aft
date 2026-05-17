@@ -68,17 +68,30 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         String::new()
     };
 
-    // Auto-backup existing file before overwriting
-    let backup_id = match edit::auto_backup(
-        ctx,
-        req.session(),
-        path.as_path(),
-        "write: pre-write backup",
-        Some(&op_id),
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
+    // Auto-backup existing files before overwriting. For create-only writes,
+    // record a tombstone so operation undo removes the created file.
+    let backup_id = if existed {
+        match edit::auto_backup(
+            ctx,
+            req.session(),
+            path.as_path(),
+            "write: pre-write backup",
+            Some(&op_id),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        }
+    } else {
+        match ctx.backup().borrow_mut().snapshot_op_tombstone(
+            req.session(),
+            &op_id,
+            path.as_path(),
+            "write: file created by write",
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         }
     };
 
@@ -87,6 +100,11 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
+                    if !existed {
+                        ctx.backup()
+                            .borrow_mut()
+                            .discard_operation_entries(req.session(), &op_id);
+                    }
                     return Response::error(
                         &req.id,
                         "invalid_request",
@@ -102,6 +120,11 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         match edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
+                if !existed {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };

@@ -72,10 +72,10 @@ fn write_creates_new_file() {
         resp["created"], true,
         "file was new, created should be true"
     );
-    // No backup_id for new files
+    // New files get a tombstone backup so undo can delete them.
     assert!(
-        resp.get("backup_id").is_none() || resp["backup_id"].is_null(),
-        "new file should not have backup_id"
+        resp["backup_id"].is_string(),
+        "new file should have tombstone backup_id"
     );
 
     // Verify content on disk

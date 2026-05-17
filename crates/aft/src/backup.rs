@@ -19,6 +19,7 @@ pub struct BackupEntry {
     pub backup_id: String,
     pub content: String,
     pub timestamp: u64,
+    pub order: u128,
     pub description: String,
     pub op_id: Option<String>,
     pub kind: BackupEntryKind,
@@ -137,11 +138,12 @@ impl BackupStore {
         })?;
 
         let key = canonicalize_key(path);
-        let id = self.next_id();
+        let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
             backup_id: id.clone(),
             content,
             timestamp: current_timestamp(),
+            order,
             description: description.to_string(),
             op_id: op_id.map(str::to_string),
             kind: BackupEntryKind::Content,
@@ -172,11 +174,12 @@ impl BackupStore {
         description: &str,
     ) -> Result<String, AftError> {
         let key = canonicalize_key(path);
-        let id = self.next_id();
+        let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
             backup_id: id.clone(),
             content: String::new(),
             timestamp: current_timestamp(),
+            order,
             description: description.to_string(),
             op_id: Some(op_id.to_string()),
             kind: BackupEntryKind::Tombstone,
@@ -208,13 +211,12 @@ impl BackupStore {
             self.load_from_disk_if_needed(session, &key);
         }
 
-        let mut latest: Option<((u64, u64), String)> = None;
+        let mut latest: Option<(u128, String)> = None;
         if let Some(files) = self.entries.get(session) {
             for stack in files.values() {
-                for entry in stack {
+                if let Some(entry) = stack.last() {
                     if let Some(op_id) = &entry.op_id {
-                        let seq = backup_sequence(&entry.backup_id).unwrap_or(0);
-                        let order = (entry.timestamp, seq);
+                        let order = entry.order;
                         if latest
                             .as_ref()
                             .map_or(true, |(latest_order, _)| order > *latest_order)
@@ -405,7 +407,10 @@ impl BackupStore {
             .and_then(|s| s.get(&key))
             .map_or(false, |s| !s.is_empty());
         if in_memory {
-            let result = self.do_restore(session, &key, path);
+            let warning = self.check_external_modification(session, &key, path);
+            let result = self
+                .do_restore(session, &key, path)
+                .map(|(entry, _)| (entry, warning));
             if result.is_ok() {
                 self.touch_session(session);
             }
@@ -493,9 +498,55 @@ impl BackupStore {
         total
     }
 
-    fn next_id(&self) -> String {
+    fn next_id_and_order(&self) -> (String, u128) {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("backup-{}", n)
+        let order = ((current_timestamp_nanos() as u128) << 32) | u128::from(n);
+        (format!("backup-{}", n), order)
+    }
+
+    pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        let keys: Vec<PathBuf> = self
+            .entries
+            .get(session)
+            .map(|files| files.keys().cloned().collect())
+            .unwrap_or_default();
+
+        for key in keys {
+            let mut remove_key = false;
+            let mut remaining_stack = None;
+            if let Some(session_entries) = self.entries.get_mut(session) {
+                if let Some(stack) = session_entries.get_mut(&key) {
+                    while stack
+                        .last()
+                        .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
+                    {
+                        stack.pop();
+                    }
+                    if stack.is_empty() {
+                        remove_key = true;
+                    } else {
+                        remaining_stack = Some(stack.clone());
+                    }
+                }
+                if remove_key {
+                    session_entries.remove(&key);
+                }
+            }
+
+            if remove_key {
+                self.remove_disk_backups(session, &key);
+            } else if let Some(stack) = remaining_stack {
+                self.write_snapshot_to_disk(session, &key, &stack);
+            }
+        }
+
+        if self
+            .entries
+            .get(session)
+            .is_some_and(|session_entries| session_entries.is_empty())
+        {
+            self.entries.remove(session);
+        }
     }
 
     fn touch_session(&mut self, session: &str) {
@@ -534,21 +585,35 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
-        // Ensure parent directory exists. This matters when restoring an
-        // operation that deleted a directory tree — the parent directories
-        // are gone by the time we try to write the file content back.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| AftError::IoError {
-                    path: parent.display().to_string(),
+        match entry.kind {
+            BackupEntryKind::Content => {
+                // Ensure parent directory exists. This matters when restoring an
+                // operation that deleted a directory tree — the parent directories
+                // are gone by the time we try to write the file content back.
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|e| AftError::IoError {
+                            path: parent.display().to_string(),
+                            message: e.to_string(),
+                        })?;
+                    }
+                }
+                std::fs::write(path, &entry.content).map_err(|e| AftError::IoError {
+                    path: path.display().to_string(),
                     message: e.to_string(),
                 })?;
             }
+            BackupEntryKind::Tombstone => match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(AftError::IoError {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            },
         }
-        std::fs::write(path, &entry.content).map_err(|e| AftError::IoError {
-            path: path.display().to_string(),
-            message: e.to_string(),
-        })?;
 
         stack.pop();
         if stack.is_empty() {
@@ -875,8 +940,16 @@ impl BackupStore {
                             meta.get("path").and_then(|v| v.as_str()),
                             meta.get("count").and_then(|v| v.as_u64()),
                         ) {
+                            let key = PathBuf::from(path_str);
+                            if !is_loadable_backup_path(&key, &path_dir) {
+                                crate::slog_warn!(
+                                    "skipping backup entry with invalid path metadata: {}",
+                                    meta_path.display()
+                                );
+                                continue;
+                            }
                             per_session.insert(
-                                PathBuf::from(path_str),
+                                key,
                                 DiskMeta {
                                     dir: path_dir.clone(),
                                     count: count as usize,
@@ -886,6 +959,9 @@ impl BackupStore {
                         }
                     }
                 }
+            }
+            if per_session.is_empty() {
+                self.disk_index.remove(&session_id);
             }
         }
         if total_entries > 0 {
@@ -948,17 +1024,24 @@ impl BackupStore {
                 }
                 BackupEntryKind::Tombstone => String::new(),
             };
+            let backup_id = meta
+                .and_then(|m| m.get("backup_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("disk-{}", i));
+            let timestamp = meta
+                .and_then(|m| m.get("timestamp"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let order = meta
+                .and_then(|m| m.get("order"))
+                .and_then(parse_order_value)
+                .unwrap_or_else(|| legacy_entry_order(timestamp, &backup_id));
             entries.push(BackupEntry {
-                backup_id: meta
-                    .and_then(|m| m.get("backup_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("disk-{}", i)),
+                backup_id,
                 content,
-                timestamp: meta
-                    .and_then(|m| m.get("timestamp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
+                timestamp,
+                order,
                 description: meta
                     .and_then(|m| m.get("description"))
                     .and_then(|v| v.as_str())
@@ -974,6 +1057,19 @@ impl BackupStore {
 
         if entries.is_empty() {
             return false;
+        }
+
+        if let Some(next_counter) = entries
+            .iter()
+            .filter_map(|entry| backup_sequence(&entry.backup_id))
+            .max()
+            .and_then(|max| max.checked_add(1))
+        {
+            let _ = self
+                .counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current < next_counter).then_some(next_counter)
+                });
         }
 
         self.entries
@@ -1043,6 +1139,7 @@ impl BackupStore {
                 serde_json::json!({
                     "backup_id": entry.backup_id,
                     "timestamp": entry.timestamp,
+                    "order": entry.order.to_string(),
                     "description": entry.description,
                     "op_id": entry.op_id,
                     "kind": match entry.kind {
@@ -1215,6 +1312,40 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn current_timestamp_nanos() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    nanos.min(u128::from(u64::MAX)) as u64
+}
+
+fn legacy_entry_order(timestamp_secs: u64, backup_id: &str) -> u128 {
+    let nanos = timestamp_secs.saturating_mul(1_000_000_000);
+    ((nanos as u128) << 32) | u128::from(backup_sequence(backup_id).unwrap_or(0))
+}
+
+fn parse_order_value(value: &serde_json::Value) -> Option<u128> {
+    value
+        .as_str()
+        .and_then(|s| s.parse::<u128>().ok())
+        .or_else(|| value.as_u64().map(u128::from))
+}
+
+fn is_loadable_backup_path(key: &Path, path_dir: &Path) -> bool {
+    if !key.is_absolute()
+        || key
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let Some(dir_name) = path_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    BackupStore::path_hash(key) == dir_name
 }
 
 fn stable_hash_16(bytes: &[u8]) -> String {
@@ -1842,5 +1973,103 @@ mod tests {
         let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
         assert_eq!(entry.op_id.as_deref(), Some("op-file"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "v1");
+    }
+
+    #[test]
+    fn per_file_restore_latest_deletes_tombstone() {
+        let dir = std::env::temp_dir().join("aft_backup_per_file_tombstone_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("created.txt");
+        fs::write(&path, "created").unwrap();
+
+        let mut store = BackupStore::new();
+        let id = store
+            .snapshot_op_tombstone(DEFAULT_SESSION_ID, "op-create", &path, "created")
+            .unwrap();
+
+        let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        assert_eq!(entry.backup_id, id);
+        assert!(!path.exists(), "tombstone undo should delete the file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_disk_index_skips_tampered_meta_path_hash_mismatch() {
+        let dir = std::env::temp_dir().join("aft_backup_tampered_meta_skip_test");
+        let _ = fs::remove_dir_all(&dir);
+        let backups = dir.join("backups");
+        let session_dir = backups.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let path_dir = session_dir.join("not-the-path-hash");
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": DEFAULT_SESSION_ID,
+                "last_accessed": current_timestamp(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(path_dir.join("0.bak"), "outside").unwrap();
+        fs::write(
+            path_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": DEFAULT_SESSION_ID,
+                "path": "/tmp/aft-malicious-overwrite-target.txt",
+                "count": 1,
+                "entries": [{
+                    "backup_id": "backup-0",
+                    "timestamp": current_timestamp(),
+                    "order": "1",
+                    "description": "tampered",
+                    "op_id": "op-tampered",
+                    "kind": "content",
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 72);
+
+        assert!(store.sessions_with_backups().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_last_operation_uses_only_top_entries_and_persisted_order() {
+        let path_a = temp_file("op_order_a.txt", "a1");
+        let path_b = temp_file("op_order_b.txt", "b1");
+        let mut store = BackupStore::new();
+
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_a, "buried", Some("op-buried"))
+            .unwrap();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path_a, "top without op")
+            .unwrap();
+        store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path_b, "top", Some("op-top"))
+            .unwrap();
+
+        let key_a = canonicalize_key(&path_a);
+        let key_b = canonicalize_key(&path_b);
+        let files = store.entries.get_mut(DEFAULT_SESSION_ID).unwrap();
+        files.get_mut(&key_a).unwrap()[0].order = u128::MAX;
+        files.get_mut(&key_a).unwrap()[1].order = 1;
+        files.get_mut(&key_b).unwrap()[0].order = 2;
+
+        fs::write(&path_a, "a2").unwrap();
+        fs::write(&path_b, "b2").unwrap();
+
+        let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(restored.op_id, "op-top");
+        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a2");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b1");
     }
 }

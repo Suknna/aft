@@ -470,6 +470,41 @@ fn move_symbol_operation_undo_restores_source_destination_and_consumers() {
     aft.shutdown();
 }
 
+#[test]
+fn move_symbol_undo_removes_new_destination_file() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("new_dest.ts");
+    write_file(
+        &source,
+        "export function keep() { return 1; }\nexport function moveMe() { return 2; }\n",
+    );
+
+    let source_original = std::fs::read_to_string(&source).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"move-to-new-dest","command":"move_symbol","file":"{}","symbol":"moveMe","destination":"{}"}}"#,
+        source.display(),
+        dest.display()
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(dest.exists(), "destination should be created");
+    assert_ne!(std::fs::read_to_string(&source).unwrap(), source_original);
+
+    let undo = aft.send(r#"{"id":"undo-move-new-dest","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert!(
+        !dest.exists(),
+        "new destination should be deleted by tombstone undo"
+    );
+
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Error path tests
 // ---------------------------------------------------------------------------

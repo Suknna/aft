@@ -73,6 +73,7 @@ fn test_checkpoint_create_restore_cycle() {
 
     let status = aft.shutdown();
     assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -179,6 +180,88 @@ fn test_operation_undo_restores_multiple_deleted_files() {
     assert_eq!(undo["restored_count"], 2);
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
     assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_write_created_file_deletes_it() {
+    let dir = temp_dir("undo_write_created_file");
+    let file = dir.join("created.txt");
+    let mut aft = AftProcess::spawn();
+
+    let write = serde_json::json!({
+        "id": "write-created",
+        "command": "write",
+        "file": file.display().to_string(),
+        "content": "new file\n",
+    });
+    let write_resp = aft.send(&serde_json::to_string(&write).unwrap());
+    assert_eq!(write_resp["success"], true, "write: {write_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "new file\n");
+
+    let undo = aft.send(r#"{"id":"undo-write-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(!file.exists(), "created file should be removed by undo");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_append_created_file_deletes_it() {
+    let dir = temp_dir("undo_append_created_file");
+    let file = dir.join("created-by-append.txt");
+    let mut aft = AftProcess::spawn();
+
+    let append = serde_json::json!({
+        "id": "append-created",
+        "command": "edit_match",
+        "op": "append",
+        "file": file.display().to_string(),
+        "appendContent": "appended\n",
+    });
+    let append_resp = aft.send(&serde_json::to_string(&append).unwrap());
+    assert_eq!(append_resp["success"], true, "append: {append_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "appended\n");
+
+    let undo = aft.send(r#"{"id":"undo-append-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(
+        !file.exists(),
+        "created append file should be removed by undo"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_transaction_created_file_deletes_it() {
+    let dir = temp_dir("undo_transaction_created_file");
+    let file = dir.join("created-by-transaction.txt");
+    let mut aft = AftProcess::spawn();
+
+    let tx = serde_json::json!({
+        "id": "transaction-created",
+        "command": "transaction",
+        "operations": [{
+            "command": "write",
+            "file": file.display().to_string(),
+            "content": "created in tx\n",
+        }],
+    });
+    let tx_resp = aft.send(&serde_json::to_string(&tx).unwrap());
+    assert_eq!(tx_resp["success"], true, "transaction: {tx_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "created in tx\n");
+
+    let undo = aft.send(r#"{"id":"undo-transaction-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(
+        !file.exists(),
+        "transaction-created file should be removed by undo"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -376,6 +459,75 @@ fn empty_subdir_blocks_recursive_delete() {
         empty_subdir.exists(),
         "empty subdirectory should remain intact"
     );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_socket_blocks_recursive_delete() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("aft_sock_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let content_file = dir.join("with_content.txt");
+    let socket_path = dir.join("socket.sock");
+    fs::write(&content_file, "content").unwrap();
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-socket-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains(&socket_path.display().to_string()),
+        "message should mention socket path: {resp:?}"
+    );
+    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(fs::read_to_string(&content_file).unwrap(), "content");
+    assert!(socket_path.exists(), "socket should remain intact");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    drop(_listener);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_link_blocks_recursive_delete() {
+    let dir = temp_dir("delete_recursive_blocks_hard_link");
+    let file = dir.join("file.txt");
+    let link = dir.join("file-hardlink.txt");
+    fs::write(&file, "content").unwrap();
+    fs::hard_link(&file, &link).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-hardlink-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "content");
+    assert_eq!(fs::read_to_string(&link).unwrap(), "content");
 
     let status = aft.shutdown();
     assert!(status.success());

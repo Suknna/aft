@@ -1,5 +1,7 @@
 //! Handler for the `delete_file` command: remove file(s) or directory with backup.
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use lsp_types::FileChangeType;
@@ -149,6 +151,34 @@ fn delete_one_or_dir(
         return delete_directory(req, ctx, &path, file, op_id);
     }
 
+    if !path.is_file() {
+        return Err(Response::error(
+            &req.id,
+            "unsupported_directory_contents",
+            format!(
+                "delete_file: refusing to delete unsupported non-regular file '{}'; undo cannot restore this file type",
+                file
+            ),
+        ));
+    }
+
+    if has_multiple_hard_links(&path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!("delete_file: failed to inspect '{}': {}", file, e),
+        )
+    })? {
+        return Err(Response::error(
+            &req.id,
+            "unsupported_directory_contents",
+            format!(
+                "delete_file: refusing to delete hard-linked file '{}'; undo cannot restore hard-link topology",
+                file
+            ),
+        ));
+    }
+
     // Backup before deletion
     let backup_id = edit::auto_backup(
         ctx,
@@ -188,6 +218,16 @@ fn is_symlink(path: &Path) -> std::io::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+#[cfg(unix)]
+fn has_multiple_hard_links(path: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::metadata(path)?.nlink() > 1)
+}
+
+#[cfg(not(unix))]
+fn has_multiple_hard_links(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Recursively delete a directory after backing up every file inside.
@@ -325,6 +365,12 @@ fn validate_directory_entries(
             unsupported_paths.push(path.display().to_string());
         } else if file_type.is_dir() {
             validate_directory_entries(&path, unsupported_paths)?;
+        } else if file_type.is_file() {
+            if has_multiple_hard_links(&path)? {
+                unsupported_paths.push(path.display().to_string());
+            }
+        } else {
+            unsupported_paths.push(path.display().to_string());
         }
     }
 
@@ -335,7 +381,7 @@ fn unsupported_directory_contents_message(paths: &[String]) -> String {
     const MAX_PATHS: usize = 5;
 
     let mut message = String::from(
-        "aft_delete with recursive: true does not yet support directory trees containing symlinks or empty directories. Restore would not recover these entries atomically.",
+        "aft_delete with recursive: true does not yet support directory trees containing symlinks, empty directories, hard links, sockets, device nodes, or other non-regular files. Restore would not recover these entries atomically.",
     );
     message.push_str(" Offending path(s): ");
     message.push_str(
@@ -360,7 +406,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
-        if file_type.is_file() || file_type.is_symlink() {
+        if file_type.is_file() {
             out.push(path);
         } else if file_type.is_dir() {
             collect_files(&path, out)?;

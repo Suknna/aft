@@ -292,6 +292,9 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 .write(true)
                 .open(validated_path.as_path())
             {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
                 return Response::error_with_data(
                     &req.id,
                     "io_error",
@@ -326,8 +329,16 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                     file_results.push(entry);
                 }
                 Err(e) => {
-                    let rollback_error = rollback_written_changes(&written_changes);
+                    let rollback_error = rollback_written_changes(
+                        &written_changes,
+                        Some((validated_path.as_path(), change.original.as_str())),
+                    );
                     let rollback_ok = rollback_error.is_none();
+                    if rollback_ok {
+                        ctx.backup()
+                            .borrow_mut()
+                            .discard_operation_entries(req.session(), &op_id);
+                    }
                     return Response::error_with_data(
                         &req.id,
                         "io_error",
@@ -372,7 +383,15 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, payload)
 }
 
-fn rollback_written_changes(written_changes: &[(PathBuf, String)]) -> Option<String> {
+fn rollback_written_changes(
+    written_changes: &[(PathBuf, String)],
+    attempted: Option<(&Path, &str)>,
+) -> Option<String> {
+    if let Some((path, original)) = attempted {
+        if let Err(e) = std::fs::write(path, original) {
+            return Some(format!("{}: {}", path.display(), e));
+        }
+    }
     for (path, original) in written_changes.iter().rev() {
         if let Err(e) = std::fs::write(path, original) {
             return Some(format!("{}: {}", path.display(), e));

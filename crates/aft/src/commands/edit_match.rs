@@ -163,7 +163,15 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
         }
     } else {
-        None
+        match ctx.backup().borrow_mut().snapshot_op_tombstone(
+            req.session(),
+            op_id,
+            path.as_path(),
+            "edit_match append: file created by append",
+        ) {
+            Ok(id) => Some(id),
+            Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+        }
     };
 
     // Capture before-content for diff computation if requested. Only read it
@@ -182,6 +190,11 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     {
         Ok(file_handle) => file_handle,
         Err(error) => {
+            if !existed {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), op_id);
+            }
             return Response::error(
                 &req.id,
                 "write_error",
@@ -191,6 +204,11 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     };
 
     if let Err(error) = file_handle.write_all(append_content.as_bytes()) {
+        if !existed {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), op_id);
+        }
         return Response::error(
             &req.id,
             "write_error",
@@ -347,6 +365,7 @@ fn handle_glob_edit_match(
     struct PendingEdit {
         path: std::path::PathBuf,
         file_str: String,
+        original_source: String,
         new_source: String,
         count: usize,
     }
@@ -380,6 +399,7 @@ fn handle_glob_edit_match(
         pending.push(PendingEdit {
             path: validated_path,
             file_str,
+            original_source: source,
             new_source,
             count,
         });
@@ -416,8 +436,6 @@ fn handle_glob_edit_match(
         Some(name)
     };
 
-    let mut written_paths: Vec<PathBuf> = Vec::new();
-
     for edit in &pending {
         if let Err(e) = edit::auto_backup(
             ctx,
@@ -436,11 +454,28 @@ fn handle_glob_edit_match(
     // Write all changed files under a checkpoint-backed transaction. If any
     // write fails, restore files already written so callers never observe a
     // partially-applied glob edit.
+    let mut written_paths: Vec<PathBuf> = Vec::new();
+
     for edit in &pending {
         if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
+            let mut rollback_ok = true;
             if let Some(name) = &checkpoint_name {
-                let _ = restore_glob_checkpoint(ctx, req.session(), name, &written_paths);
+                rollback_ok =
+                    restore_glob_checkpoint(ctx, req.session(), name, &written_paths).is_ok();
                 delete_glob_checkpoint(ctx, req.session(), name);
+            }
+            if let Err(rollback_error) = std::fs::write(&edit.path, &edit.original_source) {
+                crate::slog_warn!(
+                    "glob edit_match rollback: failed to restore attempted file {}: {}",
+                    edit.path.display(),
+                    rollback_error
+                );
+                rollback_ok = false;
+            }
+            if rollback_ok {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), op_id);
             }
             return Response::error(
                 &req.id,
