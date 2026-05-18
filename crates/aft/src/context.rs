@@ -403,6 +403,16 @@ impl AppContext {
     ///
     /// Stores `None` if there's no project_root or no matchable gitignore
     /// files. Logs build errors but never fails configure.
+    /// Clear any cached gitignore matcher without rebuilding.
+    ///
+    /// Used by `handle_configure` in degraded mode (e.g. `project_root == $HOME`)
+    /// where running the gitignore-discovery walk would exceed the configure
+    /// budget. The watcher event filter falls back to the hardcoded infra-dir
+    /// skip list when no matcher is present.
+    pub fn clear_gitignore(&self) {
+        *self.gitignore.borrow_mut() = None;
+    }
+
     pub fn rebuild_gitignore(&self) {
         use ignore::gitignore::GitignoreBuilder;
         use std::path::Path;

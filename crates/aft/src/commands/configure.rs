@@ -977,19 +977,20 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
 
-    // Rebuild gitignore matcher used by the watcher event filter to honor the
-    // user's `.gitignore` files instead of a hardcoded directory list.
-    // Cheap (~ms for typical projects) and bounded for huge monorepos via the
-    // walker's depth/filter_entry settings in `rebuild_gitignore`.
-    ctx.rebuild_gitignore();
-
-    // Detect "this is not really a project root" scenarios and prepare to
-    // auto-disable the heavy subsystems (search/semantic) so the bridge stays
-    // useful for read/write/edit/bash without burning CPU/RAM indexing the
-    // user's home tree. The decision is recorded on `AppContext` as a list
-    // of `degraded_reasons` strings; status / sidebar surfaces it, and we
-    // override `config.search_index` and `config.semantic_search` below
-    // before they're read by the subsystem builders.
+    // Detect "this is not really a project root" scenarios FIRST, before any
+    // walks that traverse `project_root` — `rebuild_gitignore()` below walks
+    // up to depth 8 to discover nested `.gitignore` files, and on `$HOME`
+    // that means walking through millions of files under `~/Library/Caches`,
+    // `~/Library/Application Support`, etc., which blows past configure's
+    // 30s budget. When we already know the root is degraded we skip the
+    // gitignore walk entirely; the matcher is only used by the watcher
+    // event filter, and watcher noise doesn't matter at `$HOME` because
+    // the heavy indexes that consume watcher events are disabled.
+    //
+    // The decision is recorded on `AppContext` as a list of `degraded_reasons`
+    // strings; status / sidebar surfaces it, and we override
+    // `config.search_index` and `config.semantic_search` below before they're
+    // read by the subsystem builders.
     //
     // Two checks here:
     //   1. Canonical path == `$HOME` — the original "Desktop launched from
@@ -1006,6 +1007,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let home_match = resolve_home_dir().is_some_and(|home| home == canonical_cache_root);
     if home_match {
         degraded_reasons.push("home_root".to_string());
+    }
+
+    // Rebuild gitignore matcher used by the watcher event filter to honor the
+    // user's `.gitignore` files instead of a hardcoded directory list.
+    // Cheap (~ms for typical projects) and bounded for huge monorepos via the
+    // walker's depth/filter_entry settings in `rebuild_gitignore`.
+    //
+    // Skipped entirely when `home_match` is true — the walk would traverse
+    // `~/Library/*` to depth 8, easily eating the full 30s configure budget.
+    // The watcher event filter falls back to the hardcoded infra-dir skip
+    // list, which is the v0.25.x behavior and fine for degraded mode.
+    if !home_match {
+        ctx.rebuild_gitignore();
+    } else {
+        // Clear any stale matcher from a previous non-home configure.
+        ctx.clear_gitignore();
     }
 
     // Optional feature flags from plugin config
