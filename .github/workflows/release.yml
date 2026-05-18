@@ -471,3 +471,55 @@ jobs:
         with:
           body_path: .alfonso/release-notes/${{ github.ref_name }}.md
           files: release-assets/*
+
+  # Announce on Discord after the GitHub release is created.
+  #
+  # Why this lives here (not in discord-release.yml as `on: release: published`):
+  # GitHub Actions intentionally suppresses event-triggered workflow cascades
+  # from `GITHUB_TOKEN`-authored events. `softprops/action-gh-release@v2` uses
+  # the default `GITHUB_TOKEN`, so the `release: published` event it emits does
+  # not trigger downstream workflows. Inlining the Discord post here is the
+  # cleanest fix (vs rotating PATs for release creation).
+  #
+  # `continue-on-error: true` keeps Discord failures from rolling back a
+  # successful release — if the webhook is down, the announcement can be
+  # retried via `gh workflow run discord-release.yml ...`.
+  discord-announce:
+    name: Announce on Discord
+    runs-on: ubuntu-latest
+    needs: github-release
+    if: success()
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read curated release notes
+        id: notes
+        run: |
+          notes_file=".alfonso/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::Curated release notes missing: $notes_file"
+            exit 1
+          fi
+          {
+            echo "body<<DISCORD_EOF"
+            cat "$notes_file"
+            echo "DISCORD_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to Discord
+        uses: SethCohen/github-releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          # Cortexkit teal — decimal value of #2C4A7C.
+          color: "2902140"
+          username: "AFT Releases"
+          # Reduce h1/h2 headings to fit Discord embed limits comfortably.
+          reduce_headings: true
+          # Keep PR/issue links — useful context in Discord.
+          remove_github_reference_links: false
+          footer_title: "Changelog"
+          footer_timestamp: true
+          release_name: ${{ github.ref_name }}
+          release_body: ${{ steps.notes.outputs.body }}
+          release_html_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}

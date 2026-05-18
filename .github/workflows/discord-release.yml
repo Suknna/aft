@@ -1,20 +1,28 @@
-# Announce GitHub releases to the Cortexkit Discord server.
+# Manual Discord re-announce workflow.
 #
-# Fires on `release: published` — when the release.yml workflow's
-# `Create GitHub Release` step transitions the release to published state
-# (using the curated body from .alfonso/release-notes/<tag>.md).
+# The primary path is `release.yml`'s `discord-announce` job which posts
+# to Discord automatically after `Create GitHub Release` completes — see
+# the comment block in release.yml for why we can't use the natural
+# `on: release: published` trigger (GitHub Actions suppresses workflow
+# cascades from GITHUB_TOKEN-authored events).
+#
+# This workflow is kept as a manual override for cases like:
+#   - Re-firing an announcement after a webhook outage
+#   - Posting about an external/manual release
+#   - Testing webhook formatting without cutting a release
+#
+# Fire via:
+#   gh workflow run discord-release.yml \
+#     -f release_name="v0.X.Y" \
+#     -f release_body="$(gh release view v0.X.Y --json body --jq .body)" \
+#     -f release_html_url="$(gh release view v0.X.Y --json url --jq .url)"
 #
 # Discord webhook URL lives as a repository secret:
 #   Settings → Secrets and variables → Actions → DISCORD_RELEASE_WEBHOOK_URL
-#
-# To test without cutting a real release, fire manually via workflow_dispatch
-# with release_name + release_body + release_html_url.
 
-name: Discord Release Announcement
+name: Discord Release Announcement (manual)
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_name:
