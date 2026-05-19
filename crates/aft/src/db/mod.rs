@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+pub mod backups;
 pub mod bash_tasks;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;

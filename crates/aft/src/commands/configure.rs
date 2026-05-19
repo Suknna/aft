@@ -996,8 +996,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.config_mut().project_root = Some(root_path.clone());
     ctx.config_mut().harness = Some(harness);
     ctx.set_harness(harness);
+    ctx.backup().borrow().set_db_harness(harness);
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
+    ctx.backup()
+        .borrow()
+        .set_db_project_key(crate::search_index::project_cache_key(
+            &canonical_cache_root,
+        ));
 
     // Detect "this is not really a project root" scenarios FIRST, before any
     // walks that traverse `project_root` — `rebuild_gitignore()` below walks
@@ -1208,10 +1214,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(conn) => {
             let shared = Arc::new(Mutex::new(conn));
             ctx.set_db(shared.clone());
+            ctx.backup().borrow().set_db_pool(shared.clone());
             ctx.bash_background().set_db_pool(shared);
         }
         Err(err) => {
             ctx.clear_db();
+            ctx.backup().borrow().clear_db_pool();
             ctx.bash_background().clear_db_pool();
             slog_warn!(
                 "failed to open aft.db at {}: {} — running with JSON-only persistence",

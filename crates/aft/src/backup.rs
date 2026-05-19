@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
+use rusqlite::Connection;
+
+use crate::db::backups::BackupRow;
 use crate::error::AftError;
 use sha2::{Digest, Sha256};
 
@@ -29,6 +33,37 @@ pub struct BackupEntry {
 pub enum BackupEntryKind {
     Content,
     Tombstone,
+}
+
+impl BackupEntry {
+    fn to_backup_row<'a>(
+        &'a self,
+        harness: &'a str,
+        session_id: &'a str,
+        project_key: &'a str,
+        file_path: &'a str,
+        path_hash: &'a str,
+        backup_path: Option<&'a str>,
+    ) -> BackupRow<'a> {
+        BackupRow {
+            backup_id: &self.backup_id,
+            harness,
+            session_id,
+            project_key,
+            op_id: self.op_id.as_deref(),
+            order: self.order,
+            file_path,
+            path_hash,
+            backup_path,
+            kind: match self.kind {
+                BackupEntryKind::Content => "content",
+                BackupEntryKind::Tombstone => "tombstone",
+            },
+            description: &self.description,
+            created_at: i64::try_from(self.timestamp).unwrap_or(i64::MAX),
+            is_tombstone: matches!(self.kind, BackupEntryKind::Tombstone),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +107,9 @@ pub struct BackupStore {
     session_meta: HashMap<String, SessionMeta>,
     counter: AtomicU64,
     storage_dir: Option<PathBuf>,
+    db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
+    db_harness: RwLock<Option<String>>,
+    db_project_key: RwLock<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +133,33 @@ impl BackupStore {
             session_meta: HashMap::new(),
             counter: AtomicU64::new(0),
             storage_dir: None,
+            db_pool: RwLock::new(None),
+            db_harness: RwLock::new(None),
+            db_project_key: RwLock::new(None),
+        }
+    }
+
+    pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
+        if let Ok(mut slot) = self.db_pool.write() {
+            *slot = Some(conn);
+        }
+    }
+
+    pub fn clear_db_pool(&self) {
+        if let Ok(mut slot) = self.db_pool.write() {
+            *slot = None;
+        }
+    }
+
+    pub fn set_db_harness(&self, harness: crate::harness::Harness) {
+        if let Ok(mut slot) = self.db_harness.write() {
+            *slot = Some(harness.as_str().to_string());
+        }
+    }
+
+    pub fn set_db_project_key(&self, project_key: String) {
+        if let Ok(mut slot) = self.db_project_key.write() {
+            *slot = Some(project_key);
         }
     }
 
@@ -1172,10 +1237,74 @@ impl BackupStore {
             .insert(
                 key.to_path_buf(),
                 DiskMeta {
-                    dir,
+                    dir: dir.clone(),
                     count: stack.len(),
                 },
             );
+        self.dual_write_stack_to_db(session, key, &dir, stack);
+    }
+
+    fn dual_write_stack_to_db(&self, session: &str, key: &Path, dir: &Path, stack: &[BackupEntry]) {
+        let pool = self.db_pool.read().ok().and_then(|slot| slot.clone());
+        let Some(pool) = pool else {
+            return;
+        };
+        let harness = self.db_harness.read().ok().and_then(|slot| slot.clone());
+        let Some(harness) = harness else {
+            crate::slog_warn!(
+                "dual-write backup to DB skipped for {}: harness not configured",
+                key.display()
+            );
+            return;
+        };
+        let project_key = self
+            .db_project_key
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(project_key) = project_key else {
+            crate::slog_warn!(
+                "dual-write backup to DB skipped for {}: project key not configured",
+                key.display()
+            );
+            return;
+        };
+
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => {
+                crate::slog_warn!(
+                    "dual-write backup to DB failed for {}: db mutex poisoned",
+                    key.display()
+                );
+                return;
+            }
+        };
+        let path_hash = Self::path_hash(key);
+        let file_path = key.display().to_string();
+        for (index, entry) in stack.iter().enumerate() {
+            let backup_path = match entry.kind {
+                BackupEntryKind::Content => {
+                    Some(dir.join(format!("{}.bak", index)).display().to_string())
+                }
+                BackupEntryKind::Tombstone => None,
+            };
+            let row = entry.to_backup_row(
+                &harness,
+                session,
+                &project_key,
+                &file_path,
+                &path_hash,
+                backup_path.as_deref(),
+            );
+            if let Err(error) = crate::db::backups::upsert_backup(&conn, &row) {
+                crate::slog_warn!(
+                    "dual-write backup to DB failed for {}: {}",
+                    entry.backup_id,
+                    error
+                );
+            }
+        }
     }
 
     fn remove_disk_backups(&mut self, session: &str, key: &Path) {
