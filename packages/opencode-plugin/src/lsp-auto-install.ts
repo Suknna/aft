@@ -19,7 +19,7 @@
  *           installed, log a warning and keep the existing version.
  *           Otherwise skip + warn.
  *
- *   3. Spawn `bun add <pkg>@<version> --cwd <cache_dir> --ignore-scripts`
+ *   3. Spawn `npm install --no-save <pkg>@<version> --ignore-scripts`
  *      in the background. Drop a lockfile while running. Log progress.
  *
  *   4. The newly-installed binary will be picked up on the user's NEXT
@@ -181,7 +181,7 @@ async function resolveTargetVersion(
   // Audit-3 v0.17 #2: validate `cached.latest_eligible` with assertSafeVersion
   // before consuming it. The cache file is JSON we wrote ourselves, but a
   // disk-tampering attacker (or a future bug that writes garbage) could put
-  // a shell-injectable string there. `bun add <pkg>@<version>` then receives
+  // a shell-injectable string there. `npm install <pkg>@<version>` then receives
   // attacker-controlled input. Treat any rejected cached version as a cache
   // miss and force a fresh probe — the next branch already handles that.
   const cached = readVersionCheck(spec.npm);
@@ -207,10 +207,21 @@ async function resolveTargetVersion(
 }
 
 /**
- * Spawn `bun add <pkg>@<version>` in the cache dir.
+ * Spawn `npm install --no-save <pkg>@<version>` in the cache dir.
  *
  * Uses `--ignore-scripts` to neutralize lifecycle hooks (the v0.16 audit
  * hardening). Output goes to plugin log.
+ *
+ * Previously this used `bun add`, but OpenCode runs under whichever runtime
+ * the user has installed (Node 22 is common), and bun is not guaranteed to
+ * be on PATH. Every install would fail silently with ENOENT, so users
+ * without bun saw recurring `lsp_binary_missing` warnings for newer servers
+ * like `@vue/language-server` even though `lsp.auto_install` was true.
+ * GitHub #46 reported this exact symptom against v0.27.0.
+ *
+ * npm is guaranteed to be present whenever the plugin runs through OpenCode's
+ * normal CLI distribution path, matches Pi's auto-install behavior, and is
+ * what OpenCode itself uses for its built-in LSP auto-install.
  */
 function runInstall(
   spec: NpmServerSpec,
@@ -228,9 +239,9 @@ function runInstall(
       return;
     }
 
-    const child = spawn("bun", ["add", target, "--cwd", cwd, "--ignore-scripts", "--silent"], {
+    const child = spawn("npm", ["install", "--no-save", "--ignore-scripts", "--silent", target], {
       stdio: ["ignore", "pipe", "pipe"],
-      // No PATH manipulation — uses the same `bun` that's running this plugin.
+      cwd,
     });
     child.unref();
 
@@ -260,7 +271,7 @@ function runInstall(
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
     child.stdout?.on("data", () => {
-      // Suppress stdout — npm-bun chatter is noisy.
+      // Suppress stdout — npm chatter is noisy.
     });
     child.stderr?.on("data", (chunk) => {
       const text = String(chunk);
@@ -295,7 +306,7 @@ async function ensureServerInstalled(
 ): Promise<{ started: boolean; reason?: string }> {
   // The lock MUST be held through install completion, not just through the
   // start decision. Two parallel sessions would otherwise both pass the
-  // "is install needed" check and run `bun add` into the same cache dir
+  // "is install needed" check and run `npm install` into the same cache dir
   // concurrently, corrupting node_modules.
   //
   // We hold the lock for the full install promise via withInstallLock(). The
@@ -399,7 +410,7 @@ async function ensureServerInstalled(
 /**
  * Lazy import to avoid a runtime `require` at module top.
  *
- * Returns the directory `<cache>/<encoded-pkg>/` where `bun add` should
+ * Returns the directory `<cache>/<encoded-pkg>/` where `npm install` should
  * place `node_modules/`.
  */
 function cachedPackageDir(npmPackage: string): string {
@@ -415,7 +426,7 @@ function cachedPackageDir(npmPackage: string): string {
  * Audit-2 v0.17 #1: TOFU verification for npm-distributed LSP servers.
  * GitHub installs hash the downloaded archive; npm installs hash the
  * resolved binary file directly because there's no single archive
- * (bun extracts node_modules across many files).
+ * (npm extracts node_modules across many files).
  *
  * On Windows we may need the `.cmd` shim — `lspBinaryPath` doesn't
  * resolve shims, so retry common Windows extensions if the bare path

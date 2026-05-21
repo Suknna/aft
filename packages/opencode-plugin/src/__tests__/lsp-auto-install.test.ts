@@ -234,7 +234,7 @@ describe("runAutoInstall", () => {
       fakeFetch(),
     );
     // Synchronously the install was kicked off (installsStarted >= 1 before the
-    // promise settles). The actual `bun add` will fail (no network in test) but
+    // promise settles). The actual `npm install` will fail (no network in test) but
     // that is logged, not surfaced here.
     expect(result.installsStarted).toBeGreaterThan(0);
   });
@@ -253,8 +253,28 @@ describe("runAutoInstall", () => {
     expect(result.installsStarted).toBe(0);
   });
 
-  test("runInstall unreferences spawned bun children", () => {
+  test("runInstall unreferences spawned npm children", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
     expect(source).toContain("child.unref()");
+  });
+
+  // GitHub #46: OpenCode plugin previously spawned `bun add`, which silently
+  // failed for users without bun on PATH (Node 22 users, npm-only setups).
+  // Every install would ENOENT and recurring `lsp_binary_missing` warnings
+  // appeared for newer servers (e.g. @vue/language-server) even though
+  // `lsp.auto_install` was true. The fix routes installs through npm (which
+  // is guaranteed to exist whenever the plugin reaches the user), matching
+  // Pi's existing behavior. Lock this in so a future refactor cannot
+  // silently reintroduce a bun dependency.
+  test("runInstall spawns npm, not bun (GitHub #46)", () => {
+    const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
+    // The runtime spawn call must use npm.
+    expect(source).toMatch(
+      /spawn\(\s*["']npm["']\s*,\s*\[\s*["']install["']\s*,\s*["']--no-save["']/,
+    );
+    // There must be no live `spawn("bun", ...)` call. Comments referencing
+    // the old behavior are fine (they explain the historical bug); only a
+    // real spawn would reintroduce the regression.
+    expect(source).not.toMatch(/spawn\(\s*["']bun["']/);
   });
 });
