@@ -113,6 +113,12 @@ echo "→ Syncing versions to $VERSION..."
 bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
+# Regenerate the JSON Schema asset so editor `$schema` URLs always resolve
+# to a schema that matches the shipped config surface for this release.
+echo "→ Rebuilding aft.schema.json..."
+bun packages/opencode-plugin/scripts/build-schema.ts
+echo ""
+
 # Refresh bun.lock so workspace package versions match the bumped
 # package.json files. Without this, CI's `bun install --frozen-lockfile`
 # fails because the lockfile still pins the old versions.

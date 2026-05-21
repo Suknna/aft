@@ -1,5 +1,6 @@
 import type { HarnessAdapter } from "../adapters/types.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
+import { ensureAftSchemaUrl } from "../lib/jsonc.js";
 import { intro, log, note, outro } from "../lib/prompts.js";
 
 export async function runSetup(argv: string[]): Promise<number> {
@@ -38,6 +39,22 @@ export async function runSetup(argv: string[]): Promise<number> {
         break;
       default:
         log.info(`${adapter.displayName}: ${result.message}`);
+    }
+
+    // Ensure aft.jsonc has $schema pointing at the generated JSON Schema so
+    // editors get autocomplete + validation for AFT config fields.
+    try {
+      const { aftConfig, aftConfigFormat } = adapter.detectConfigPaths();
+      const schemaResult = ensureAftSchemaUrl(aftConfig, aftConfigFormat);
+      if (schemaResult.action === "added" || schemaResult.action === "updated") {
+        log.success(`${adapter.displayName}: ${schemaResult.message}`);
+      }
+    } catch (error) {
+      log.warn(
+        `${adapter.displayName}: could not set $schema on aft.jsonc: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
 
     printNextSteps(adapter);

@@ -90,6 +90,12 @@ export interface ConfigureExperimentalOverrides {
 export type ToolSurface = "minimal" | "recommended" | "all";
 
 export interface AftConfig {
+  /**
+   * Optional JSON Schema URL for editor tooling. Runtime no-op — only present
+   * so VS Code/Cursor/etc. pick up the published schema for autocomplete +
+   * validation. `aft setup` auto-inserts this.
+   */
+  $schema?: string;
   format_on_edit?: boolean;
   /** Maximum formatter subprocess wallclock seconds. Bounded 1..=600. Default 10. */
   formatter_timeout_secs?: number;
@@ -211,6 +217,12 @@ const ExperimentalConfigSchema = z.object({
 
 export const AftConfigSchema = z
   .object({
+    /**
+     * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+     * runtime — only present so VS Code/Cursor/etc. pick up the published
+     * schema for autocomplete + validation. `aft setup` auto-inserts this.
+     */
+    $schema: z.string().optional(),
     format_on_edit: z.boolean().optional(),
     formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
     validate_on_edit: z.enum(["syntax", "full"]).optional(),

@@ -24,6 +24,7 @@
     "test": "bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
     "lint": "biome check src",
+    "schema": "bun scripts/build-schema.ts",
     "prepublishOnly": "bun run build"
   },
   "dependencies": {

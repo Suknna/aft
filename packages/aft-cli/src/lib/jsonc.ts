@@ -58,3 +58,62 @@ export function writeJsoncFile(
     format === "jsonc" ? stringifyJsonc(value, null, 2) : JSON.stringify(value, null, 2);
   writeFileSync(path, `${serialized}\n`);
 }
+
+/** Canonical URL of the published AFT config schema. */
+export const AFT_SCHEMA_URL =
+  "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json";
+
+export type AftSchemaAction = "added" | "updated" | "unchanged";
+
+/**
+ * Ensure `aft.jsonc` (or `aft.json`) contains a top-level `$schema` field
+ * pointing at the published AFT JSON Schema. Editor tooling (VS Code, Cursor,
+ * etc.) uses this for autocomplete and validation.
+ *
+ * Creates the file with `{"$schema": "..."}` if missing. Preserves existing
+ * comments and field ordering when the file exists.
+ *
+ * `format` follows the harness adapter contract: `"none"` means no file
+ * existed before — written as `.json` by default so editors that don't grok
+ * JSONC still parse it. Pass `"jsonc"` to keep existing JSONC files as JSONC.
+ */
+export function ensureAftSchemaUrl(
+  path: string,
+  format: JsoncFormat,
+): { action: AftSchemaAction; message: string } {
+  const existed = existsSync(path);
+  if (!existed) {
+    const writeFormat: JsoncFormat = format === "jsonc" ? "jsonc" : "json";
+    writeJsoncFile(path, { $schema: AFT_SCHEMA_URL }, writeFormat);
+    return {
+      action: "added",
+      message: `created ${path} with $schema URL for editor autocomplete`,
+    };
+  }
+
+  const { value, error } = readJsoncFile(path);
+  if (!value) {
+    throw new Error(error ? `failed to parse ${path}: ${error}` : `failed to parse ${path}`);
+  }
+
+  const previous = value.$schema;
+  if (previous === AFT_SCHEMA_URL) {
+    return { action: "unchanged", message: `$schema already present in ${path}` };
+  }
+
+  // Mutate in place so comment-json preserves the comment associations on
+  // the existing object. Spreading into a fresh literal would drop them.
+  value.$schema = AFT_SCHEMA_URL;
+  writeJsoncFile(path, value, format === "none" ? "json" : format);
+
+  if (previous === undefined) {
+    return {
+      action: "added",
+      message: `added $schema URL to ${path} for editor autocomplete`,
+    };
+  }
+  return {
+    action: "updated",
+    message: `updated $schema URL in ${path}`,
+  };
+}

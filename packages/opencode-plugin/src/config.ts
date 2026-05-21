@@ -118,6 +118,12 @@ const ExperimentalConfigSchema = z.object({
 
 export const AftConfigSchema = z
   .object({
+    /**
+     * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+     * runtime — only present so VS Code/Cursor/etc. pick up the published
+     * schema for autocomplete + validation. `aft setup` auto-inserts this.
+     */
+    $schema: z.string().optional(),
     /** Whether to auto-format files after edits. Default: true. */
     format_on_edit: z.boolean().optional(),
     /**
