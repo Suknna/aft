@@ -52,7 +52,11 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let existed = path.exists();
 
-    let original = if edit::wants_diff(&req.params) && existed {
+    // Capture pre-write content when the file exists so we can detect no-op
+    // writes (file content byte-identical to original) and emit honest
+    // `no_op: true` for UIs. Used by diff metadata too when requested.
+    // See GitHub #45.
+    let original = if existed {
         match std::fs::read_to_string(path.as_path()) {
             Ok(content) => content,
             Err(error) => {
@@ -168,10 +172,18 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
 
-    // Include diff info if requested (for UI metadata)
+    // Read final on-disk content once for no_op detection + diff metadata.
+    // Honest reporting: when the file existed AND the post-write content is
+    // byte-identical to `original`, surface `no_op: true` so UIs can render
+    // "wrote, but no net change" instead of a bare "File updated". See
+    // GitHub #45.
+    let final_content =
+        std::fs::read_to_string(path.as_path()).unwrap_or_else(|_| content.to_string());
+    if existed && original == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if edit::wants_diff(&req.params) {
-        let final_content =
-            std::fs::read_to_string(path.as_path()).unwrap_or_else(|_| content.to_string());
         result["diff"] = edit::compute_diff_info(&original, &final_content);
     }
 

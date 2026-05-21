@@ -128,4 +128,83 @@ describe("buildMutationResult", () => {
     expect(result.details?.deletions).toBe(0);
     expect(result.details?.truncated).toBeUndefined();
   });
+
+  // ---------------------------------------------------------------------------
+  // no_op honest reporting (v0.27.1, GitHub #45)
+  // ---------------------------------------------------------------------------
+
+  test("surfaces no_op:true in details + adds note to agent text", () => {
+    // Rust returns no_op:true when post-write content is byte-identical to
+    // pre-write (identity edit, formatter-normalized away, or replacement
+    // matched existing content). The UI must distinguish this from a real
+    // failed-edit +0/-0 so the user/agent knows what actually happened.
+    const result = buildMutationResult("src/identity.ts", {
+      replacements: 1,
+      no_op: true,
+      diff: {
+        additions: 0,
+        deletions: 0,
+        truncated: false,
+        before: "const a = 1;\n",
+        after: "const a = 1;\n",
+      },
+    });
+
+    expect(result.details?.noOp).toBe(true);
+
+    const text = result.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text?: string }).text ?? "")
+      .join("");
+    expect(text).toContain("Edited src/identity.ts (+0/-0, 1 replacement)");
+    expect(text).toContain("no net file change");
+    expect(text).toContain("byte-identical");
+  });
+
+  test("absent no_op leaves details.noOp unset and no note in text", () => {
+    // Real change must NOT trigger the no-op note path.
+    const result = buildMutationResult("src/change.ts", {
+      replacements: 1,
+      diff: {
+        additions: 1,
+        deletions: 1,
+        truncated: false,
+        before: "const a = 1;\n",
+        after: "const a = 2;\n",
+      },
+    });
+
+    expect(result.details?.noOp).toBeUndefined();
+
+    const text = result.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text?: string }).text ?? "")
+      .join("");
+    expect(text).not.toContain("no net file change");
+    expect(text).not.toContain("byte-identical");
+  });
+
+  test("no_op:false (explicit) is treated as not-a-no-op", () => {
+    // Defensive: Rust never sets no_op:false (the field is absent on real
+    // changes), but the typed-as-unknown response field could in theory be
+    // false from a misbehaving caller. The note must NOT fire.
+    const result = buildMutationResult("src/no_op_false.ts", {
+      replacements: 1,
+      no_op: false,
+      diff: {
+        additions: 1,
+        deletions: 0,
+        truncated: false,
+        before: "a\n",
+        after: "a\nb\n",
+      },
+    });
+
+    expect(result.details?.noOp).toBeUndefined();
+    const text = result.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text?: string }).text ?? "")
+      .join("");
+    expect(text).not.toContain("no net file change");
+  });
 });

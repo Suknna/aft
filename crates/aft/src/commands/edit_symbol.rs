@@ -367,9 +367,16 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
 
-    // Include diff info if requested (for UI metadata)
+    // Read final content once for both no_op detection and diff info.
+    // Honest reporting: when the symbol replacement produced byte-identical
+    // file content (e.g. replacing a symbol with its own body, or formatter
+    // normalized the change away), surface `no_op: true`. See GitHub #45.
+    let final_content = std::fs::read_to_string(&path).unwrap_or_default();
+    if source == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(&path).unwrap_or_default();
         result["diff"] = edit::compute_diff_info(&source, &final_content);
     }
 

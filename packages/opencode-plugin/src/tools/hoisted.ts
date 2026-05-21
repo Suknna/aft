@@ -599,6 +599,15 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 
       let output = data.created ? "Created new file." : "File updated.";
       if (data.formatted) output += " Auto-formatted.";
+      // v0.27.1: Rust returns `no_op: true` when post-write content is
+      // byte-identical to the pre-write state (e.g. agent wrote the same
+      // bytes that were already there, or a formatter normalized the
+      // change away). Surface this so the agent doesn't see "File updated"
+      // and assume real bytes changed. See GitHub #45.
+      if (data.no_op === true) {
+        output +=
+          " No net change — the written content is byte-identical to what was already on disk.";
+      }
 
       // Append inline diagnostics if present
       const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
@@ -934,6 +943,18 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
       if (globSkipNote) result += `\n\n${globSkipNote}`;
+
+      // v0.27.1: surface `no_op: true` honestly. Rust sets this when the
+      // post-write file content is byte-identical to the pre-write state —
+      // either oldString === newString, a formatter normalized the change
+      // away, or the replacement matched what was already in the file.
+      // The match was satisfied (replacements > 0) but no net file change
+      // landed. Without this note, agents see `+0/-0` and assume the tool
+      // failed silently. See GitHub #45.
+      if (data.no_op === true) {
+        result +=
+          "\n\nNote: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
+      }
 
       // Append inline diagnostics to output (matching write tool pattern)
       const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;

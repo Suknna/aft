@@ -276,6 +276,15 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         result["backup_id"] = serde_json::json!(id);
     }
 
+    // Honest reporting: when file content is byte-identical to the pre-append
+    // state (rare for append, but possible with empty appendContent or
+    // formatter-normalized whitespace), surface `no_op: true` so UIs can
+    // render a clear "matched but no net change" instead of bare +0/-0.
+    // See GitHub #45.
+    if existed && before_content == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if want_diff {
         // For new files, before-content is empty; compute_diff_info handles
         // that correctly (additions = number of lines in append_content).
@@ -959,9 +968,21 @@ fn handle_single_file_edit_match(
 
     write_result.append_lsp_diagnostics_to(&mut result);
 
-    // Include diff info if requested (for UI metadata)
+    // Compute final on-disk content once for both `no_op` detection and the
+    // optional diff metadata. We always emit `no_op: true` when the file
+    // content is byte-identical to the source — this happens when:
+    //   - agent passed `oldString === newString` (identity edit)
+    //   - a formatter normalized the agent's change back to the original
+    //   - the replacement matched what the file already contained
+    // The match was satisfied (replacements > 0) but no net change landed.
+    // Pi/OpenCode UIs use this to render "matched but no change" instead of
+    // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
+    let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
+    if source == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
         result["diff"] = edit::compute_diff_info(&source, &final_content);
     }
 

@@ -1499,3 +1499,174 @@ exit 0
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+// ============================================================================
+// no_op honest reporting tests (v0.27.1, GitHub #45)
+//
+// Rust sets `no_op: true` on the response when the post-write file content is
+// byte-identical to the pre-write state. This separates "matched but produced
+// no change" from a real failure mode so Pi/OpenCode UIs can render an
+// informative message instead of a bare +0/-0 that looks like a tool bug.
+// ============================================================================
+
+#[test]
+fn edit_match_no_op_when_old_string_equals_new_string() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_no_op_identity");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("identity.txt");
+    fs::write(&target, "hello world\nfoo bar\n").unwrap();
+    let original = fs::read(&target).unwrap();
+
+    let req = serde_json::json!({
+        "id": "no-op-identity",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "foo",
+        "replacement": "foo",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "edit should succeed: {resp:?}");
+    assert_eq!(resp["replacements"], 1, "match was found and applied once");
+    assert_eq!(
+        resp["no_op"], true,
+        "byte-identical replacement must surface no_op: true"
+    );
+    assert_eq!(resp["diff"]["additions"], 0);
+    assert_eq!(resp["diff"]["deletions"], 0);
+
+    // File should genuinely be unchanged on disk
+    assert_eq!(fs::read(&target).unwrap(), original);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_no_op_absent_when_real_change_applied() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_no_op_real");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("real_change.txt");
+    fs::write(&target, "hello world\nfoo bar\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "no-op-real",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "foo",
+        "replacement": "BAR",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["replacements"], 1);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "real change must NOT set no_op: true (got {resp:?})"
+    );
+    assert_eq!(resp["diff"]["additions"], 1);
+    assert_eq!(resp["diff"]["deletions"], 1);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_when_content_identical_to_existing_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_no_op_write_same");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("same.txt");
+    let body = "identical content\n";
+    fs::write(&target, body).unwrap();
+
+    let req = serde_json::json!({
+        "id": "write-same",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": body,
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(resp["created"], false);
+    assert_eq!(
+        resp["no_op"], true,
+        "writing the same bytes must surface no_op: true"
+    );
+    assert_eq!(resp["diff"]["additions"], 0);
+    assert_eq!(resp["diff"]["deletions"], 0);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_absent_when_file_created() {
+    // Creating a new file is not a "no-op" — there was no pre-state to compare
+    // against. `created: true` is the signal; `no_op` should be unset.
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_no_op_write_new");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("brand_new.txt");
+    let _ = fs::remove_file(&target);
+
+    let req = serde_json::json!({
+        "id": "write-new",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "fresh content\n",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["created"], true);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "create-file path must NOT set no_op: true (got {resp:?})"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_absent_when_content_actually_differs() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_no_op_write_diff");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("differs.txt");
+    fs::write(&target, "original\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "write-diff",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "modified\n",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["created"], false);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "real overwrite must NOT set no_op: true (got {resp:?})"
+    );
+    assert_eq!(resp["diff"]["additions"], 1);
+    assert_eq!(resp["diff"]["deletions"], 1);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}

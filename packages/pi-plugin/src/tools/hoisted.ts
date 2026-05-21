@@ -147,6 +147,13 @@ interface FileMutationDetails {
    * or accept the unformatted result.
    */
   formatSkippedReason?: string;
+  /**
+   * v0.27.1: Rust returns `no_op: true` when the post-write file content
+   * is byte-identical to the pre-write state. This separates "matched but
+   * produced no change" from a real `+0/-0` failure mode in the UI.
+   * See GitHub #45.
+   */
+  noOp?: boolean;
 }
 
 export function registerHoistedTools(
@@ -366,6 +373,12 @@ export function buildMutationResult(
   const replacements = response.replacements as number | undefined;
   const diagnostics = response.lsp_diagnostics as unknown[] | undefined;
   const truncated = diffObj?.truncated === true;
+  // Rust v0.27.1: `no_op: true` when the file content is byte-identical to
+  // the pre-write state — either the agent passed `oldString === newString`,
+  // a formatter normalized the change away, or the replacement matched the
+  // existing content. The match was satisfied (replacements > 0) but no net
+  // file change landed. See GitHub #45.
+  const noOp = response.no_op === true;
   // Format outcome — Rust writes return `formatted: bool` and, when
   // skipped, `format_skipped_reason: "<reason>"`. Forward both into
   // `details` so Pi agents can act on them (retry with different config,
@@ -394,7 +407,8 @@ export function buildMutationResult(
   }
 
   // Agent-facing text: summary header + diff (if present) + truncation
-  // notice + format-skip notice (non-benign reasons only) + diagnostics.
+  // notice + no-op notice + format-skip notice (non-benign reasons only)
+  // + diagnostics.
   const summaryHeader =
     replacements !== undefined
       ? `Edited ${filePath} (+${additions}/-${deletions}, ${replacements} replacement${replacements === 1 ? "" : "s"})`
@@ -403,6 +417,14 @@ export function buildMutationResult(
   if (diffText) text += `\n\n${diffText}`;
   if (truncated) {
     text += "\n\n(diff truncated \u2014 file too large to include before/after content)";
+  }
+  if (noOp) {
+    // Surface the no-op signal explicitly so the agent can distinguish "the
+    // tool failed silently" from "the edit matched but produced no net change".
+    // Common causes: oldString equals newString, or a formatter normalized
+    // the replacement back to the original.
+    text +=
+      "\n\nNote: no net file change \u2014 the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
   }
   // Surface non-benign format-skip reasons in agent-facing text. Benign
   // reasons (no formatter configured for the language, language unsupported)
@@ -430,6 +452,7 @@ export function buildMutationResult(
       truncated: truncated || undefined,
       formatted,
       formatSkippedReason,
+      noOp: noOp || undefined,
     },
   };
 }
@@ -539,13 +562,22 @@ function renderMutationResult(
 
   // No diff (no-op edit or truncated diff): one-line summary. Truncation is
   // surfaced explicitly in muted text so the user isn't misled into thinking
-  // a tiny summary reflects a tiny change.
+  // a tiny summary reflects a tiny change. v0.27.1: when Rust signaled
+  // `no_op: true`, attach a clear "no net change" suffix instead of a bare
+  // `+0/-0` so the user can tell the agent's edit matched but produced no
+  // file change (oldString === newString, or formatter reverted the diff).
+  // See GitHub #45.
   if (!diff) {
     const additions = details?.additions ?? 0;
     const deletions = details?.deletions ?? 0;
     const text = reuseText(context.lastComponent);
     const summary = theme.fg("success", `+${additions}/-${deletions}`);
-    const suffix = details?.truncated ? ` ${theme.fg("muted", "(diff truncated)")}` : "";
+    let suffix = "";
+    if (details?.truncated) {
+      suffix = ` ${theme.fg("muted", "(diff truncated)")}`;
+    } else if (details?.noOp) {
+      suffix = ` ${theme.fg("muted", "(no net change)")}`;
+    }
     text.setText(`\n${summary}${suffix}`);
     return text;
   }
