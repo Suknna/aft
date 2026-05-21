@@ -7,6 +7,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
+import { resolveBashConfig } from "./config.js";
 import { log } from "./logger.js";
 
 export interface WorkflowHintsOpts {
@@ -86,11 +87,15 @@ export function buildHintsFromConfig(
   absentTools: Set<string>,
   hoistBuiltins: boolean,
 ): string | null {
+  // Background-bash gating reads the resolved bash config so the new
+  // graduated `bash: true` / `bash: { background: true }` shapes enable
+  // the hint, not just the legacy `experimental.bash.background: true`
+  // path. See `resolveBashConfig` in config.ts.
   return buildWorkflowHints({
     toolSurface: config.tool_surface ?? "recommended",
     hoistBuiltins,
     semanticEnabled: config.semantic_search === true,
-    bashBackgroundEnabled: config.experimental?.bash?.background === true,
+    bashBackgroundEnabled: resolveBashConfig(config).background,
     absentTools,
   });
 }

@@ -8,7 +8,7 @@
 // off it sees `aft_read`/`aft_grep`/`aft_bash`.
 // ---------------------------------------------------------------------------
 
-import type { AftConfig } from "./config.js";
+import { type AftConfig, resolveBashConfig } from "./config.js";
 
 export interface WorkflowHintsOpts {
   /** `tool_surface` setting — controls which tools are registered. */
@@ -102,13 +102,17 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 /**
  * Resolve workflow-hints opts from a loaded AftConfig and the active
  * disabled-tools set computed at registration time.
+ *
+ * Background-bash gating reads the resolved bash config so the new
+ * graduated `bash: true` / `bash: { background: true }` shapes enable the
+ * hint, not just the legacy `experimental.bash.background: true` path.
  */
 export function buildHintsFromConfig(config: AftConfig, disabledTools: Set<string>): string | null {
   return buildWorkflowHints({
     toolSurface: config.tool_surface ?? "recommended",
     hoistBuiltins: config.hoist_builtin_tools !== false,
     semanticEnabled: config.semantic_search === true,
-    bashBackgroundEnabled: config.experimental?.bash?.background === true,
+    bashBackgroundEnabled: resolveBashConfig(config).background,
     disabledTools,
   });
 }

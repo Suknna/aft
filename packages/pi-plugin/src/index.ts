@@ -53,6 +53,7 @@ import { registerStatusCommand } from "./commands/aft-status.js";
 import {
   type AftConfig,
   loadAftConfig,
+  resolveBashConfig,
   resolveExperimentalConfigForConfigure,
   resolveLspConfigForConfigure,
 } from "./config.js";
@@ -667,18 +668,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const surface = resolveToolSurface(config);
 
   // Hoisted tool overrides (replace Pi's built-in bash/read/write/edit/grep with AFT versions).
-  // Bash hoisting is opt-in: only register the AFT bash replacement when the
-  // user has enabled at least one experimental.bash.* flag (rewrite, compress,
-  // or background). When all flags are off, Pi's native bash stays in place
-  // and no AFT bash code is in the path. registerBashTool handles per-flag
-  // gating internally for bash_status / bash_kill.
-  // Read nested user-facing config shape — the flat experimental_bash_* keys
-  // are an internal Rust-configure detail, not the surface users write to.
-  const anyBashExperimental =
-    config.experimental?.bash?.rewrite === true ||
-    config.experimental?.bash?.compress === true ||
-    config.experimental?.bash?.background === true;
-  if (surface.hoistBash && anyBashExperimental) {
+  // Bash hoisting is gated by the single resolved bash config — see
+  // `resolveBashConfig` in config.ts for the precedence rules (top-level
+  // `bash` wins over legacy `experimental.bash.*`, surface defaults fill
+  // in when neither is set). When `surface.hoistBash` is false (e.g.
+  // `tool_surface: "minimal"`), AFT bash never registers regardless of
+  // resolved config. registerBashTool handles per-flag gating internally
+  // for bash_status / bash_kill.
+  if (surface.hoistBash && resolveBashConfig(config).enabled) {
     registerBashTool(pi, ctx);
   }
   registerHoistedTools(pi, ctx, surface);

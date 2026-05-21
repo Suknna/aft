@@ -218,8 +218,13 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring auto_update from project config");
   });
 
-  // v0.18 bash hoisting features: nested experimental flags are project-settable.
-  test("user config can set experimental.bash.rewrite", () => {
+  // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are
+  // migrated to the top-level `bash` block during load, and the resulting
+  // in-memory config exposes them under `bash.*`. The user's on-disk file
+  // is also rewritten on first load (see migration tests below). We keep
+  // these scenarios to lock in that the legacy nested input shape still
+  // produces the expected runtime state.
+  test("user config can set bash.rewrite via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -232,11 +237,16 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config).toMatchObject({ experimental: { bash: { rewrite: true } } });
+    // Graduation materializes implicit false sub-features so post-migration
+    // runtime matches pre-migration runtime (where unset sub-flags were off).
+    expect(config).toMatchObject({
+      bash: { rewrite: true, compress: false, background: false },
+    });
+    expect(config).not.toHaveProperty("experimental");
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("project config can override experimental.bash.rewrite", () => {
+  test("project config can override bash.rewrite via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -253,12 +263,14 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // Project's false value wins over user's true.
-    expect(config).toMatchObject({ experimental: { bash: { rewrite: false } } });
+    // Project's false value wins over user's true after graduation.
+    expect(config).toMatchObject({
+      bash: { rewrite: false, compress: false, background: false },
+    });
     expect(result.stderr).not.toContain("Ignoring experimental from project config");
   });
 
-  test("user config can set experimental.bash.compress", () => {
+  test("user config can set bash.compress via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -271,11 +283,13 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config).toMatchObject({ experimental: { bash: { compress: true } } });
+    expect(config).toMatchObject({
+      bash: { compress: true, rewrite: false, background: false },
+    });
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("project config can override experimental.bash.compress", () => {
+  test("project config can override bash.compress via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -293,11 +307,13 @@ describe("loadAftConfig", () => {
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
     // Project's true value wins over user's false.
-    expect(config).toMatchObject({ experimental: { bash: { compress: true } } });
+    expect(config).toMatchObject({
+      bash: { compress: true, rewrite: false, background: false },
+    });
     expect(result.stderr).not.toContain("Ignoring experimental from project config");
   });
 
-  test("user config can set experimental.bash.background", () => {
+  test("user config can set bash.background via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -310,11 +326,13 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config).toMatchObject({ experimental: { bash: { background: true } } });
+    expect(config).toMatchObject({
+      bash: { background: true, rewrite: false, compress: false },
+    });
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("project config can set experimental.bash.background", () => {
+  test("project config can set bash.background via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({}));
     writeFileSync(
@@ -328,16 +346,53 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    // Project's true value is accepted (user has no value set).
-    expect(config).toMatchObject({ experimental: { bash: { background: true } } });
+    expect(config).toMatchObject({
+      bash: { background: true, rewrite: false, compress: false },
+    });
     expect(result.stderr).not.toContain("Ignoring experimental from project config");
   });
 
-  test("deep merges nested experimental config", () => {
+  test("deep merges top-level bash config across user + project", () => {
+    // Post-graduation supported pattern: both files use the new top-level
+    // `bash` shape, sub-features deep-merge with override winning per key.
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ experimental: { bash: { rewrite: true }, lsp_ty: true } }),
+      JSON.stringify({ bash: { rewrite: true }, experimental: { lsp_ty: true } }),
+    );
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ bash: { compress: false } }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    // Field-by-field union: user's rewrite=true survives, project's
+    // compress=false wins, background not set so it defaults true at
+    // resolve time (resolver fills in the new graduated default).
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      bash: { rewrite: true, compress: false },
+      experimental: { lsp_ty: true },
+    });
+  });
+
+  test("legacy experimental.bash in both files: project's materialized shape wins on merge", () => {
+    // Regression note for v0.27.2 graduation: when BOTH user and project
+    // files express bash via legacy `experimental.bash.*`, each migrates
+    // independently to top-level `bash` with all three sub-features
+    // materialized (so single-file post-migration behavior matches
+    // pre-migration behavior). The cross-file deep merge then runs against
+    // the materialized shapes, so project's explicit values win for every
+    // key — not just the ones the user explicitly set.
+    //
+    // This is a behavior change vs pre-graduation cross-file merge, and is
+    // documented as a known migration edge case. Users who want field-level
+    // deep merge across user + project should adopt the new top-level
+    // `bash` shape (see the test above).
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ experimental: { bash: { rewrite: true } } }),
     );
     writeFileSync(
       fixture.projectConfigPath,
@@ -349,8 +404,11 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
+    // After both files migrate independently and the materialized blocks
+    // shallow-merge: project's bash wins for all three keys, user's
+    // rewrite:true is overridden by project's materialized rewrite:false.
     expect(JSON.parse(result.stdout)).toMatchObject({
-      experimental: { bash: { rewrite: true, compress: false }, lsp_ty: true },
+      bash: { rewrite: false, compress: false, background: false },
     });
   });
 
@@ -373,10 +431,13 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
+    // Flat keys lift to nested experimental.bash, then graduation lifts the
+    // bash block to top-level. lsp_ty stays under experimental.
     expect(JSON.parse(result.stdout)).toEqual({
       search_index: true,
       semantic_search: true,
-      experimental: { bash: { rewrite: true, compress: true, background: true }, lsp_ty: true },
+      bash: { rewrite: true, compress: true, background: true },
+      experimental: { lsp_ty: true },
     });
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
     expect(migrated).toContain('"search_index": true');
@@ -413,7 +474,10 @@ describe("loadAftConfig", () => {
 
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
     expect(migrated).toContain("// keep me");
-    expect(migrated).toContain('"experimental"');
+    // After v0.27.2 graduation, the bash block lives at top-level and
+    // experimental{} is stripped when the only key inside it was the
+    // graduated bash block.
+    expect(migrated).toContain('"bash"');
     expect(migrated).not.toContain("experimental_bash_rewrite");
   });
 
@@ -477,9 +541,11 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
+    // experimental_bash_compress lifts to nested experimental.bash.compress,
+    // then graduates to top-level bash.compress with materialized siblings.
     expect(JSON.parse(result.stdout)).toMatchObject({
       search_index: true,
-      experimental: { bash: { compress: true } },
+      bash: { compress: true, rewrite: false, background: false },
     });
     expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
     expect(result.stderr).toContain(`Migrated config at ${fixture.projectConfigPath}`);

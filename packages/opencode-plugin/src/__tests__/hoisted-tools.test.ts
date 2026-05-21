@@ -1056,75 +1056,128 @@ describe("Hoisted tool execute handlers", () => {
  * non-existent tools. (See council audit
  * `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.)
  */
-describe("Hoisted bash gating", () => {
-  function toolsWithBashConfig(bash: Record<string, boolean> | undefined, prefixed = false) {
+describe("Hoisted bash gating (post v0.27.2 graduation)", () => {
+  function toolsWithConfig(
+    cfg: Partial<PluginContext["config"]>,
+    prefixed = false,
+  ): Record<string, unknown> {
     const pool = { getBridge: () => ({ send: async () => ({}) }) } as unknown as BridgePool;
     const ctx: PluginContext = {
       pool,
       client: createMockClient(),
-      config: { experimental: bash ? { bash } : undefined } as PluginContext["config"],
+      config: cfg as PluginContext["config"],
       storageDir: "/tmp/aft-test",
     };
     return prefixed ? aftPrefixedTools(ctx) : hoistedTools(ctx);
   }
 
-  test("no experimental.bash config → bash/bash_status/bash_kill NOT registered", () => {
-    const tools = toolsWithBashConfig(undefined);
-    expect(tools.bash).toBeUndefined();
-    expect(tools.bash_status).toBeUndefined();
-    expect(tools.bash_kill).toBeUndefined();
-    // Other hoisted tools are unaffected by the bash gate.
+  // ---- Surface defaults (new graduation behavior) ----------------------
+
+  test("no bash config + tool_surface=recommended → bash registered (graduated on by default)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended" });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
     expect(tools.read).toBeDefined();
     expect(tools.edit).toBeDefined();
   });
 
-  test("empty experimental.bash object → bash NOT registered", () => {
-    const tools = toolsWithBashConfig({});
+  test("no bash config + tool_surface=all → bash registered", () => {
+    const tools = toolsWithConfig({ tool_surface: "all" });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("no bash config + tool_surface=minimal → bash NOT registered", () => {
+    // Minimal surface opts out of everything not strictly core, including
+    // bash. Users on minimal need to opt back in with explicit `bash: true`.
+    const tools = toolsWithConfig({ tool_surface: "minimal" });
     expect(tools.bash).toBeUndefined();
     expect(tools.bash_status).toBeUndefined();
     expect(tools.bash_kill).toBeUndefined();
   });
 
-  test("experimental.bash.rewrite=true alone → all three bash tools registered", () => {
+  // ---- Top-level bash shape (new surface) ------------------------------
+
+  test("bash: true → all three bash tools registered, all sub-features on", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: true });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("bash: false → no bash-family tools registered (hard opt-out)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: false });
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
+  });
+
+  test("bash: { rewrite: false } → partial override; bash still registered (object form enables hoist)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: { rewrite: false } });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  // ---- Legacy experimental.bash shape (backward compat) ----------------
+
+  test("legacy experimental.bash.rewrite=true → all three bash tools registered", () => {
     // Foreground bash can auto-promote even without the background flag,
     // so status/kill must be available for the promoted task.
-    const tools = toolsWithBashConfig({ rewrite: true });
+    const tools = toolsWithConfig({ experimental: { bash: { rewrite: true } } });
     expect(tools.bash).toBeDefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
   });
 
-  test("experimental.bash.compress=true alone → all three bash tools registered", () => {
-    const tools = toolsWithBashConfig({ compress: true });
+  test("legacy experimental.bash.compress=true → all three bash tools registered", () => {
+    const tools = toolsWithConfig({ experimental: { bash: { compress: true } } });
     expect(tools.bash).toBeDefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
   });
 
-  test("experimental.bash.background=true → all three bash tools registered", () => {
-    const tools = toolsWithBashConfig({ background: true });
+  test("legacy experimental.bash.background=true → all three bash tools registered", () => {
+    const tools = toolsWithConfig({ experimental: { bash: { background: true } } });
     expect(tools.bash).toBeDefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
   });
 
-  test("all three bash flags true → full bash surface registered", () => {
-    const tools = toolsWithBashConfig({ rewrite: true, compress: true, background: true });
+  test("legacy experimental.bash with all three flags true → full bash surface", () => {
+    const tools = toolsWithConfig({
+      experimental: { bash: { rewrite: true, compress: true, background: true } },
+    });
     expect(tools.bash).toBeDefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
   });
 
-  test("hoist-off experimental.bash.rewrite=true → aft_bash plus status/kill registered", () => {
-    const tools = toolsWithBashConfig({ rewrite: true }, true);
+  test("legacy experimental.bash empty + tool_surface=minimal → NOT registered", () => {
+    // Empty legacy block + minimal surface = no opt-in anywhere, no bash.
+    const tools = toolsWithConfig({ tool_surface: "minimal", experimental: { bash: {} } });
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
+  });
+
+  // ---- Hoist-off mode --------------------------------------------------
+
+  test("hoist-off + legacy experimental.bash.rewrite=true → aft_bash plus status/kill registered", () => {
+    const tools = toolsWithConfig(
+      { hoist_builtin_tools: false, experimental: { bash: { rewrite: true } } },
+      true,
+    );
     expect(tools.aft_bash).toBeDefined();
     expect(tools.bash).toBeUndefined();
     expect(tools.bash_status).toBeDefined();
     expect(tools.bash_kill).toBeDefined();
   });
 
-  test("hoist-off with all bash flags false → no bash-family tools registered", () => {
-    const tools = toolsWithBashConfig({ rewrite: false, compress: false, background: false }, true);
+  test("hoist-off + bash: false → no bash-family tools registered", () => {
+    const tools = toolsWithConfig({ hoist_builtin_tools: false, bash: false }, true);
     expect(tools.aft_bash).toBeUndefined();
     expect(tools.bash).toBeUndefined();
     expect(tools.bash_status).toBeUndefined();

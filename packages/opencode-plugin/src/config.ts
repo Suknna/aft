@@ -104,6 +104,12 @@ const LspConfigSchema = z.object({
 });
 
 const ExperimentalConfigSchema = z.object({
+  /**
+   * @deprecated The bash family graduated from experimental in v0.27.2. Use the
+   * top-level `bash` key instead. This nested form is still accepted for
+   * backward compatibility — when present and top-level `bash` is absent,
+   * its values seed the resolved bash config. Will be removed in v0.28.
+   */
   bash: z
     .object({
       rewrite: z.boolean().optional(),
@@ -115,6 +121,26 @@ const ExperimentalConfigSchema = z.object({
     .optional(),
   lsp_ty: z.boolean().optional(),
 });
+
+/**
+ * Graduated `bash` config. Replaces `experimental.bash.*` in v0.27.2.
+ * Default behavior:
+ *   - tool_surface "recommended" or "all" → bash hoist on, all sub-features on
+ *   - tool_surface "minimal" → bash hoist off (user explicitly wants minimal)
+ * Three shapes:
+ *   - `bash: true`     → identical to default (all on)
+ *   - `bash: false`    → hoist disabled entirely; OpenCode native bash stays
+ *   - `bash: { ... }`  → partial override; missing sub-keys default to true
+ */
+const BashFeaturesSchema = z.object({
+  rewrite: z.boolean().optional(),
+  compress: z.boolean().optional(),
+  background: z.boolean().optional(),
+  long_running_reminder_enabled: z.boolean().optional(),
+  long_running_reminder_interval_ms: z.number().int().positive().optional(),
+});
+
+const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
 export const AftConfigSchema = z
   .object({
@@ -170,6 +196,19 @@ export const AftConfigSchema = z
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
     semantic_search: z.boolean().optional(),
+    /**
+     * Bash tool family (hoist + rewrite + compress + background execution).
+     * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+     *
+     * Accepts three shapes:
+     *   - `true`  — all sub-features on, hoist enabled
+     *   - `false` — hoist disabled entirely; OpenCode's native bash stays
+     *   - `{ rewrite?, compress?, background?, ... }` — partial override;
+     *     missing sub-keys default to `true`
+     *
+     * Replaces `experimental.bash.*` (still accepted for backward compat).
+     */
+    bash: BashConfigSchema.optional(),
     /** Experimental opt-in features. Default: all false. */
     experimental: ExperimentalConfigSchema.optional(),
     /** User-defined and built-in LSP server configuration. */
@@ -325,26 +364,139 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   return overrides;
 }
 
+/**
+ * Resolved bash configuration after merging top-level `bash`, the
+ * legacy `experimental.bash.*` fallback, and tool_surface defaults.
+ * Everything downstream — hoist gating, configure-override emission,
+ * workflow-hints — reads from this single shape.
+ *
+ * `enabled` controls hoist registration ONLY; the three sub-features
+ * (rewrite/compress/background) are independent feature flags within
+ * an enabled bash surface. `enabled: false` forces all three off and
+ * disables hoist; OpenCode's native bash stays in place.
+ */
+export interface ResolvedBashConfig {
+  enabled: boolean;
+  rewrite: boolean;
+  compress: boolean;
+  background: boolean;
+  long_running_reminder_enabled?: boolean;
+  long_running_reminder_interval_ms?: number;
+}
+
+/**
+ * Single source of truth for bash config across the plugin. Resolution
+ * order (highest priority wins):
+ *
+ *   1. Top-level `bash: false` → fully disabled (sub-features all false)
+ *   2. Top-level `bash: true`  → fully enabled (sub-features all true)
+ *   3. Top-level `bash: { ... }` → enabled; each sub-feature defaults true
+ *      when not specified
+ *   4. Top-level `bash` absent + any `experimental.bash.*` set → legacy
+ *      fallback; sub-features take their explicit values (default false
+ *      to preserve pre-v0.27.2 behavior — that block was opt-in)
+ *   5. Top-level `bash` absent + no experimental → tool_surface default:
+ *        - "minimal" → disabled
+ *        - "recommended" or "all" → enabled with all sub-features on
+ *
+ * The long_running_reminder_* tuning fields are passed through from
+ * whichever surface specified them; they live alongside the feature
+ * flags because they're emitted to Rust through the same configure
+ * call shape.
+ */
+export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
+  const top = config.bash;
+  const legacy = config.experimental?.bash;
+  const surface = config.tool_surface ?? "recommended";
+  const surfaceDefaultEnabled = surface !== "minimal";
+
+  // Reminder tuning rides along from whichever surface set it — top-level
+  // wins, legacy fills in the gap.
+  const reminderEnabled =
+    (typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined) ??
+    legacy?.long_running_reminder_enabled;
+  const reminderInterval =
+    (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
+    legacy?.long_running_reminder_interval_ms;
+
+  const base: ResolvedBashConfig = {
+    enabled: false,
+    rewrite: false,
+    compress: false,
+    background: false,
+    long_running_reminder_enabled: reminderEnabled,
+    long_running_reminder_interval_ms: reminderInterval,
+  };
+
+  // Top-level wins over legacy when both are present.
+  if (top === false) {
+    return base; // hard disable
+  }
+  if (top === true) {
+    return { ...base, enabled: true, rewrite: true, compress: true, background: true };
+  }
+  if (typeof top === "object" && top !== null) {
+    return {
+      ...base,
+      enabled: true,
+      rewrite: top.rewrite ?? true,
+      compress: top.compress ?? true,
+      background: top.background ?? true,
+    };
+  }
+
+  // Top-level absent. Honor legacy experimental.bash.* if any sub-flag was
+  // explicitly set — preserves pre-v0.27.2 opt-in semantics. We treat
+  // `experimental.bash: {}` (object present but all keys absent) the same as
+  // legacy entirely absent so we don't accidentally disable bash for users
+  // who wrote an empty experimental block while migrating.
+  const hasLegacyFeatureFlag =
+    legacy &&
+    (legacy.rewrite !== undefined ||
+      legacy.compress !== undefined ||
+      legacy.background !== undefined);
+  if (hasLegacyFeatureFlag) {
+    const rewrite = legacy.rewrite === true;
+    const compress = legacy.compress === true;
+    const background = legacy.background === true;
+    return {
+      ...base,
+      enabled: rewrite || compress || background,
+      rewrite,
+      compress,
+      background,
+    };
+  }
+
+  // No top-level, no legacy → fall back to surface default.
+  return {
+    ...base,
+    enabled: surfaceDefaultEnabled,
+    rewrite: surfaceDefaultEnabled,
+    compress: surfaceDefaultEnabled,
+    background: surfaceDefaultEnabled,
+  };
+}
+
 export function resolveExperimentalConfigForConfigure(
   config: AftConfig,
 ): ConfigureExperimentalOverrides {
   const overrides: ConfigureExperimentalOverrides = {};
-  if (config.experimental?.bash?.rewrite !== undefined) {
-    overrides.experimental_bash_rewrite = config.experimental.bash.rewrite;
+  // Bash sub-features always flow through `resolveBashConfig` now — that
+  // function handles the graduated top-level surface, the legacy
+  // experimental fallback, and the tool_surface default in one place. We
+  // still emit the three flat `experimental_bash_*` wire keys because the
+  // Rust configure protocol hasn't been renamed; renaming there too would
+  // require a coordinated binary bump.
+  const bash = resolveBashConfig(config);
+  overrides.experimental_bash_rewrite = bash.rewrite;
+  overrides.experimental_bash_compress = bash.compress;
+  overrides.experimental_bash_background = bash.background;
+  if (bash.long_running_reminder_enabled !== undefined) {
+    overrides.bash_long_running_reminder_enabled = bash.long_running_reminder_enabled;
   }
-  if (config.experimental?.bash?.compress !== undefined) {
-    overrides.experimental_bash_compress = config.experimental.bash.compress;
-  }
-  if (config.experimental?.bash?.background !== undefined) {
-    overrides.experimental_bash_background = config.experimental.bash.background;
-  }
-  if (config.experimental?.bash?.long_running_reminder_enabled !== undefined) {
-    overrides.bash_long_running_reminder_enabled =
-      config.experimental.bash.long_running_reminder_enabled;
-  }
-  if (config.experimental?.bash?.long_running_reminder_interval_ms !== undefined) {
-    overrides.bash_long_running_reminder_interval_ms =
-      config.experimental.bash.long_running_reminder_interval_ms;
+  if (bash.long_running_reminder_interval_ms !== undefined) {
+    overrides.bash_long_running_reminder_interval_ms = bash.long_running_reminder_interval_ms;
   }
   if (config.experimental?.lsp_ty !== undefined) {
     overrides.experimental_lsp_ty = config.experimental.lsp_ty;
@@ -449,7 +601,106 @@ function migrateRawConfig(
     delete rawConfig[migration.oldKey];
     oldKeys.push(migration.oldKey);
   }
+  oldKeys.push(...migrateExperimentalBashBlock(rawConfig, configPath, logger));
   return oldKeys;
+}
+
+/**
+ * Graduation migration: `experimental.bash.*` → top-level `bash.*` (v0.27.2).
+ *
+ * Different shape than the flat-key migrations above: we move a whole nested
+ * object up one level AND normalize defaults so the user's pre-migration
+ * runtime behavior is preserved exactly. Inspired by magic-context's
+ * `migrateLegacyExperimental` pattern (`packages/plugin/src/config/index.ts`
+ * in opencode-magic-context), adapted for AFT's already-on-disk rewrite path
+ * (so users don't even need to run `doctor`).
+ *
+ * Behavior:
+ *   - If user has BOTH `experimental.bash` and top-level `bash`, top-level
+ *     wins and we still strip the experimental block so the config stays
+ *     clean (warned so the user knows their experimental keys were dropped).
+ *   - If user has only `experimental.bash`, it lifts to top-level `bash` as
+ *     an explicit object with all three sub-features materialized. This
+ *     preserves the old default semantics: `experimental.bash: { rewrite:
+ *     true }` had `compress: false, background: false` by default (the
+ *     experimental block was opt-in). The new top-level `bash: { rewrite:
+ *     true }` defaults `compress` and `background` to `true` (the block
+ *     itself graduated to on-by-default). To prevent a silent behavior
+ *     change, we materialize the implicit `false`s so the migrated config
+ *     reads exactly as the old runtime did. Users can manually trim it to
+ *     `bash: true` (or remove it for the new default) afterwards.
+ *   - Tuning fields (`long_running_reminder_*`) carry through unchanged.
+ *   - If `experimental` becomes an empty object after removing the bash
+ *     block, the whole `experimental` key is dropped so we don't leave a
+ *     dangling `"experimental": {}` in the user's file.
+ *
+ * Returns the list of migrated keys (formatted as `experimental.bash.*`) so
+ * the caller's "migrated config" log line mentions them.
+ */
+function migrateExperimentalBashBlock(
+  rawConfig: Record<string, unknown>,
+  configPath: string,
+  logger?: Logger,
+): string[] {
+  const experimental = rawConfig.experimental;
+  if (typeof experimental !== "object" || experimental === null || Array.isArray(experimental)) {
+    return [];
+  }
+  const expRecord = experimental as Record<string, unknown>;
+  if (!Object.hasOwn(expRecord, "bash")) return [];
+
+  const legacyBash = expRecord.bash;
+
+  // Non-object legacy value (e.g. `experimental.bash: true`) — shouldn't
+  // exist historically but be defensive. Drop it without inventing a
+  // top-level shape; the user can rewrite it themselves.
+  if (typeof legacyBash !== "object" || legacyBash === null || Array.isArray(legacyBash)) {
+    delete expRecord.bash;
+    if (Object.keys(expRecord).length === 0) delete rawConfig.experimental;
+    return ["experimental.bash"];
+  }
+
+  const bashRecord = legacyBash as Record<string, unknown>;
+  const hasFeatureFlag =
+    "rewrite" in bashRecord || "compress" in bashRecord || "background" in bashRecord;
+
+  // Pure tuning-only block (e.g. only long_running_reminder_*). Nothing
+  // semantic to graduate — materializing implicit feature flags here would
+  // surprise users who never opted into bash hoisting. Leave it alone.
+  if (!hasFeatureFlag) return [];
+
+  const movedKeys = Object.keys(bashRecord).map((k) => `experimental.bash.${k}`);
+
+  if (Object.hasOwn(rawConfig, "bash")) {
+    logger?.warn(
+      `Config migration conflict at ${configPath}: experimental.bash dropped because top-level "bash" is already set`,
+    );
+  } else {
+    // Materialize all three sub-features with their pre-migration runtime
+    // values. `=== true` collapses missing/undefined/null to false, which
+    // is exactly how the old experimental block treated unset sub-flags.
+    const migrated: Record<string, unknown> = {
+      rewrite: bashRecord.rewrite === true,
+      compress: bashRecord.compress === true,
+      background: bashRecord.background === true,
+    };
+    if (bashRecord.long_running_reminder_enabled !== undefined) {
+      migrated.long_running_reminder_enabled = bashRecord.long_running_reminder_enabled;
+    }
+    if (bashRecord.long_running_reminder_interval_ms !== undefined) {
+      migrated.long_running_reminder_interval_ms = bashRecord.long_running_reminder_interval_ms;
+    }
+    rawConfig.bash = migrated;
+  }
+  delete expRecord.bash;
+
+  // Strip an empty experimental object so the user's file doesn't keep an
+  // orphan `"experimental": {}` after migration.
+  if (Object.keys(expRecord).length === 0) {
+    delete rawConfig.experimental;
+  }
+
+  return movedKeys;
 }
 
 export function migrateAftConfigFile(
@@ -676,6 +927,41 @@ function mergeLspConfig(
   ) as AftConfig["lsp"];
 }
 
+/**
+ * Deep-merge top-level `bash` config across user + project. Mirrors the
+ * field-level union used for `experimental.bash` so a project can override
+ * one sub-feature (e.g. `bash: { compress: false }`) without nuking the
+ * user's other sub-features.
+ *
+ * Handles every supported shape for both sides:
+ *   - boolean (true/false) collapses to the full object form
+ *     ({ rewrite: bool, compress: bool, background: bool }) so the merge
+ *     can still operate field-by-field
+ *   - object form merges field-by-field with override winning per key
+ *   - undefined on either side passes the other through unchanged
+ *
+ * Returns whatever shape best represents the merged state — the resolver
+ * (`resolveBashConfig`) handles all three shapes downstream.
+ */
+function mergeBashConfig(
+  baseBash: AftConfig["bash"],
+  overrideBash: AftConfig["bash"],
+): AftConfig["bash"] {
+  if (baseBash === undefined && overrideBash === undefined) return undefined;
+  if (baseBash === undefined) return overrideBash;
+  if (overrideBash === undefined) return baseBash;
+
+  // Expand booleans into the full object so the deep merge below behaves
+  // consistently regardless of input shape.
+  const expand = (value: AftConfig["bash"]): Record<string, unknown> => {
+    if (value === true) return { rewrite: true, compress: true, background: true };
+    if (value === false) return { rewrite: false, compress: false, background: false };
+    return { ...(value ?? {}) };
+  };
+
+  return { ...expand(baseBash), ...expand(overrideBash) };
+}
+
 function mergeExperimentalConfig(
   baseExperimental: AftConfig["experimental"],
   overrideExperimental: AftConfig["experimental"],
@@ -741,6 +1027,12 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "search_index",
   "semantic_search",
   "experimental",
+  // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
+  // project-settable so users can opt out per-repo (e.g. `bash: false` in
+  // a repo with weird shell needs) or opt in. NOT a security boundary —
+  // bash hoist disabling is a UX/safety preference, and OpenCode's permission
+  // rules still gate the underlying execution either way.
+  "bash",
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
@@ -782,10 +1074,15 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
+  const bash = mergeBashConfig(base.bash, override.bash);
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
   // See PROJECT_SAFE_TOP_LEVEL_FIELDS above for the full security rationale.
+  // We deep-merge `bash` separately so the field-by-field union beats the
+  // shallow allowlist spread; otherwise project's `bash: { compress: false }`
+  // would wipe out user's `bash: { rewrite: true }`.
   const safeOverride = pickProjectSafeFields(override);
+  delete safeOverride.bash;
 
   return {
     ...base,
@@ -794,6 +1091,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(Object.keys(formatter).length > 0 ? { formatter } : {}),
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
     ...(lsp ? { lsp } : {}),
+    ...(bash !== undefined ? { bash } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.

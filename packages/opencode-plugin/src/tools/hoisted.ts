@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { resolveBashConfig } from "../config.js";
 import { storeToolMetadata } from "../metadata-store.js";
 import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
@@ -1677,14 +1678,14 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_move: createMoveTool(ctx),
   };
 
-  // Read nested user-facing config shape — the flat experimental_bash_* keys
-  // are an internal Rust-configure detail, not the surface users write to.
-  const bashRewrite = ctx.config.experimental?.bash?.rewrite === true;
-  const bashCompress = ctx.config.experimental?.bash?.compress === true;
-  const bashBackground = ctx.config.experimental?.bash?.background === true;
-  const anyBashExperimental = bashRewrite || bashCompress || bashBackground;
-
-  if (anyBashExperimental) {
+  // Bash hoisting is gated by the single resolved bash config — see
+  // `resolveBashConfig` in config.ts for the precedence rules (top-level
+  // `bash` wins over legacy `experimental.bash.*`, surface defaults fill in
+  // when neither is set). When enabled, `bash_status` and `bash_kill`
+  // register alongside `bash` so the agent can always inspect and kill
+  // auto-promoted background tasks regardless of which sub-feature was
+  // actually requested.
+  if (resolveBashConfig(ctx.config).enabled) {
     tools.bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
@@ -1781,15 +1782,11 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     aft_move: createMoveTool(ctx),
   };
 
-  // Keep hoist-off mode consistent with hoisted mode: bash-family tools are
-  // available only when an experimental bash path is enabled, but the primary
-  // bash tool uses the aft_ prefix to avoid overriding OpenCode's native bash.
-  const bashRewrite = ctx.config.experimental?.bash?.rewrite === true;
-  const bashCompress = ctx.config.experimental?.bash?.compress === true;
-  const bashBackground = ctx.config.experimental?.bash?.background === true;
-  const anyBashExperimental = bashRewrite || bashCompress || bashBackground;
-
-  if (anyBashExperimental) {
+  // Hoist-off mode: same gating as hoisted mode but with the aft_ prefix on
+  // the primary bash tool so it doesn't override OpenCode's native bash.
+  // The sibling status/kill tools keep their unprefixed names because they
+  // refer to AFT-spawned task IDs that the native bash doesn't know about.
+  if (resolveBashConfig(ctx.config).enabled) {
     tools.aft_bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);

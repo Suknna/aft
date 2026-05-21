@@ -149,10 +149,29 @@ describe("buildHintsFromConfig", () => {
     expect(out).toContain("`aft_grep`");
   });
 
-  test("conditionally appends bg-bash when experimental.bash.background=true", () => {
-    const off: AftConfig = { tool_surface: "recommended" };
-    expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
+  test("appends bg-bash hint by default on recommended (post-v0.27.2 graduation)", () => {
+    // Bash + background are on by default for `recommended` after the bash
+    // graduation, so the long-running hint surfaces without explicit opt-in.
+    const defaults: AftConfig = { tool_surface: "recommended" };
+    expect(buildHintsFromConfig(defaults, new Set())).toContain("**Long-running commands**");
+  });
 
+  test("omits bg-bash hint when bash: false (hard opt-out)", () => {
+    const off: AftConfig = { tool_surface: "recommended", bash: false };
+    expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
+  });
+
+  test("omits bg-bash hint when bash: { background: false }", () => {
+    const off: AftConfig = { tool_surface: "recommended", bash: { background: false } };
+    expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
+  });
+
+  test("omits bg-bash hint on tool_surface=minimal (bash off by default)", () => {
+    const off: AftConfig = { tool_surface: "minimal" };
+    expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
+  });
+
+  test("legacy experimental.bash.background=true still enables bg-bash hint", () => {
     const on: AftConfig = {
       tool_surface: "recommended",
       experimental: { bash: { background: true } },

@@ -30,11 +30,18 @@ import { describe, expect, test } from "bun:test";
 import { resolveProjectOverridesForConfigure } from "../config.js";
 
 describe("resolveProjectOverridesForConfigure", () => {
-  test("empty config returns only the restrict_to_project_root default", () => {
-    // Rust expects this field; we explicitly set false (parity with OpenCode
-    // built-in tools) so it doesn't fall back to its own default.
+  test("empty config returns restrict_to_project_root default + graduated bash defaults", () => {
+    // Rust expects restrict_to_project_root; we explicitly set false (parity
+    // with OpenCode built-in tools) so it doesn't fall back to its own default.
+    //
+    // Post-v0.27.2 graduation: bash is on by default for the implicit
+    // `recommended` tool_surface, so `resolveBashConfig` emits true for all
+    // three sub-features. They flow through to Rust as flat keys.
     expect(resolveProjectOverridesForConfigure({})).toEqual({
       restrict_to_project_root: false,
+      experimental_bash_rewrite: true,
+      experimental_bash_compress: true,
+      experimental_bash_background: true,
     });
   });
 
@@ -100,6 +107,10 @@ describe("resolveProjectOverridesForConfigure", () => {
     // The pool does `{ ...global, ...projectOverrides }`. Any undefined value
     // here would clobber the global value. Excluding them keeps the merge
     // semantically clean.
+    //
+    // Post-v0.27.2: bash defaults flow through unconditionally because the
+    // resolver materializes the surface default. Other unspecified fields
+    // are still omitted as before.
     const overrides = resolveProjectOverridesForConfigure({
       format_on_edit: true,
       // formatter_timeout_secs and validate_on_edit left undefined
@@ -108,6 +119,10 @@ describe("resolveProjectOverridesForConfigure", () => {
     expect(overrides).toEqual({
       format_on_edit: true,
       restrict_to_project_root: false, // always set
+      // Graduated bash defaults are always materialized (see resolveBashConfig).
+      experimental_bash_rewrite: true,
+      experimental_bash_compress: true,
+      experimental_bash_background: true,
     });
     expect("formatter_timeout_secs" in overrides).toBe(false);
     expect("validate_on_edit" in overrides).toBe(false);
