@@ -1,6 +1,16 @@
-import { sessionWarn } from "./logger.js";
+import { createHash, randomUUID } from "node:crypto";
+import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import type { PluginContext } from "./types.js";
+
+/**
+ * Short SHA-256 of the reminder body for delivery-trace correlation. The full
+ * body is never logged (it can contain large output previews); 16 hex chars is
+ * enough to uniquely identify a unique reminder within a session.
+ */
+function hashReminder(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
 
 export interface BgCompletion {
   task_id: string;
@@ -157,6 +167,17 @@ export async function appendInTurnBgCompletions(
   const deliveredCompletions = [...state.pendingCompletions];
   const reminder = formatCombinedSystemReminder(state.pendingCompletions, state.pendingLongRunning);
   output.output = appendReminder(output.output ?? "", reminder);
+  // Trace #7 of 7: reminder went out as part of an existing tool result
+  // instead of through promptAsync. NO wake_prompt_async_start event
+  // accompanies this branch — that's the diagnostic signal that the
+  // reminder reached the model via tool-result piggyback.
+  sessionLog(drainContext.sessionID, `${LOG_PREFIX} in-turn append`, {
+    event: "bash_completion_in_turn_append",
+    task_ids: deliveredCompletions.map((c) => c.task_id),
+    long_running_task_ids: state.pendingLongRunning.map((r) => r.task_id),
+    reminder_sha256: hashReminder(reminder),
+    reminder_chars: reminder.length,
+  });
   state.pendingCompletions = [];
   state.pendingLongRunning = [];
   state.wakeRetryAttempts = 0;
@@ -231,11 +252,71 @@ async function triggerWakeIfPending(
         };
       }
       if (promptContext?.variant) body.variant = promptContext.variant;
-      await client.session.promptAsync({
-        path: { id: drainContext.sessionID },
-        body,
+
+      // Trace #3 of 7: about to call promptAsync. The deliveryID uniquely
+      // identifies this single promptAsync invocation across the rest of
+      // the trace chain (#3 start → #4 ok / #5 error → #6 ack_ok). One
+      // deliveryID = one HTTP POST to OpenCode's session prompt endpoint.
+      // When the DB shows multiple assistant children but logs show one
+      // start event with this deliveryID, the duplication is downstream
+      // of AFT.
+      const deliveryID = `aftdel_${randomUUID()}`;
+      const taskIDs = deliveredCompletions.map((c) => c.task_id);
+      const wakeMeta = {
+        delivery_id: deliveryID,
+        attempt: state.wakeRetryAttempts + 1,
+        task_ids: taskIDs,
+        directory: drainContext.directory,
+        reminder_sha256: hashReminder(reminder),
+        reminder_chars: reminder.length,
+        prompt_context: promptContext
+          ? {
+              agent: promptContext.agent,
+              model: promptContext.model
+                ? {
+                    providerID: promptContext.model.providerID,
+                    modelID: promptContext.model.modelID,
+                  }
+                : null,
+              variant: promptContext.variant ?? null,
+            }
+          : null,
+      };
+      sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync start`, {
+        event: "bash_completion_wake_prompt_async_start",
+        ...wakeMeta,
       });
-      await ackCompletions(drainContext, deliveredCompletions);
+      try {
+        await client.session.promptAsync({
+          path: { id: drainContext.sessionID },
+          body,
+        });
+      } catch (err) {
+        // Trace #5 of 7: promptAsync rejected. Counted toward MAX_WAKE_SEND_ATTEMPTS
+        // by the catch in scheduleWake. Re-throw so the retry path runs.
+        sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
+          event: "bash_completion_wake_prompt_async_error",
+          delivery_id: deliveryID,
+          attempt: state.wakeRetryAttempts + 1,
+          task_ids: taskIDs,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+      // Trace #4 of 7: promptAsync resolved. OpenCode has accepted the
+      // synthetic user message and will run the agent turn. A subsequent
+      // assistant child with finish="stop" should appear in OpenCode's
+      // DB for this parent user message; if MORE than one appears for
+      // the same parent + reminder_sha256, the duplication is in the
+      // OpenCode runner, not in AFT (only one promptAsync call exists
+      // with this deliveryID in the log).
+      sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync ok`, {
+        event: "bash_completion_wake_prompt_async_ok",
+        delivery_id: deliveryID,
+        attempt: state.wakeRetryAttempts + 1,
+        task_ids: taskIDs,
+      });
+      await ackCompletions(drainContext, deliveredCompletions, deliveryID);
     },
     (err, hardStopped) => {
       sessionWarn(
@@ -245,6 +326,7 @@ async function triggerWakeIfPending(
           : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     },
+    drainContext.sessionID,
   );
 }
 
@@ -326,6 +408,7 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
 async function ackCompletions(
   { ctx, directory, sessionID }: DrainContext,
   completions: readonly BgCompletion[],
+  deliveryID?: string,
 ): Promise<void> {
   const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
   if (taskIds.length === 0) return;
@@ -340,7 +423,18 @@ async function ackCompletions(
         sessionID,
         `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
       );
+      return;
     }
+    // Trace #6 of 7: bash_ack_completions succeeded on the Rust side.
+    // Closes the wake chain: scheduled → fire → start → ok → ack_ok.
+    // Note: ack also runs from appendInTurnBgCompletions without a
+    // deliveryID — that path uses trace #7 (in_turn_append) instead, so
+    // ack_ok carries delivery_id only when present.
+    sessionLog(sessionID, `${LOG_PREFIX} ack ok`, {
+      event: "bash_completion_ack_ok",
+      delivery_id: deliveryID ?? null,
+      task_ids: taskIds,
+    });
   } catch (err) {
     sessionWarn(
       sessionID,
@@ -353,6 +447,7 @@ function scheduleWake(
   state: SessionBgState,
   sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
+  sessionID?: string,
 ): void {
   if (state.wakeHardStopped) return;
   // Race model: JS state changes are synchronous; awaits only happen before scheduling
@@ -377,6 +472,21 @@ function scheduleWake(
 
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
+
+  // Trace #1 of 7 for the wake-delivery chain. Pairs with bash_completion_wake_fire.
+  // When the OpenCode DB later shows N assistant children for one parent
+  // user message, the matching count of wake_scheduled / wake_fire /
+  // wake_prompt_async_start events for the same task_ids tells us whether
+  // AFT submitted the prompt once or N times. See
+  // .alfonso/incident-reports/2026-05-21-bash-reminder-duplicate-runs.md.
+  sessionLog(sessionID, `${LOG_PREFIX} wake scheduled`, {
+    event: "bash_completion_wake_scheduled",
+    delay_ms: delay,
+    pending_completions: state.pendingCompletions.length,
+    pending_long_running: state.pendingLongRunning.length,
+    retry_attempt: state.wakeRetryAttempts,
+  });
+
   state.debounceTimer = setTimeout(() => {
     const pending = state.pendingCompletions;
     const pendingLongRunning = state.pendingLongRunning;
@@ -389,6 +499,20 @@ function scheduleWake(
     // skip — don't ship an empty "[BACKGROUND BASH STILL RUNNING]" shell.
     if (pending.length === 0 && pendingLongRunning.length === 0) return;
     const reminder = formatCombinedSystemReminder(pending, pendingLongRunning);
+
+    // Trace #2 of 7: timer actually fired and we captured a non-empty
+    // pending set. The matching wake_prompt_async_start MUST follow within
+    // ~milliseconds — its absence means sendWake threw synchronously
+    // before reaching client.session.promptAsync.
+    sessionLog(sessionID, `${LOG_PREFIX} wake fire`, {
+      event: "bash_completion_wake_fire",
+      task_ids: pending.map((c) => c.task_id),
+      long_running_task_ids: pendingLongRunning.map((r) => r.task_id),
+      reminder_sha256: hashReminder(reminder),
+      reminder_chars: reminder.length,
+      retry_attempt: state.wakeRetryAttempts,
+    });
+
     state.pendingCompletions = [];
     state.pendingLongRunning = [];
     void sendWake(reminder, pending)
@@ -409,7 +533,7 @@ function scheduleWake(
         }
         state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
         onSendFailure(err, false);
-        scheduleWake(state, sendWake, onSendFailure);
+        scheduleWake(state, sendWake, onSendFailure, sessionID);
       });
   }, delay);
   state.debounceTimer.unref?.();
