@@ -809,8 +809,12 @@ fn missing_tool_warning(
         kind: kind.to_string(),
         language: language.to_string(),
         tool: candidate.tool.clone(),
+        // GitHub issue #47: word this so the user understands the tool may
+        // be installed but missing from AFT's PATH (common with GUI-launched
+        // editors that don't inherit a login shell). format.rs has the same
+        // wording in `configured_tool_hint`.
         hint: format!(
-            "{} is configured in {} but not installed. {}",
+            "{} is configured in {} but was not found on PATH or in common install locations. {}",
             candidate.tool,
             candidate.source,
             crate::format::install_hint(&candidate.tool)

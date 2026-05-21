@@ -305,38 +305,123 @@ fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) -> Option<P
         }
     }
 
-    // 2. Fall back to PATH lookup
-    match Command::new(command)
+    // 2. Try PATH lookup first. This is the fast common path: spawning the
+    // tool with `--version` and waiting briefly for it to exit. When the
+    // editor (OpenCode, Pi, etc.) is launched from a login shell the PATH
+    // is usually complete, so this finds Homebrew/cargo/etc. binaries.
+    if let Some(path) = try_path_lookup(command) {
+        return Some(path);
+    }
+
+    // 3. Fall back to well-known install locations the editor's PATH may
+    // not contain. GitHub issue #47: macOS GUI launches (Spotlight, Dock,
+    // Alfred) and some Linux desktop launchers drop /opt/homebrew/bin and
+    // similar from PATH, making PATH lookups fail even though the user
+    // genuinely has the tool installed. Returning the absolute path here
+    // means downstream `Command::new(resolved)` works regardless.
+    try_well_known_path_lookup(command)
+}
+
+/// Try spawning the tool via the inherited PATH. Returns the bare command
+/// name on success (downstream `Command::new` re-resolves through PATH),
+/// or None if the spawn fails or the tool exits with non-zero status.
+fn try_path_lookup(command: &str) -> Option<PathBuf> {
+    let mut child = Command::new(command)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(mut child) => {
-            let start = Instant::now();
-            let timeout = Duration::from_secs(2);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        return if status.success() {
-                            Some(PathBuf::from(command))
-                        } else {
-                            None
-                        };
-                    }
-                    Ok(None) if start.elapsed() > timeout => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                    Ok(None) => thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return None,
-                }
+        .ok()?;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Some(PathBuf::from(command))
+                } else {
+                    None
+                };
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Look up `command` in the well-known install locations that GUI-launched
+/// editors commonly miss from PATH. Returns the absolute path so the caller
+/// invokes the tool via `Command::new(absolute_path)` regardless of PATH.
+///
+/// Search order is built by `well_known_search_paths`:
+/// 1. `/opt/homebrew/bin` (Apple Silicon Homebrew)
+/// 2. `/usr/local/bin` (Intel Mac Homebrew + most manual Linux installs)
+/// 3. `$HOME/.cargo/bin` (cargo install — rustfmt, etc.)
+/// 4. `$HOME/go/bin` (`go install` default GOPATH layout)
+/// 5. `$HOME/.local/bin` (pip --user, pipx, npm prefix, many shell scripts)
+///
+/// Each candidate is verified to (a) exist as a regular file and (b) be
+/// executable; we don't spawn `--version` here because spawning an
+/// absolute-path candidate that doesn't accept `--version` would emit a
+/// false negative (and Rust's `fs::metadata` is much cheaper than a spawn).
+fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        // On Windows, well-known POSIX paths don't apply. Skip the fallback
+        // entirely — the user's tool is either on PATH or genuinely missing.
+        return None;
+    }
+    let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
+    try_well_known_path_lookup_in(&candidates)
+}
+
+/// Build the candidate path list for the given command name and HOME value.
+/// Extracted so tests can drive the lookup with a controlled HOME without
+/// mutating process-global env vars.
+fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
+    candidates.push(PathBuf::from("/opt/homebrew/bin").join(command));
+    candidates.push(PathBuf::from("/usr/local/bin").join(command));
+    if let Some(home) = home {
+        let home_path = PathBuf::from(home);
+        candidates.push(home_path.join(".cargo/bin").join(command));
+        candidates.push(home_path.join("go/bin").join(command));
+        candidates.push(home_path.join(".local/bin").join(command));
+    }
+    candidates
+}
+
+/// Walk a pre-built candidate list, returning the first file that exists and
+/// is executable. Extracted from `try_well_known_path_lookup` so tests can
+/// inject candidates anchored at a tempdir.
+fn try_well_known_path_lookup_in(candidates: &[PathBuf]) -> Option<PathBuf> {
+    for candidate in candidates {
+        if let Ok(metadata) = std::fs::metadata(candidate) {
+            if metadata.is_file() && is_executable(&metadata) {
+                return Some(candidate.clone());
             }
         }
-        Err(_) => None,
     }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+    // Windows: regular files in well-known POSIX paths don't apply
+    // (try_well_known_path_lookup returns early on Windows). This stub
+    // exists only so the file compiles on Windows.
+    true
 }
 
 /// Check if `ruff format` is available with a stable formatter.
@@ -941,7 +1026,13 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "rustfmt" => "Install: `rustup component add rustfmt`".to_string(),
         "rust-analyzer" => "Install: `rustup component add rust-analyzer`".to_string(),
         "cargo" => "Install Rust from https://rustup.rs/.".to_string(),
-        "go" => "Install Go from https://go.dev/dl/.".to_string(),
+        "go" => [
+            "Install Go from https://go.dev/dl/, or — if it's already installed —",
+            "ensure its bin directory is on PATH (Homebrew typically uses",
+            "/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).",
+            "GUI-launched editors often don't inherit login-shell PATH.",
+        ]
+        .join(" "),
         "gopls" => "Install: `go install golang.org/x/tools/gopls@latest`".to_string(),
         "bash-language-server" => "Install: `npm install -g bash-language-server`".to_string(),
         "yaml-language-server" => "Install: `npm install -g yaml-language-server`".to_string(),
@@ -958,8 +1049,17 @@ pub(crate) fn install_hint(tool: &str) -> String {
 }
 
 fn configured_tool_hint(tool: &str, source: &str) -> String {
+    // GitHub issue #47: editors launched from a non-login GUI shell (Spotlight,
+    // Dock, Alfred, etc.) often don't inherit the user's full PATH, so a tool
+    // that's installed but lives under /opt/homebrew/bin, ~/.cargo/bin, or
+    // similar can fail this lookup. We already check those well-known
+    // locations in `resolve_tool_uncached`; if we still didn't find the tool,
+    // it's genuinely missing OR sits in an unusual install prefix.
+    //
+    // Word the message so users know to check both "is it installed at all"
+    // and "is it on AFT's PATH" — rather than implying definite absence.
     format!(
-        "{tool} is configured in {source} but not installed. {}",
+        "{tool} is configured in {source} but was not found on PATH or in common install locations. {}",
         install_hint(tool)
     )
 }
@@ -2112,5 +2212,118 @@ mod tests {
             FormatError::NotFound { tool } => assert_eq!(tool, "__nonexistent_xyz__"),
             other => panic!("expected NotFound, got: {:?}", other),
         }
+    }
+
+    // GitHub issue #47: GUI-launched editors miss /opt/homebrew/bin etc. from
+    // PATH. `try_well_known_path_lookup` should find the tool at well-known
+    // install locations even when PATH wouldn't.
+    #[cfg(unix)]
+    #[test]
+    fn well_known_search_paths_include_homebrew_cargo_go_and_local() {
+        let home = std::ffi::OsString::from("/Users/test-home");
+        let paths = well_known_search_paths("toolx", Some(&home));
+        let strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        // Order matters: Homebrew prefixes come first so an installed-via-brew
+        // tool wins over a HOME-rooted shim.
+        assert_eq!(strs[0], "/opt/homebrew/bin/toolx");
+        assert_eq!(strs[1], "/usr/local/bin/toolx");
+        assert_eq!(strs[2], "/Users/test-home/.cargo/bin/toolx");
+        assert_eq!(strs[3], "/Users/test-home/go/bin/toolx");
+        assert_eq!(strs[4], "/Users/test-home/.local/bin/toolx");
+        assert_eq!(strs.len(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn well_known_search_paths_skips_home_when_unset() {
+        let paths = well_known_search_paths("toolx", None);
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("opt/homebrew/bin/toolx"));
+        assert!(paths[1].ends_with("usr/local/bin/toolx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_well_known_path_lookup_in_finds_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let tool_path = bin_dir.join("toolx");
+        fs::write(&tool_path, "#!/bin/sh\necho test").unwrap();
+        let mut perms = fs::metadata(&tool_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tool_path, perms).unwrap();
+
+        let candidates = vec![
+            dir.path().join("missing/toolx"),
+            tool_path.clone(),
+            dir.path().join("alt/toolx"),
+        ];
+        let found = try_well_known_path_lookup_in(&candidates);
+        assert_eq!(found, Some(tool_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_well_known_path_lookup_in_skips_non_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // File exists but is not marked executable (default 0o644 on most umasks).
+        let tool_path = bin_dir.join("toolx");
+        fs::write(&tool_path, "not a real tool").unwrap();
+
+        let found = try_well_known_path_lookup_in(&std::slice::from_ref(&tool_path));
+        assert!(found.is_none(), "non-executable file should be skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_well_known_path_lookup_in_skips_directories_and_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the expected path should not count as a tool.
+        let candidates = vec![dir.path().to_path_buf(), dir.path().join("does-not-exist")];
+        assert!(try_well_known_path_lookup_in(&candidates).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn try_well_known_path_lookup_is_noop_on_windows() {
+        // On Windows we deliberately skip POSIX well-known paths; only PATH
+        // lookup applies. The public entry point should always return None.
+        assert!(try_well_known_path_lookup("biome").is_none());
+    }
+
+    // GitHub issue #47: wording must not claim "but not installed" — the tool
+    // may be installed but missing from AFT's PATH (GUI-launched editor).
+    #[test]
+    fn configured_tool_hint_does_not_claim_not_installed() {
+        let hint = configured_tool_hint("biome", "biome.json");
+        assert!(
+            hint.contains("was not found on PATH or in common install locations"),
+            "hint should explain the PATH miss: got {:?}",
+            hint
+        );
+        assert!(
+            !hint.contains("but not installed"),
+            "hint must not claim the tool isn't installed: got {:?}",
+            hint
+        );
+    }
+
+    #[test]
+    fn install_hint_for_go_mentions_path() {
+        // Verify the Go-specific hint nudges users toward checking PATH
+        // (Homebrew install location is the most common GUI-launch PATH miss).
+        let hint = install_hint("go");
+        assert!(
+            hint.contains("PATH"),
+            "go install hint should mention PATH: got {:?}",
+            hint
+        );
     }
 }
