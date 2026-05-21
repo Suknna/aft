@@ -23,6 +23,20 @@ export interface NpmServerSpec {
   readonly extensions: readonly string[];
   /** Project-root marker files (presence triggers install). Optional. */
   readonly rootMarkers?: readonly string[];
+  /**
+   * Package names whose presence in `<projectRoot>/package.json` `dependencies`,
+   * `devDependencies`, or `peerDependencies` triggers auto-install. Useful for
+   * frameworks where the config file alone (`vite.config.ts`, etc.) doesn't
+   * reveal which language server is needed — e.g. a Vite project is only a
+   * Vue project if `vue` is in package.json. Optional.
+   *
+   * GitHub issue #48: Vue, Astro, and Svelte projects can have their .vue
+   * /.astro/.svelte files deep enough in a monorepo (or behind skipped
+   * directories like `apps/`) that the bounded extension walk misses them.
+   * Without rootMarkers OR this hint, auto-install never triggers and the
+   * user sees a recurring `lsp_binary_missing` warning.
+   */
+  readonly packageJsonDeps?: readonly string[];
 }
 
 export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
@@ -66,18 +80,34 @@ export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
     npm: "@vue/language-server",
     binary: "vue-language-server",
     extensions: ["vue"],
+    // Vue CLI + Nuxt projects ship config files; Vite-based Vue apps don't,
+    // so we also detect via package.json deps (the most common modern setup).
+    rootMarkers: [
+      "vue.config.js",
+      "vue.config.mjs",
+      "vue.config.ts",
+      "nuxt.config.js",
+      "nuxt.config.mjs",
+      "nuxt.config.ts",
+      "nuxt.config.cjs",
+    ],
+    packageJsonDeps: ["vue", "@vue/runtime-core", "nuxt"],
   },
   {
     id: "astro",
     npm: "@astrojs/language-server",
     binary: "astro-ls",
     extensions: ["astro"],
+    rootMarkers: ["astro.config.js", "astro.config.mjs", "astro.config.ts", "astro.config.cjs"],
+    packageJsonDeps: ["astro"],
   },
   {
     id: "svelte",
     npm: "svelte-language-server",
     binary: "svelteserver",
     extensions: ["svelte"],
+    rootMarkers: ["svelte.config.js", "svelte.config.mjs", "svelte.config.ts", "svelte.config.cjs"],
+    packageJsonDeps: ["svelte", "@sveltejs/kit"],
   },
   {
     id: "php-intelephense",

@@ -47,7 +47,11 @@ import {
 } from "./lsp-cache.js";
 import { assertSafeVersion, isSafeVersion } from "./lsp-github-probe.js";
 import { NPM_LSP_TABLE, type NpmServerSpec } from "./lsp-npm-table.js";
-import { hasRootMarker, relevantExtensionsInProject } from "./lsp-project-relevance.js";
+import {
+  hasPackageJsonDep,
+  hasRootMarker,
+  relevantExtensionsInProject,
+} from "./lsp-project-relevance.js";
 import { probeRegistry, type VersionPickResult } from "./lsp-registry-probe.js";
 
 /** Per-call configuration drawn from `lsp.*` plugin config. */
@@ -93,8 +97,19 @@ export interface AutoInstallResult {
 }
 
 /**
- * Cheap project-relevance check: root markers win immediately; otherwise use
- * the bounded shared extension walk for monorepos with nested source files.
+ * Cheap project-relevance check. A server is relevant if ANY of:
+ *
+ *   1. A `rootMarkers` file exists at the project root (e.g. `tsconfig.json`,
+ *      `vue.config.ts`, `astro.config.mjs`).
+ *   2. `packageJsonDeps` matches an entry in `<root>/package.json` deps maps
+ *      — covers Vite/Nuxt/SvelteKit setups where no framework-specific
+ *      config file exists at the root (GitHub issue #48).
+ *   3. The bounded extension walk found one of `spec.extensions` in the
+ *      project tree (depth ≤ 4, ≤ 200 dirs visited).
+ *
+ * Checks are ordered cheapest-first: `existsSync`, package.json read, then
+ * the walk. The walk result is cached across servers within one runAutoInstall
+ * call via `projectExtensions`.
  */
 function isProjectRelevant(
   spec: NpmServerSpec,
@@ -102,6 +117,7 @@ function isProjectRelevant(
   projectExtensions: () => ReadonlySet<string>,
 ): boolean {
   if (hasRootMarker(projectRoot, spec.rootMarkers)) return true;
+  if (hasPackageJsonDep(projectRoot, spec.packageJsonDeps)) return true;
   const extensions = projectExtensions();
   return spec.extensions.some((ext) => extensions.has(ext.toLowerCase()));
 }

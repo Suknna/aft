@@ -1,4 +1,4 @@
-import { type Dirent, existsSync, readdirSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_WALK_DIRS = 200;
@@ -21,6 +21,52 @@ export function hasRootMarker(projectRoot: string, rootMarkers?: readonly string
     if (existsSync(join(projectRoot, marker))) return true;
   }
   return false;
+}
+
+/**
+ * True when `<projectRoot>/package.json` lists any name from `depNames`
+ * in its `dependencies`, `devDependencies`, or `peerDependencies` maps.
+ *
+ * GitHub issue #48: Vue/Astro/Svelte projects fail the bounded extension
+ * walk for monorepo layouts. Detecting them by package.json dep name
+ * catches Vite-based setups and other frameworks where no framework-
+ * specific config file exists at the project root.
+ *
+ * Reads package.json once per call. Failures (missing file, invalid JSON,
+ * I/O error) return false — this signal is additive, never blocking.
+ */
+export function hasPackageJsonDep(projectRoot: string, depNames?: readonly string[]): boolean {
+  if (!depNames || depNames.length === 0) return false;
+  const pkg = readPackageJson(projectRoot);
+  if (!pkg) return false;
+  const merged: Record<string, unknown> = {
+    ...(typeof pkg.dependencies === "object" && pkg.dependencies ? pkg.dependencies : {}),
+    ...(typeof pkg.devDependencies === "object" && pkg.devDependencies ? pkg.devDependencies : {}),
+    ...(typeof pkg.peerDependencies === "object" && pkg.peerDependencies
+      ? pkg.peerDependencies
+      : {}),
+  };
+  for (const name of depNames) {
+    if (Object.hasOwn(merged, name)) return true;
+  }
+  return false;
+}
+
+interface PartialPackageJson {
+  dependencies?: unknown;
+  devDependencies?: unknown;
+  peerDependencies?: unknown;
+}
+
+function readPackageJson(projectRoot: string): PartialPackageJson | null {
+  try {
+    const raw = readFileSync(join(projectRoot, "package.json"), "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed as PartialPackageJson;
+  } catch {
+    return null;
+  }
 }
 
 /**
