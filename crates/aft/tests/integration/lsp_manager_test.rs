@@ -282,11 +282,16 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
     fs::write(root.join("typst.toml"), "[package]\nname = \"demo\"\n").unwrap();
     fs::write(&main_typ, "= Demo\n").unwrap();
 
+    // NOTE: id must NOT match a built-in server name. Earlier versions of this
+    // test used "tinymist" — that is a built-in id, so after #56 (user entries
+    // merge with matching built-ins) the registered ServerKind would be
+    // ServerKind::Tinymist, not ServerKind::Custom("tinymist"). Use a clearly
+    // user-only id so this test verifies the Custom code path.
     let mut env = HashMap::new();
     env.insert("AFT_TEST_LSP_ENV".to_string(), "from-config".to_string());
     let config = Config {
         lsp_servers: vec![UserServerDef {
-            id: "tinymist".to_string(),
+            id: "my-typst".to_string(),
             extensions: vec!["typ".to_string()],
             binary: "tinymist".to_string(),
             args: Vec::new(),
@@ -303,7 +308,7 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
 
     let mut manager = LspManager::new();
     manager.override_binary(
-        ServerKind::Custom(Arc::from("tinymist")),
+        ServerKind::Custom(Arc::from("my-typst")),
         fake_server_path(),
     );
 
