@@ -268,10 +268,14 @@ describe("runAutoInstall", () => {
   // silently reintroduce a bun dependency.
   test("runInstall spawns npm, not bun (GitHub #46)", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
-    // The runtime spawn call must use npm.
+    // The runtime spawn call must use npm on Unix and npm.cmd on Windows.
+    // Node's child_process.spawn does not auto-resolve `.cmd` shims on
+    // win32, and npm ships as `npm.cmd` there. We assert the two pieces
+    // separately so the test survives formatter reflows of the source.
     expect(source).toMatch(
-      /spawn\(\s*["']npm["']\s*,\s*\[\s*["']install["']\s*,\s*["']--no-save["']/,
+      /process\.platform\s*===\s*["']win32["']\s*\?\s*["']npm\.cmd["']\s*:\s*["']npm["']/,
     );
+    expect(source).toMatch(/spawn\(\s*\w+\s*,\s*\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing
     // the old behavior are fine (they explain the historical bug); only a
     // real spawn would reintroduce the regression.

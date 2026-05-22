@@ -254,8 +254,15 @@ describe("runAutoInstall", () => {
 
   test("runInstall uses npm for Pi and unreferences spawned children", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
-    expect(source).toContain(
-      'spawn("npm", ["install", "--no-save", "--ignore-scripts", "--silent", target]',
+    // Node's child_process.spawn on Windows does not auto-resolve `.cmd`
+    // shims, and npm ships as `npm.cmd` there. Assert the platform branch
+    // + the spawn invocation separately so the test survives formatter
+    // reflows of the source.
+    expect(source).toMatch(
+      /process\.platform\s*===\s*["']win32["']\s*\?\s*["']npm\.cmd["']\s*:\s*["']npm["']/,
+    );
+    expect(source).toMatch(
+      /spawn\(\s*\w+\s*,\s*\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*\]/,
     );
     expect(source).not.toContain('spawn("bun"');
     expect(source).toContain("child.unref()");
