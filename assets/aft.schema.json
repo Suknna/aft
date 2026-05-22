@@ -102,6 +102,47 @@
       "default": false,
       "description": "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field."
     },
+    "bash": {
+      "oneOf": [
+        {
+          "type": "boolean",
+          "description": "Shorthand: `true` enables hoisting with rewrite + compress + background all on; `false` disables AFT bash hoisting entirely and keeps the host's native bash."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rewrite": {
+              "type": "boolean",
+              "default": true,
+              "description": "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output."
+            },
+            "compress": {
+              "type": "boolean",
+              "default": true,
+              "description": "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker."
+            },
+            "background": {
+              "type": "boolean",
+              "default": true,
+              "description": "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag."
+            },
+            "long_running_reminder_enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed."
+            },
+            "long_running_reminder_interval_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 600000,
+              "description": "Interval in milliseconds between mid-flight reminders for a still-running background bash task."
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "description": "Bash tool family (hoist + rewrite + compress + background execution). Default on for `tool_surface: recommended`/`all`, off for `minimal`. Replaces `experimental.bash.*` (still accepted for backward compat)."
+    },
     "experimental": {
       "type": "object",
       "properties": {
