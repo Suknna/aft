@@ -140,3 +140,71 @@ strip = false
 
     assert_eq!(actual, "matched raw ansi");
 }
+
+fn compress_builtin(command: &str, output: &str) -> String {
+    let registry = build_registry(ALL, None, None);
+    aft::compress::compress_with_registry(command, output, &registry)
+}
+
+#[test]
+fn deno_check_shortcircuits_clean_output() {
+    let output = "Check file:///tmp/main.ts OK";
+    let compressed = compress_builtin("deno check main.ts", output);
+
+    assert_eq!(compressed, "deno check: ok");
+}
+
+#[test]
+fn pip_install_already_satisfied_shortcircuits() {
+    let output = "Requirement already satisfied: numpy in /usr/lib/python3.10\nRequirement already satisfied: pandas in /usr/lib/python3.10";
+    let compressed = compress_builtin("pip install numpy pandas", output);
+
+    assert_eq!(compressed, "pip: already satisfied");
+}
+
+#[test]
+fn uv_audit_shortcircuits_clean_output() {
+    let output = "Audited 42 packages";
+    let compressed = compress_builtin("uv pip install -r requirements.txt", output);
+
+    assert_eq!(compressed, "uv: audited packages");
+}
+
+#[test]
+fn aws_filter_strips_initialization_and_truncates_long_lines() {
+    let long_value = "x".repeat(800);
+    let output = format!("Initializing AWS CLI ...\n{{\"Value\":\"{long_value}\"}}");
+    let compressed = compress_builtin("aws ec2 describe-instances", &output);
+
+    assert!(!compressed.contains("Initializing AWS CLI"));
+    assert!(compressed.contains("Value"));
+    assert!(compressed.len() < output.len());
+}
+
+#[test]
+fn psql_empty_result_shortcircuits() {
+    let output = "+----+\n+----+\n(0 rows)";
+    let compressed = compress_builtin("psql -c 'select * from t'", output);
+
+    assert_eq!(compressed, "psql: (0 rows)");
+}
+
+#[test]
+fn curl_filter_strips_progress_and_verbose_connection_noise() {
+    let output = "  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n* Trying 127.0.0.1:443...\n* Connected to example.com (127.0.0.1) port 443\n{\"ok\":true}";
+    let compressed = compress_builtin("curl -v https://example.com", output);
+
+    assert!(!compressed.contains("% Total"));
+    assert!(!compressed.contains("* Trying"));
+    assert!(!compressed.contains("* Connected"));
+    assert!(compressed.contains("{\"ok\":true}"));
+    assert!(compressed.len() < output.len());
+}
+
+#[test]
+fn wget_successful_download_shortcircuits() {
+    let output = "Resolving example.com (example.com)... 93.184.216.34\nConnecting to example.com (example.com)|93.184.216.34|:443... connected.\nHTTP request sent, awaiting response... 200 OK\n'index.html' saved [1234/1234]";
+    let compressed = compress_builtin("wget https://example.com", output);
+
+    assert_eq!(compressed, "wget: downloaded");
+}

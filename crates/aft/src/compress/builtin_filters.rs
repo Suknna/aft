@@ -33,4 +33,11 @@ pub const ALL: &[(&str, &str)] = &[
         "ansible-playbook",
         include_str!("builtin_filters/ansible-playbook.toml"),
     ),
+    ("aws", include_str!("builtin_filters/aws.toml")),
+    ("curl", include_str!("builtin_filters/curl.toml")),
+    ("deno", include_str!("builtin_filters/deno.toml")),
+    ("pip", include_str!("builtin_filters/pip.toml")),
+    ("psql", include_str!("builtin_filters/psql.toml")),
+    ("uv", include_str!("builtin_filters/uv.toml")),
+    ("wget", include_str!("builtin_filters/wget.toml")),
 ];
