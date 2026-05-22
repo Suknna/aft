@@ -482,6 +482,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           directory: sessionDir,
           sessionID: completion.session_id,
           client: input.client,
+          // Workaround for anomalyco/opencode#28202 — wake path uses a
+          // separate live-server client built from this URL. See
+          // bg-notifications.ts and shared/live-server-client.ts.
+          serverUrl: input.serverUrl?.toString(),
         },
         completion,
       );
@@ -494,6 +498,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           directory: sessionDir,
           sessionID: reminder.session_id,
           client: input.client,
+          serverUrl: input.serverUrl?.toString(),
         },
         reminder,
       );
@@ -869,6 +874,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         directory: sessionDir,
         sessionID,
         client: input.client,
+        serverUrl: input.serverUrl?.toString(),
       });
     },
     "chat.message": async (messageInput: {

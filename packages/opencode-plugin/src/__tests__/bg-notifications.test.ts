@@ -1,6 +1,61 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+
+// Spy on sessionLog/sessionWarn so we can assert on the structured trace
+// events emitted by the wake path (event names, wake_client_path metadata,
+// wake_serverUrl_unavailable). The mock MUST be installed before the
+// SUT is imported, because Bun hoists `mock.module` to the top of the file.
+const sessionLogSpy = mock(
+  (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
+);
+const sessionWarnSpy = mock(
+  (_sessionID: string | undefined, _message: string, _data?: unknown) => {},
+);
+mock.module("../logger.js", () => ({
+  sessionLog: sessionLogSpy,
+  sessionWarn: sessionWarnSpy,
+  log: () => {},
+  warn: () => {},
+  error: () => {},
+  sessionError: () => {},
+  bridgeLogger: {
+    log: () => {},
+    warn: () => {},
+    error: () => {},
+    getLogFilePath: () => "",
+  },
+  getLogFilePath: () => "",
+}));
+
+// Mock the live-server client factory so unit tests don't need a real
+// HTTP listener. Each test installs the client it wants via
+// `setTestLiveServerClient(...)`. This is the substitute for the legacy
+// `client: { session: { promptAsync } }` parameter on DrainContext —
+// the wake path no longer reads `drainContext.client` (workaround for
+// anomalyco/opencode#28202), so we have to intercept the SDK factory.
+let liveServerClient: unknown = null;
+let lastLiveServerArgs: { serverUrl: string; directory: string } | null = null;
+function setTestLiveServerClient(client: unknown): void {
+  liveServerClient = client;
+}
+function getLastLiveServerArgs(): { serverUrl: string; directory: string } | null {
+  return lastLiveServerArgs;
+}
+mock.module("../shared/live-server-client.js", () => ({
+  getLiveServerClient: (serverUrl: string, directory: string) => {
+    lastLiveServerArgs = { serverUrl, directory };
+    if (!liveServerClient) {
+      throw new Error("test did not configure a live-server client via setTestLiveServerClient()");
+    }
+    return liveServerClient;
+  },
+  __resetLiveServerClientCacheForTests: () => {
+    liveServerClient = null;
+    lastLiveServerArgs = null;
+  },
+}));
+
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
@@ -16,22 +71,46 @@ import type { PluginContext } from "../types.js";
 
 type BridgeResponse = Record<string, unknown>;
 
+const TEST_SERVER_URL = "http://127.0.0.1:0/";
+
+beforeEach(() => {
+  sessionLogSpy.mockClear();
+  sessionWarnSpy.mockClear();
+  liveServerClient = null;
+  lastLiveServerArgs = null;
+});
+
 afterEach(() => {
   __resetBgNotificationStateForTests();
 });
 
 /**
- * Make a fake `client.session.messages` that returns the given message
- * shape. Used by tests that exercise prompt-context resolution which the
- * wake path performs against the real OpenCode messages API.
+ * Configure the live-server client mock to return `{ session: { promptAsync } }`,
+ * optionally with a `messages` stub so prompt-context resolution works.
  */
-function clientWithMessages(promptAsync: (input: unknown) => Promise<void>, messages: unknown[]) {
-  return {
+function installLiveServerClient(
+  promptAsync: (input: unknown) => Promise<unknown> | unknown,
+  messages?: unknown[],
+): void {
+  setTestLiveServerClient({
     session: {
       promptAsync,
-      messages: async () => ({ data: messages }),
+      ...(messages !== undefined ? { messages: async () => ({ data: messages }) } : {}),
     },
-  };
+  });
+}
+
+/** Helper: extract the structured data argument from the first matching trace event. */
+function findTraceEvent(eventName: string): Record<string, unknown> | undefined {
+  for (const call of sessionLogSpy.mock.calls) {
+    const data = call[2] as { event?: string } | undefined;
+    if (data?.event === eventName) return data as Record<string, unknown>;
+  }
+  for (const call of sessionWarnSpy.mock.calls) {
+    const data = call[2] as { event?: string } | undefined;
+    if (data?.event === eventName) return data as Record<string, unknown>;
+  }
+  return undefined;
 }
 
 describe("OpenCode background notifications", () => {
@@ -135,6 +214,8 @@ describe("OpenCode background notifications", () => {
     }));
     const output = { output: "tool output" };
 
+    // In-turn delivery never calls promptAsync, so no live-server client
+    // setup is needed.
     await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
 
     expect(output.output).toContain("tool output\n\n<system-reminder>");
@@ -181,12 +262,14 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion("task-1", "npm test")],
     }));
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
 
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
 
@@ -197,18 +280,21 @@ describe("OpenCode background notifications", () => {
     expect(payload.body.noReply).toBe(false);
     expect(payload.body.parts[0].text).toContain("- task task-1 (exit 0)");
     expect(payload.body.parts[0].text).not.toContain(": npm test");
+    // Live-server factory was called with the URL + directory we provided.
+    expect(getLastLiveServerArgs()).toEqual({
+      serverUrl: TEST_SERVER_URL,
+      directory: "/tmp/project",
+    });
   });
 
   test("turn-end wake forwards resolved agent + model + variant to preserve prefix cache", async () => {
-    // Simulate a session with a real assistant message — the wake resolver
-    // reads from client.session.messages() and forwards model/variant.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
       success: true,
       bg_completions: [completion("task-1", "npm test")],
     }));
     const promptAsync = mock(async () => {});
-    const client = clientWithMessages(promptAsync, [
+    installLiveServerClient(promptAsync, [
       {
         info: {
           role: "assistant",
@@ -224,7 +310,8 @@ describe("OpenCode background notifications", () => {
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client,
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
 
@@ -253,16 +340,16 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion("task-1", "npm test")],
     }));
     const promptAsync = mock(async () => {});
-
     // Empty session — no prior messages, so the resolver returns null and
     // the wake should go out without forging a fake model.
-    const client = clientWithMessages(promptAsync, []);
+    installLiveServerClient(promptAsync, []);
 
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client,
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
 
@@ -290,13 +377,15 @@ describe("OpenCode background notifications", () => {
     }));
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
 
     await handlePushedBgCompletion(
       {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: { session: { promptAsync } },
+        client: {},
+        serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
     );
@@ -314,9 +403,16 @@ describe("OpenCode background notifications", () => {
   test("buffers push completion received before task tracking", async () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
 
     await handlePushedBgCompletion(
-      { ctx, directory: "/tmp/project", sessionID: "s1", client: { session: { promptAsync } } },
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
       completion("task-1", "npm test"),
     );
     trackBgTask("s1", "task-1");
@@ -324,7 +420,8 @@ describe("OpenCode background notifications", () => {
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
 
@@ -340,9 +437,16 @@ describe("OpenCode background notifications", () => {
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
+    installLiveServerClient(promptAsync);
 
     await handlePushedBgCompletion(
-      { ctx, directory: "/tmp/project", sessionID: "s1", client: { session: { promptAsync } } },
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
       completion("task-1", "npm test"),
     );
     await sleep(260);
@@ -358,9 +462,16 @@ describe("OpenCode background notifications", () => {
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
+    installLiveServerClient(promptAsync);
 
     await handlePushedBgCompletion(
-      { ctx, directory: "/tmp/project", sessionID: "s1", client: { session: { promptAsync } } },
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
       completion("task-1", "npm test"),
     );
     await sleep(3_800);
@@ -377,13 +488,15 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
 
     await handlePushedBgCompletion(
       {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: { session: { promptAsync } },
+        client: {},
+        serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
     );
@@ -404,27 +517,31 @@ describe("OpenCode background notifications", () => {
     ];
     const { ctx } = harness(() => responses.shift() ?? { success: true, bg_completions: [] });
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
 
     for (const taskId of ["task-1", "task-2", "task-3"]) trackBgTask("s1", taskId);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(50);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(50);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(520);
 
@@ -451,6 +568,7 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion(`task-${++index}`, `cmd-${index}`)],
     }));
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
     const started = Date.now();
 
     for (let task = 1; task <= 6; task++) trackBgTask("s1", `task-${task}`);
@@ -459,7 +577,8 @@ describe("OpenCode background notifications", () => {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: { session: { promptAsync } },
+        client: {},
+        serverUrl: TEST_SERVER_URL,
       });
       await sleep(190);
     }
@@ -478,6 +597,7 @@ describe("OpenCode background notifications", () => {
 
   test("second pushed background completion wakes without chat message reset", async () => {
     const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
     let responses: BridgeResponse[] = [
       { success: true, bg_completions: [completion("task-1", "one")] },
     ];
@@ -488,14 +608,16 @@ describe("OpenCode background notifications", () => {
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
     expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -506,7 +628,8 @@ describe("OpenCode background notifications", () => {
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: { session: { promptAsync } },
+      client: {},
+      serverUrl: TEST_SERVER_URL,
     });
     await sleep(260);
     expect(promptAsync).toHaveBeenCalledTimes(2);
@@ -582,6 +705,74 @@ describe("OpenCode background notifications", () => {
     } finally {
       Date.now = originalDateNow;
     }
+  });
+
+  // ─── Workaround-specific tests for anomalyco/opencode#28202 ───
+
+  test("serverUrl unavailable degrades to retry-with-backoff and never calls promptAsync", async () => {
+    // Without serverUrl, the wake path MUST NOT use input.client.promptAsync
+    // (that's the bug path). It should keep completions queued, log a
+    // dedicated trace event, and let the retry-with-backoff fire. Eventually
+    // the existing wake_hard_stop kicks in after MAX_WAKE_SEND_ATTEMPTS.
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        // serverUrl intentionally omitted
+      },
+      completion("task-1", "npm test"),
+    );
+    // One debounce window — long enough for the first scheduled wake to fire.
+    await sleep(260);
+
+    // The promptAsync stub must NEVER be reached — that would prove the
+    // workaround silently fell back to a broken transport.
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    // The pending completion is held for retry (not silently dropped).
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    // The dedicated trace event was emitted with task ids + attempt number.
+    const meta = findTraceEvent("bash_completion_wake_serverUrl_unavailable");
+    expect(meta).toBeDefined();
+    expect(meta?.task_ids).toEqual(["task-1"]);
+    expect(meta?.attempt).toBe(1);
+    // A retry is scheduled — debounce timer should still be live for the
+    // next attempt to run after backoff.
+    expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
+  });
+
+  test("live-server wake emits wake_client_path in trace metadata", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const promptAsync = mock(async () => {});
+    installLiveServerClient(promptAsync);
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
+    await sleep(260);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
+    expect(startMeta).toBeDefined();
+    expect(startMeta?.wake_client_path).toBe("live-server");
+    // Sanity check that the other expected wake metadata is still present —
+    // proves we didn't accidentally trim the trace surface.
+    expect(typeof startMeta?.delivery_id).toBe("string");
+    expect(startMeta?.task_ids).toEqual(["task-1"]);
   });
 });
 

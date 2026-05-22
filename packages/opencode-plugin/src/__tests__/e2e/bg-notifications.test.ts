@@ -1,8 +1,31 @@
 /// <reference path="../../bun-test.d.ts" />
 
-import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+
+// Mock the live-server SDK factory so the wake path can route promptAsync
+// to a test stub. The real implementation builds a `createOpencodeClient`
+// pointed at `input.serverUrl`, which is not available in this real-bridge
+// e2e harness (no OpenCode HTTP server fixture). The workaround for
+// anomalyco/opencode#28202 mandates that the wake path never falls back
+// to `input.client`, so we mock the live-server factory instead.
+let e2eLiveServerClient: unknown = null;
+function setE2ELiveServerClient(client: unknown): void {
+  e2eLiveServerClient = client;
+}
+mock.module("../../shared/live-server-client.js", () => ({
+  getLiveServerClient: () => {
+    if (!e2eLiveServerClient) {
+      throw new Error("e2e test did not configure a live-server client");
+    }
+    return e2eLiveServerClient;
+  },
+  __resetLiveServerClientCacheForTests: () => {
+    e2eLiveServerClient = null;
+  },
+}));
+
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
@@ -96,16 +119,25 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
     const { h, ctx, bash } = await pluginHarness();
     const taskId = await spawnBackground(h, bash, "printf idle-done");
     const promptCalls: unknown[] = [];
-    const client = {
-      session: { promptAsync: async (payload: unknown) => promptCalls.push(payload) },
-    };
+    // Install a stub live-server client that captures the wake POST. The
+    // workaround intentionally bypasses `input.client` and would otherwise
+    // try to reach `serverUrl` over HTTP — see anomalyco/opencode#28202.
+    setE2ELiveServerClient({
+      session: {
+        promptAsync: async (payload: unknown) => {
+          promptCalls.push(payload);
+        },
+        messages: async () => ({ data: [] }),
+      },
+    });
 
     await waitUntil(async () => {
       await handleIdleBgCompletions({
         ctx,
         directory: h.tempDir,
         sessionID: "e2e-session",
-        client,
+        client: {},
+        serverUrl: "http://127.0.0.1:0/",
       });
       await sleep(260);
       return promptCalls.length > 0;
