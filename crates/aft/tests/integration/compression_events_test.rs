@@ -150,7 +150,7 @@ fn completed_task_records_compression_event() {
     wait_for_event_count(&conn, &task_id, 1);
     let event = fetch_event(&conn, &task_id);
 
-    assert_eq!(completion.tokens_skipped, false);
+    assert!(!completion.tokens_skipped);
     assert!(event.original_tokens > 0);
     assert!(event.compressed_tokens > 0);
     registry.detach();
@@ -178,7 +178,7 @@ fn completed_task_with_large_output_records_event_from_tail() {
     );
     let completion = wait_for_completion(&registry, &task_id);
 
-    assert_eq!(completion.tokens_skipped, false);
+    assert!(!completion.tokens_skipped);
     wait_for_event_count(&conn, &task_id, 1);
     let event = fetch_event(&conn, &task_id);
     assert!(
