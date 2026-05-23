@@ -71,6 +71,17 @@ interface DrainContext {
   sessionID?: string;
 }
 
+/**
+ * Mark a bg task's completion as consumed by an explicit bash_status wait.
+ * Removes it from pendingCompletions so the next wake/in-turn drain
+ * doesn't double-notify the agent.
+ */
+export function consumeBgCompletion(sessionID: string | undefined, taskId: string): void {
+  const state = getSessionState(sessionID);
+  if (!state) return;
+  state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+}
+
 export function trackBgTask(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
   pruneUnknownCompletions(state, Date.now());
@@ -383,6 +394,11 @@ function scheduleWake(
       });
   }, delay);
   state.debounceTimer.unref?.();
+}
+
+function getSessionState(sessionID: string | undefined): SessionBgState | undefined {
+  cleanupIdleSessionStates(Date.now());
+  return sessionBgStates.get(sessionID || DEFAULT_SESSION_ID);
 }
 
 function stateFor(sessionID: string | undefined): SessionBgState {

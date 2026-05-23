@@ -20,14 +20,14 @@ const MAX_INPUT_BYTES: usize = 1_048_576;
 /// the agent wants to write literal `\u001b` characters (e.g. source code).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum BashWriteInput {
+pub enum BashWriteInput {
     Text(String),
     Sequence(Vec<SequenceItem>),
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum SequenceItem {
+pub enum SequenceItem {
     Text(String),
     Key { key: String },
 }

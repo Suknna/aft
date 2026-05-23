@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -6,7 +8,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { trackBgTask } from "../bg-notifications.js";
+import { consumeBgCompletion, trackBgTask } from "../bg-notifications.js";
 import {
   disposePtyTerminal,
   getOrCreatePtyTerminal,
@@ -22,6 +24,9 @@ import { bridgeFor, callBridge, resolveSessionId, textResult } from "./_shared.j
 // .alfonso/athena/council-aft-bash-timeout-design-5f25c3ee503ab303/
 const FOREGROUND_WAIT_WINDOW_MS = 5_000;
 const FOREGROUND_POLL_INTERVAL_MS = 100;
+const BASH_WAIT_POLL_INTERVAL_MS = 100;
+const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
+const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
 // Bridge transport budget for `bash` calls. Rust returns `running` immediately
 // and the plugin polls separately, so transport only needs to cover spawn +
 // protocol round-trip; not a function of params.timeout. See council audit
@@ -104,6 +109,33 @@ const BashStatusParams = Type.Object({
         "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
     }),
   ),
+  wait_for: Type.Optional(
+    Type.Union(
+      [
+        Type.String(),
+        Type.Object({
+          regex: Type.String(),
+        }),
+      ],
+      {
+        description:
+          "Wait until this text pattern appears in the task's output. String form: substring match. Object form: regex match (JavaScript regex syntax). The call returns as soon as the pattern is found OR the task reaches terminal status OR timeout_ms elapses.",
+      },
+    ),
+  ),
+  exit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Wait until the task reaches a terminal status (completed/failed/killed/timed_out). Useful for explicitly awaiting a background bash task before returning. Can be combined with wait_for — the call returns on whichever condition fires first.",
+    }),
+  ),
+  timeout_ms: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description:
+        "Maximum wait time in milliseconds. Default: 30000 (30s). Hard-capped at 300000 (5min). Ignored when neither wait_for nor exit is specified.",
+    }),
+  ),
 });
 
 const BashWriteParams = Type.Object({
@@ -148,6 +180,13 @@ interface BashDetails {
   bg_completions?: BgCompletion[];
 }
 
+interface BashStatusWaited {
+  reason: "matched" | "exited" | "timeout";
+  elapsed_ms: number;
+  match?: string;
+  match_offset?: number;
+}
+
 interface BashStatusDetails {
   success: boolean;
   status: string;
@@ -157,6 +196,7 @@ interface BashStatusDetails {
   command?: string;
   mode?: string;
   output_path?: string;
+  waited?: BashStatusWaited;
 }
 
 interface BashWriteDetails {
@@ -417,8 +457,8 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     description:
-      'Check the status of a background bash task. For PTY tasks, pass output_mode: "screen" (default), "raw", or "both".',
-    promptSnippet: "Poll a background bash task by task_id",
+      'Check the status of a background bash task. For PTY tasks, pass output_mode: "screen" (default), "raw", or "both". Pass exit: true and/or wait_for to block until the task exits, the text/regex appears, or timeout_ms elapses.',
+    promptSnippet: "Poll or explicitly wait for a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
       _toolCallId: string,
@@ -428,15 +468,23 @@ export function createBashStatusTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const data = await callBridge(
-        bridge,
-        "bash_status",
-        { task_id: params.task_id, output_mode: params.output_mode },
-        extCtx,
+      const waitFor = parseWaitPattern(params.wait_for);
+      const shouldWait = waitFor !== undefined || params.exit === true;
+      const effectiveWaitMs = Math.min(
+        params.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+        MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
       );
-      if (data.success === false) {
-        throw new Error((data.message as string | undefined) ?? "bash_status failed");
-      }
+      const data = shouldWait
+        ? await waitForBashStatus(
+            bridge,
+            extCtx,
+            params.task_id,
+            params.output_mode,
+            waitFor,
+            params.exit === true,
+            effectiveWaitMs,
+          )
+        : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode),
@@ -547,6 +595,162 @@ function bashKillResult(
   };
 }
 
+type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; value: RegExp };
+
+async function bashStatusSnapshot(
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
+  taskId: string,
+  outputMode: string | undefined,
+  options?: BridgeRequestOptions,
+): Promise<Record<string, unknown>> {
+  return await callBridge(
+    bridge,
+    "bash_status",
+    { task_id: taskId, output_mode: outputMode },
+    extCtx,
+    options,
+  );
+}
+
+async function waitForBashStatus(
+  bridge: BinaryBridge,
+  extCtx: ExtensionContext,
+  taskId: string,
+  outputMode: string | undefined,
+  waitFor: BashWaitPattern | undefined,
+  waitForExit: boolean,
+  effectiveWaitMs: number,
+): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
+  const startedAt = Date.now();
+  const deadline = startedAt + effectiveWaitMs;
+  let spillCursor = 0;
+  let scanText = "";
+  let scanBaseOffset = 0;
+  const bridgeOptions = {
+    keepBridgeOnTimeout: true,
+    transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
+  };
+
+  while (true) {
+    const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
+    if (waitForExit && isTerminalStatus(data.status)) {
+      consumeBgCompletion(resolveSessionId(extCtx), taskId);
+      return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+    }
+
+    if (waitFor) {
+      const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
+      if (scan) {
+        spillCursor = scan.nextCursor;
+        if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
+        scanText += scan.text;
+        const match = findWaitMatch(scanText, waitFor);
+        if (match) {
+          return withWaited(data, {
+            reason: "matched",
+            elapsed_ms: Date.now() - startedAt,
+            match: match.text,
+            match_offset:
+              scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
+          });
+        }
+      }
+      if (isTerminalStatus(data.status)) {
+        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
+    }
+    await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+  }
+}
+
+async function readNewTaskOutput(
+  extCtx: ExtensionContext,
+  taskId: string,
+  data: Record<string, unknown>,
+  cursor: number,
+): Promise<{ text: string; baseOffset: number; nextCursor: number } | undefined> {
+  const outputPath = data.output_path as string | undefined;
+  if (!outputPath) return undefined;
+  if (data.mode === "pty") {
+    const state = await getOrCreatePtyTerminal(ptyCacheKey(extCtx, taskId), outputPath);
+    const baseOffset = state.offset;
+    const bytes = await readPtyBytes(state);
+    return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
+  }
+
+  const bytes = await readFileBytesFrom(outputPath, cursor);
+  return { text: bytes.toString("utf8"), baseOffset: cursor, nextCursor: cursor + bytes.length };
+}
+
+async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
+  const handle = await fs.open(outputPath, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let offset = cursor;
+    while (true) {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      offset += bytesRead;
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
+  if (typeof value === "string") return { kind: "substring", value };
+  if (isRegexWaitObject(value)) return { kind: "regex", value: new RegExp(value.regex) };
+  return undefined;
+}
+
+function isRegexWaitObject(value: unknown): value is { regex: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "regex" in value &&
+    typeof (value as { regex?: unknown }).regex === "string"
+  );
+}
+
+function findWaitMatch(
+  text: string,
+  pattern: BashWaitPattern,
+): { text: string; index: number } | undefined {
+  if (pattern.kind === "substring") {
+    const index = text.indexOf(pattern.value);
+    return index >= 0 ? { text: pattern.value, index } : undefined;
+  }
+  pattern.value.lastIndex = 0;
+  const match = pattern.value.exec(text);
+  return match ? { text: match[0], index: match.index } : undefined;
+}
+
+function withWaited(
+  data: Record<string, unknown>,
+  waited: BashStatusWaited,
+): Record<string, unknown> & { waited: BashStatusWaited } {
+  return { ...data, waited };
+}
+
+function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails): string {
+  if (waited.reason === "matched") {
+    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
+  }
+  if (waited.reason === "timeout") {
+    return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;
+  }
+  const exit = typeof details.exit_code === "number" ? `, exit ${details.exit_code}` : "";
+  return `Waited ${waited.elapsed_ms}ms; task exited (${details.status}${exit}).`;
+}
+
 async function formatBashStatus(
   extCtx: ExtensionContext,
   taskId: string,
@@ -557,6 +761,9 @@ async function formatBashStatus(
   const dur =
     typeof details.duration_ms === "number" ? ` ${Math.round(details.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
+  if (details.waited)
+    text += `
+${formatWaitSummary(details.waited, details)}`;
   if (details.mode === "pty") {
     text += await formatPtyStatus(extCtx, taskId, details, requestedOutputMode);
   } else {

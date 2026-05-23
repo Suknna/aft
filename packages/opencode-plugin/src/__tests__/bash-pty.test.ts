@@ -153,6 +153,22 @@ describe("OpenCode bash PTY layer", () => {
     expect(__ptyCacheSizeForTests()).toBe(1);
   });
 
+  test("Test 26b: bash_status waitFor matches PTY bytes", async () => {
+    const outputPath = await spill("booting\nready on pty\n");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    const result = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-pty-wait", waitFor: "ready on pty" },
+      runtime(),
+    );
+    expect(result).toContain('matched "ready on pty" at offset 8');
+    expect(result).toContain("ready on pty");
+  });
+
   test("Test 27: bash_status cache disposes on terminal status", async () => {
     const outputPath = await spill("done");
     const { ctx: pluginCtx } = ctx(() => ({

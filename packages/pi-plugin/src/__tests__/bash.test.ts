@@ -9,6 +9,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -84,6 +87,17 @@ function makeMockContext(bridge: BinaryBridge): PluginContext {
     config: {} as PluginContext["config"],
     storageDir: "/tmp/test",
   };
+}
+
+async function spill(contents: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "aft-pi-bash-status-test-"));
+  const file = join(dir, "task.out");
+  await writeFile(file, contents);
+  return file;
+}
+
+function toolText(result: unknown): string {
+  return (result as { content: Array<{ type: string; text: string }> }).content[0].text;
 }
 
 describe("bash tool adapter", () => {
@@ -451,6 +465,56 @@ describe("bash tool adapter", () => {
     await expect(
       bashTool.execute("test-call", { command: "rm -rf /" }, undefined, undefined, extCtx),
     ).rejects.toThrow("Permission ask reached Pi adapter");
+  });
+
+  test("bash_status wait_for substring returns waited details", async () => {
+    const outputPath = await spill("alpha ready beta\n");
+    try {
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const { bridge, calls } = makeTrackableMockBridge({
+        status: "running",
+        mode: "pipes",
+        output_path: outputPath,
+      });
+      const ctx = makeMockContext(bridge);
+      registerBashTool(api, ctx);
+      const result = (await tools
+        .get("bash_status")!
+        .execute("call", { task_id: "bash-pi-wait", wait_for: "ready" }, undefined, undefined, {
+          cwd: "/test",
+        })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
+      expect(toolText(result)).toContain('matched "ready" at offset 6');
+      expect(result.details.waited).toMatchObject({
+        reason: "matched",
+        match: "ready",
+        match_offset: 6,
+      });
+      const callArgs = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
+      expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
+      expect(callArgs[2].transportTimeoutMs).toBe(30_000);
+    } finally {
+      await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_status exit true returns waited exited details", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "completed",
+      exit_code: 0,
+      output_preview: "done",
+    });
+    const ctx = makeMockContext(bridge);
+    registerBashTool(api, ctx);
+    const result = (await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-pi-exit", exit: true }, undefined, undefined, {
+        cwd: "/test",
+      })) as { details: { waited?: { reason: string } } };
+    expect(toolText(result)).toContain("task exited (completed, exit 0)");
+    expect(result.details.waited?.reason).toBe("exited");
   });
 
   test("renderCall returns Text component", () => {
