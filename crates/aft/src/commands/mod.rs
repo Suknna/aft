@@ -11,6 +11,7 @@ pub mod bash_drain_completions;
 pub mod bash_kill;
 pub mod bash_promote;
 pub mod bash_status;
+pub mod bash_write;
 pub mod batch;
 pub mod call_tree;
 pub mod callers;

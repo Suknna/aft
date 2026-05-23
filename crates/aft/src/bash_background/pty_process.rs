@@ -36,19 +36,70 @@ pub(crate) fn spawn_pty_for_command(
     }
     #[cfg(windows)]
     {
-        let _ = (
-            task_id,
-            session_id,
-            user_command,
-            paths,
-            workdir,
-            env,
-            rows,
-            cols,
-            wake_tx,
-        );
-        Err("PTY spawn on Windows is deferred to Phase 1b".to_string())
+        use crate::windows_shell::shell_candidates;
+
+        let candidates = shell_candidates();
+        let mut last_err = String::from("no Windows shell candidates available");
+
+        for shell in candidates {
+            let wrapper_body = shell.wrapper_script(user_command, &paths.exit);
+            let wrapper_path = windows_wrapper_path(paths, &shell);
+            if let Err(error) = fs::write(&wrapper_path, wrapper_body) {
+                last_err = format!("write wrapper {wrapper_path:?}: {error}");
+                continue;
+            }
+
+            let mut command = CommandBuilder::new(shell.binary().as_ref());
+            for arg in shell.pty_wrapper_args(&wrapper_path) {
+                command.arg(arg);
+            }
+            command.cwd(workdir.as_os_str());
+            for (key, value) in env {
+                command.env(key, value);
+            }
+
+            match try_spawn_pty(
+                task_id,
+                session_id,
+                command,
+                paths,
+                rows,
+                cols,
+                wake_tx.clone(),
+            ) {
+                Ok(runtime) => return Ok(runtime),
+                Err(error) => {
+                    let msg = format!("{shell:?}: {error}");
+                    if msg.contains("NotFound") || msg.contains("not recognized") {
+                        last_err = msg;
+                        continue;
+                    }
+                    return Err(msg);
+                }
+            }
+        }
+
+        Err(last_err)
     }
+}
+
+#[cfg(windows)]
+fn windows_wrapper_path(
+    paths: &TaskPaths,
+    shell: &crate::windows_shell::WindowsShell,
+) -> std::path::PathBuf {
+    let extension = match shell {
+        crate::windows_shell::WindowsShell::Pwsh
+        | crate::windows_shell::WindowsShell::Powershell => "ps1",
+        crate::windows_shell::WindowsShell::Cmd => "bat",
+        crate::windows_shell::WindowsShell::Posix(_) => "sh",
+    };
+    let stem = paths
+        .json
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("wrapper");
+    paths.dir.join(format!("{stem}.{extension}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,4 +259,100 @@ fn write_exit_marker(path: &Path, marker: &ExitMarker, task_id: &str) -> io::Res
         ExitMarker::Killed => "killed".to_string(),
     };
     atomic_write(path, content.as_bytes(), task_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use portable_pty::{Child, ChildKiller, ExitStatus};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct FakeKiller;
+
+    impl ChildKiller for FakeKiller {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(FakeKiller)
+        }
+    }
+
+    #[derive(Debug)]
+    struct InterruptedOnceChild {
+        waits: usize,
+    }
+
+    impl ChildKiller for InterruptedOnceChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(FakeKiller)
+        }
+    }
+
+    impl Child for InterruptedOnceChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.waits += 1;
+            if self.waits == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(ExitStatus::with_exit_code(0))
+            }
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_waiter_retries_wait_on_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let exit_path = temp.path().join("task.exit");
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let coordinator = Arc::new(CompletionCoordinator::new(
+            "task".to_string(),
+            "session".to_string(),
+            wake_tx,
+        ));
+        let was_killed = Arc::new(AtomicBool::new(false));
+        let exit_observed = Arc::new(AtomicBool::new(false));
+
+        spawn_waiter(
+            Box::new(InterruptedOnceChild { waits: 0 }),
+            exit_path.clone(),
+            was_killed,
+            Arc::clone(&exit_observed),
+            Arc::clone(&coordinator),
+        );
+        coordinator.signal_one_done();
+
+        let started = Instant::now();
+        while !exit_observed.load(Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
+    }
 }

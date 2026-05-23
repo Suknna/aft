@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -406,7 +407,6 @@ impl BgTaskRegistry {
         Ok(task_id)
     }
 
-    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_pty(
         &self,
@@ -605,6 +605,46 @@ impl BgTaskRegistry {
             .insert(task_id.clone(), task);
 
         Ok(task_id)
+    }
+
+    pub fn write_pty(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        input: &[u8],
+    ) -> Result<usize, String> {
+        let task = self
+            .task_for_session(task_id, session_id)
+            .ok_or_else(|| "task_not_found".to_string())?;
+
+        let writer = {
+            let state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if state.metadata.mode != BgMode::Pty {
+                return Err("task_not_pty".to_string());
+            }
+            if state.metadata.status.is_terminal() {
+                return Err("task_exited".to_string());
+            }
+            match &state.runtime {
+                TaskRuntime::Pty(Some(runtime)) => Arc::clone(&runtime.writer),
+                TaskRuntime::Pty(None) => return Err("task_exited".to_string()),
+                TaskRuntime::Piped(_) => return Err("task_not_pty".to_string()),
+            }
+        };
+
+        let mut writer = writer
+            .lock()
+            .map_err(|_| "PTY writer lock poisoned".to_string())?;
+        writer
+            .write_all(input)
+            .map_err(|error| format!("failed to write to PTY: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("failed to flush PTY writer: {error}"))?;
+        Ok(input.len())
     }
 
     pub fn replay_session(&self, storage_dir: &Path, session_id: &str) -> Result<(), String> {
@@ -2389,7 +2429,11 @@ impl BgTask {
                 .is_terminal()
                 .then(|| self.started.elapsed().as_millis() as u64)
         });
-        let (output_preview, output_truncated) = state.buffer.read_tail(preview_bytes);
+        let (output_preview, output_truncated) = if metadata.mode == BgMode::Pty {
+            (String::new(), false)
+        } else {
+            state.buffer.read_tail(preview_bytes)
+        };
         BgTaskSnapshot {
             info: BgTaskInfo {
                 task_id: self.task_id.clone(),

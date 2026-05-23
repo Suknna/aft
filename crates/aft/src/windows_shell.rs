@@ -89,6 +89,21 @@ impl WindowsShell {
         cmd
     }
 
+    /// Args for invoking a wrapper file under a PTY-attached shell.
+    /// Returns owned strings so callers can pass temporary wrapper paths.
+    pub(crate) fn pty_wrapper_args(&self, wrapper_path: &Path) -> Vec<String> {
+        match self {
+            WindowsShell::Cmd => vec!["/c".into(), wrapper_path.display().to_string()],
+            WindowsShell::Pwsh | WindowsShell::Powershell => vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-File".into(),
+                wrapper_path.display().to_string(),
+            ],
+            WindowsShell::Posix(_) => vec![wrapper_path.display().to_string()],
+        }
+    }
+
     /// Build a `Command` that runs the background wrapper script.
     ///
     /// Production background bash now writes cmd wrappers to `.bat` files and
@@ -490,6 +505,28 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn pty_wrapper_args_are_owned_and_shell_specific() {
+        let wrapper = PathBuf::from(r"C:\tmp\task.bat");
+        assert_eq!(
+            WindowsShell::Cmd.pty_wrapper_args(&wrapper),
+            vec!["/c".to_string(), wrapper.display().to_string()]
+        );
+        assert_eq!(
+            WindowsShell::Pwsh.pty_wrapper_args(&wrapper),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-File".to_string(),
+                wrapper.display().to_string(),
+            ]
+        );
+        assert_eq!(
+            WindowsShell::Posix(PathBuf::from(r"C:\Git\bin\bash.exe")).pty_wrapper_args(&wrapper),
+            vec![wrapper.display().to_string()]
+        );
     }
 
     // ---------------------------------------------------------------

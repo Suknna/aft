@@ -40,6 +40,8 @@ struct BashParams {
     description: Option<String>,
     #[serde(default)]
     background: bool,
+    #[serde(default)]
+    pty: bool,
     #[serde(default = "default_notify_on_completion")]
     notify_on_completion: bool,
     #[serde(default = "default_compressed")]
@@ -71,6 +73,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Some(description) = params.description.as_deref() {
         log::debug!("bash description: {description}");
+    }
+
+    if params.pty && !params.background {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "PTY mode requires background: true",
+        );
     }
 
     if let Some(blocked) = blocked_env_var(&params.env) {
@@ -125,6 +135,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         params.background,
         params.notify_on_completion,
         params.compressed,
+        params.pty,
     )
 }
 

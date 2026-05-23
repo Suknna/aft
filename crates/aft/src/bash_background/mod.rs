@@ -66,6 +66,7 @@ pub fn spawn(
     require_background_flag: bool,
     notify_on_completion: bool,
     compressed: bool,
+    pty: bool,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -90,24 +91,44 @@ pub fn spawn(
         .or_else(|| std::env::current_dir().ok())
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
-    match ctx.bash_background().spawn(
-        command,
-        session_id.to_string(),
-        workdir,
-        env.unwrap_or_default(),
-        timeout,
-        storage_dir,
-        max_running,
-        notify_on_completion,
-        compressed,
-        project_root,
-    ) {
+    let env = env.unwrap_or_default();
+    let spawn_result = if pty {
+        ctx.bash_background().spawn_pty(
+            command,
+            session_id.to_string(),
+            workdir,
+            env,
+            timeout,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+            24,
+            80,
+        )
+    } else {
+        ctx.bash_background().spawn(
+            command,
+            session_id.to_string(),
+            workdir,
+            env,
+            timeout,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+    };
+
+    match spawn_result {
         Ok(task_id) => Response::success(
             request_id,
             json!({
                 "task_id": task_id,
                 "status": BgTaskStatus::Running,
-                "mode": "pipes",
+                "mode": if pty { "pty" } else { "pipes" },
             }),
         ),
         Err(message) if message.contains("limit exceeded") => {

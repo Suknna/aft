@@ -9,6 +9,8 @@ const PREVIEW_BYTES: usize = 5 * 1024;
 struct BashStatusParams {
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    output_mode: Option<String>,
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -31,6 +33,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(task_id) = params.task_id else {
         return Response::error(&req.id, "invalid_request", "bash_status: missing task_id");
     };
+
+    if let Some(output_mode) = params.output_mode.as_deref() {
+        if !matches!(output_mode, "screen" | "raw" | "both") {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "bash_status: output_mode must be one of screen, raw, or both",
+            );
+        }
+    }
 
     let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     match ctx.bash_background().status(

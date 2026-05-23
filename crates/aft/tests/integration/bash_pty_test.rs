@@ -400,3 +400,479 @@ fn pty_v2_task_rehydrates_then_upgrades_to_v3_on_next_persist() {
         serde_json::from_str(&fs::read_to_string(&paths.json).unwrap()).unwrap();
     assert_eq!(after["schema_version"], 3);
 }
+
+fn spawn_pty_task(
+    registry: &BgTaskRegistry,
+    storage: &std::path::Path,
+    project: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+) -> String {
+    registry
+        .spawn_pty(
+            command,
+            SESSION.to_string(),
+            project.to_path_buf(),
+            Default::default(),
+            Some(timeout),
+            storage.to_path_buf(),
+            32,
+            true,
+            false,
+            Some(project.to_path_buf()),
+            24,
+            80,
+        )
+        .unwrap()
+}
+
+fn read_pty_until(path: &std::path::Path, needle: &str, timeout: Duration) -> String {
+    let started = Instant::now();
+    loop {
+        let output = fs::read_to_string(path).unwrap_or_default();
+        if output.contains(needle) {
+            return output;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "timed out waiting for {needle:?}; last output: {output:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_write_to_cat() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "cat",
+        Duration::from_secs(30),
+    );
+    let paths = task_paths(storage.path(), SESSION, &task_id);
+
+    assert_eq!(
+        registry.write_pty(&task_id, SESSION, b"hello\n").unwrap(),
+        6
+    );
+    let output = read_pty_until(&paths.pty, "hello", Duration::from_secs(2));
+    assert!(output.contains("hello"));
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[cfg(windows)]
+#[test]
+fn pty_write_to_cmd_dir() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "cmd.exe",
+        Duration::from_secs(30),
+    );
+    let paths = task_paths(storage.path(), SESSION, &task_id);
+
+    registry
+        .write_pty(&task_id, SESSION, b"dir & exit\r\n")
+        .unwrap();
+    let output = read_pty_until(&paths.pty, "Directory of", Duration::from_secs(5));
+    assert!(output.contains("Directory of"));
+    wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+}
+
+#[test]
+fn pty_write_python_repl_round_trip() {
+    let python = if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        "python3 -q"
+    } else if std::process::Command::new("python")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        "python -q"
+    } else {
+        eprintln!("skipping: python not found");
+        return;
+    };
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        python,
+        Duration::from_secs(30),
+    );
+    let paths = task_paths(storage.path(), SESSION, &task_id);
+
+    registry
+        .write_pty(&task_id, SESSION, b"print('pty-repl-ok')\n")
+        .unwrap();
+    let output = read_pty_until(&paths.pty, "pty-repl-ok", Duration::from_secs(5));
+    assert!(output.contains("pty-repl-ok"));
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[test]
+fn pty_write_non_pty_task() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry
+        .spawn(
+            "sleep 1",
+            SESSION.to_string(),
+            project.path().to_path_buf(),
+            Default::default(),
+            Some(Duration::from_secs(30)),
+            storage.path().to_path_buf(),
+            32,
+            true,
+            false,
+            Some(project.path().to_path_buf()),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.write_pty(&task_id, SESSION, b"hello").unwrap_err(),
+        "task_not_pty"
+    );
+    let _ = registry.kill(&task_id, SESSION);
+}
+
+#[test]
+fn pty_write_exited_task() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "printf done",
+        Duration::from_secs(30),
+    );
+    wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+
+    assert_eq!(
+        registry.write_pty(&task_id, SESSION, b"hello").unwrap_err(),
+        "task_exited"
+    );
+}
+
+#[test]
+fn pty_write_too_large() {
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+
+    let project = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(project.path().to_path_buf()),
+            experimental_bash_background: true,
+            storage_dir: Some(project.path().join("storage")),
+            ..Config::default()
+        },
+    );
+    let req: RawRequest = serde_json::from_value(json!({
+        "id": "write-large",
+        "command": "bash_write",
+        "params": { "task_id": "missing", "input": "x".repeat(1_048_577) }
+    }))
+    .unwrap();
+
+    let response = aft::commands::bash_write::handle(&req, &ctx);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "input_too_large");
+}
+
+#[test]
+fn pty_validation_no_background() {
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+
+    let project = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(project.path().to_path_buf()),
+            experimental_bash_background: true,
+            storage_dir: Some(project.path().join("storage")),
+            ..Config::default()
+        },
+    );
+    let req: RawRequest = serde_json::from_value(json!({
+        "id": "pty-no-bg",
+        "command": "bash",
+        "params": { "command": "cat", "pty": true }
+    }))
+    .unwrap();
+
+    let response = aft::commands::bash::handle(&req, &ctx);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "invalid_request");
+    assert!(response.data["message"]
+        .as_str()
+        .unwrap()
+        .contains("background"));
+}
+
+#[test]
+fn pty_status_output_mode_validation() {
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let req: RawRequest = serde_json::from_value(json!({
+        "id": "bad-output-mode",
+        "command": "bash_status",
+        "params": { "task_id": "missing", "output_mode": "ansi" }
+    }))
+    .unwrap();
+
+    let response = aft::commands::bash_status::handle(&req, &ctx);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "invalid_request");
+}
+
+#[test]
+fn pty_status_accepts_output_modes() {
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    for output_mode in ["screen", "raw", "both"] {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": format!("mode-{output_mode}"),
+            "command": "bash_status",
+            "params": { "task_id": "missing", "output_mode": output_mode }
+        }))
+        .unwrap();
+        let response = aft::commands::bash_status::handle(&req, &ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "task_not_found");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_kill_terminates_sighup_ignoring_cat() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "trap '' TERM HUP; cat",
+        Duration::from_secs(30),
+    );
+
+    let killed = registry.kill(&task_id, SESSION).unwrap();
+    assert_eq!(killed.info.status, BgTaskStatus::Killing);
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[cfg(windows)]
+#[test]
+fn pty_kill_terminates_pwsh_infinite_loop() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "pwsh -NoProfile -Command while($true){Start-Sleep -Milliseconds 100}",
+        Duration::from_secs(30),
+    );
+
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[test]
+fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "cat",
+        Duration::from_secs(30),
+    );
+
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+    let marker = fs::read_to_string(task_paths(storage.path(), SESSION, &task_id).exit).unwrap();
+    assert_eq!(marker.trim(), "killed");
+}
+
+#[test]
+fn pty_kill_with_clones_outstanding_still_terminates() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "cat",
+        Duration::from_secs(30),
+    );
+
+    registry
+        .write_pty(&task_id, SESSION, b"keep-clones-busy\n")
+        .unwrap();
+    registry.kill(&task_id, SESSION).unwrap();
+    let started = Instant::now();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "sleep 5",
+        Duration::from_millis(100),
+    );
+
+    let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::TimedOut);
+    assert_eq!(snapshot.exit_code, Some(124));
+}
+
+#[test]
+fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "printf preview",
+        Duration::from_secs(30),
+    );
+
+    let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+    assert_eq!(snapshot.info.mode, BgMode::Pty);
+    assert_eq!(snapshot.output_preview, "");
+    assert!(!snapshot.output_truncated);
+    assert!(snapshot.output_path.unwrap().ends_with(".pty"));
+    assert_eq!(snapshot.stderr_path, None);
+}
+
+#[test]
+fn pty_completion_preview_is_empty() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "printf completion",
+        Duration::from_secs(30),
+    );
+    wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+
+    let completions = registry.drain_completions_for_session(Some(SESSION));
+    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    assert_eq!(completion.output_preview, "");
+    assert!(!completion.output_truncated);
+}
+
+#[test]
+fn pty_completion_token_counts_returns_skipped_sentinel() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "printf tokens",
+        Duration::from_secs(30),
+    );
+    wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+
+    let completions = registry.drain_completions_for_session(Some(SESSION));
+    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    assert_eq!(completion.original_tokens, None);
+    assert_eq!(completion.compressed_tokens, None);
+    assert!(completion.tokens_skipped);
+}
+
+#[test]
+fn pty_parallel_smoke_10_tasks() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let mut task_ids = Vec::new();
+    for index in 0..10 {
+        task_ids.push(spawn_pty_task(
+            &registry,
+            storage.path(),
+            project.path(),
+            &format!("printf pty-{index}"),
+            Duration::from_secs(30),
+        ));
+    }
+
+    for task_id in task_ids {
+        let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+        let output = fs::read_to_string(snapshot.output_path.unwrap()).unwrap();
+        assert!(output.contains("pty-"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn pty_windows_wrapper_script_runs_utf8_command() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "echo café-東京",
+        Duration::from_secs(30),
+    );
+
+    let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+    let output = fs::read_to_string(snapshot.output_path.unwrap()).unwrap();
+    assert!(output.contains("café-東京"), "output: {output:?}");
+}
