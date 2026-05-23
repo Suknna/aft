@@ -61,6 +61,83 @@ echo "  Releasing AFT $TAG"
 echo "  ─────────────────────"
 echo ""
 
+# ─── Static release-content checks ───
+#
+# Run BEFORE the dry-run early-exit so `release.sh <ver> --dry` also catches
+# missing release notes and stale announcement text. These checks don't
+# mutate anything; they're pure read-only validation.
+#
+# We keep forgetting to update the in-plugin "what's new" dialog for new
+# minor releases. The dialog text lives in `ANNOUNCEMENT_VERSION` and
+# `ANNOUNCEMENT_FEATURES` constants in both plugin entry files, and it
+# only re-fires when `ANNOUNCEMENT_VERSION` is bumped (PLUGIN_VERSION
+# alone doesn't trigger it — that's by design so patch releases don't
+# spam dismissed dialogs).
+#
+# Release notes drafts live at `.alfonso/release-notes/v$VERSION.md` per
+# the standing workflow rule; CI uses this exact path as the GitHub
+# release body. Missing notes mean we'd ship blank GitHub + Discord
+# release announcements.
+echo "→ Release-content checks..."
+
+NOTES_FILE=".alfonso/release-notes/v$VERSION.md"
+if [[ ! -s "$NOTES_FILE" ]]; then
+  echo "Error: release notes draft missing or empty at $NOTES_FILE"
+  echo "  → Drafts must exist BEFORE release.sh runs. See standing workflow rule."
+  LATEST_PRIOR=$(find .alfonso/release-notes -name 'v*.md' 2>/dev/null | sed 's|.*/v||;s|\.md$||' | sort -V | tail -1 || true)
+  if [[ -n "$LATEST_PRIOR" ]]; then
+    echo "  → Copy a prior release's notes as a template and edit:"
+    echo "    cp .alfonso/release-notes/v${LATEST_PRIOR}.md $NOTES_FILE"
+  fi
+  exit 1
+fi
+
+ANN_OC=$(grep -oE 'ANNOUNCEMENT_VERSION = "[^"]*"' packages/opencode-plugin/src/index.ts 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"/\1/')
+ANN_PI=$(grep -oE 'ANNOUNCEMENT_VERSION = "[^"]*"' packages/pi-plugin/src/index.ts 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"/\1/')
+
+if [[ -z "$ANN_OC" ]] || [[ -z "$ANN_PI" ]]; then
+  echo "Error: could not find ANNOUNCEMENT_VERSION constant in one of:"
+  echo "  packages/opencode-plugin/src/index.ts -> '$ANN_OC'"
+  echo "  packages/pi-plugin/src/index.ts        -> '$ANN_PI'"
+  echo "  → Either the constant was renamed or the file moved. Update this check."
+  exit 1
+fi
+
+# Drift detection — both plugins must always agree, regardless of patch vs minor.
+if [[ "$ANN_OC" != "$ANN_PI" ]]; then
+  echo "Error: ANNOUNCEMENT_VERSION drift between plugins:"
+  echo "  opencode-plugin: '$ANN_OC'"
+  echo "  pi-plugin:       '$ANN_PI'"
+  echo "  → Both plugins must show the same release announcement. Fix and retry."
+  exit 1
+fi
+
+# For X.Y.0 minor (or major) releases, require ANNOUNCEMENT_VERSION == $VERSION.
+# Patch releases keep the prior announcement so previously-dismissed dialogs
+# don't re-fire — that's intentional.
+PATCH_LEVEL="${VERSION##*.}"
+if [[ "$PATCH_LEVEL" == "0" ]] && [[ "$ANN_OC" != "$VERSION" ]]; then
+  echo "Error: cutting minor release v$VERSION but ANNOUNCEMENT_VERSION is still '$ANN_OC'"
+  echo ""
+  echo "  Update BOTH plugins to surface a fresh 'what's new' dialog for v$VERSION:"
+  echo "    packages/opencode-plugin/src/index.ts  (ANNOUNCEMENT_VERSION + ANNOUNCEMENT_FEATURES)"
+  echo "    packages/pi-plugin/src/index.ts        (ANNOUNCEMENT_VERSION + ANNOUNCEMENT_FEATURES)"
+  echo ""
+  echo "  ANNOUNCEMENT_FEATURES is a string[] of user-facing bullet points — short, no internal noise."
+  echo "  ANNOUNCEMENT_FOOTER already carries the Discord invite, so no need to repeat it in features."
+  echo ""
+  echo "  To skip this check (e.g. emergency patch tagged as a minor by mistake):"
+  echo "    SKIP_ANNOUNCEMENT_CHECK=1 ./scripts/release.sh $VERSION"
+  if [[ "${SKIP_ANNOUNCEMENT_CHECK:-}" != "1" ]]; then
+    exit 1
+  fi
+  echo "  (skipping because SKIP_ANNOUNCEMENT_CHECK=1)"
+fi
+
+echo "    ✓ release notes draft present ($NOTES_FILE)"
+echo "    ✓ announcement version: $ANN_OC (both plugins)"
+echo ""
+
 # Step 1: Sync versions
 if [[ "$DRY" == "--dry" ]]; then
   echo "→ Version sync (dry run):"
