@@ -68,25 +68,38 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // Signal shutdown then unconditionally join the heartbeat thread
+        // BEFORE removing the lockfile. The earlier `recv_timeout(100ms)`
+        // implementation could let `remove_lock_if_owned` race with a
+        // still-alive heartbeat:
+        //
+        //   1. Drop signals shutdown, ack times out under CI load.
+        //   2. Drop calls `remove_lock_if_owned` → file removed.
+        //   3. Another caller acquires the lock → writes its metadata.
+        //   4. Our heartbeat (still alive, mid-`atomic_write_lock_metadata`
+        //      from before shutdown was checked) overwrites the new
+        //      owner's file with our stale metadata. heartbeat_once's
+        //      ownership check happens BEFORE the write, so it can race
+        //      with a concurrent acquire that flips ownership in between.
+        //   5. The new owner's heartbeat sees foreign metadata, exits
+        //      `NotOwner`. The new owner's drop sees foreign metadata,
+        //      `remove_lock_if_owned` returns `Ok(false)`, file persists.
+        //
+        // Always-joining bounds drop latency to one `park_timeout`
+        // iteration (~25ms) plus the current `heartbeat_once` IO —
+        // typically <500ms under CI load. The unused `heartbeat_done`
+        // channel is kept for backward compatibility with any external
+        // code that may still construct LockGuard manually, but Drop no
+        // longer relies on it.
         self.shutdown.store(true, Ordering::Release);
-        if let Some(handle) = self.heartbeat.as_ref() {
+        if let Some(handle) = self.heartbeat.take() {
             handle.thread().unpark();
+            let _ = handle.join();
         }
-
-        if self
-            .heartbeat_done
-            .recv_timeout(Duration::from_millis(100))
-            .is_ok()
-        {
-            if let Some(handle) = self.heartbeat.take() {
-                let _ = handle.join();
-            }
-        } else {
-            slog_warn!(
-                "fs lock heartbeat thread for {} did not stop within 100ms",
-                self.path.display()
-            );
-        }
+        // Drain any pending ack so the receiver doesn't carry stale state
+        // if this LockGuard is somehow re-used (it isn't today, but be
+        // defensive).
+        while self.heartbeat_done.try_recv().is_ok() {}
 
         match remove_lock_if_owned(&self.path, &self.metadata) {
             Ok(true) => slog_info!("released filesystem lock at {}", self.path.display()),
