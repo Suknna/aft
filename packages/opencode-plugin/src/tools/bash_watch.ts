@@ -89,12 +89,10 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           throw new Error(`${code}: ${message}`);
         }
         markExplicitControl(context.sessionID, taskId);
-        const snapshot = await bashStatusSnapshot(ctx, context, taskId, undefined);
-        return JSON.stringify(
-          { registered: true, watchId: registered.watch_id, snapshot },
-          null,
-          2,
-        );
+        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
+          .metadata;
+        metadata?.({ taskId, registered: true, watchId: registered.watch_id });
+        return `Watch registered: ${registered.watch_id} on task ${taskId}\nA notification will fire when the pattern matches or the task exits.`;
       }
 
       const effectiveWaitMs = subagentForcedSync
@@ -103,13 +101,48 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
             (args.timeoutMs as number | undefined) ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
             MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
           );
-      return JSON.stringify(
-        await waitForBashStatus(ctx, context, taskId, undefined, waitFor, effectiveWaitMs),
-        null,
-        2,
+      const data = await waitForBashStatus(
+        ctx,
+        context,
+        taskId,
+        undefined,
+        waitFor,
+        effectiveWaitMs,
       );
+      const waited = data.waited;
+      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
+      if (waited) metadata?.({ taskId, status: data.status, waited });
+      return formatWatchResultText(taskId, data, waited);
     },
   };
+}
+
+function formatWatchResultText(
+  taskId: string,
+  data: Record<string, unknown>,
+  waited: BashStatusWaited | undefined,
+): string {
+  const status = data.status as string;
+  const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
+  const dur =
+    typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
+  let text = `Task ${taskId}: ${status}${exit}${dur}`;
+  if (waited) {
+    if (waited.reason === "matched") {
+      text += `\nWaited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
+    } else if (waited.reason === "timeout") {
+      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match.`;
+    } else {
+      const stat = String(data.status ?? "unknown");
+      const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
+      text += `\nWaited ${waited.elapsed_ms}ms; task exited (${stat}${e}).`;
+    }
+  }
+  const preview = data.output_preview as string | undefined;
+  if (preview && status !== "running") {
+    text += `\n${preview.slice(0, 2000)}`;
+  }
+  return text;
 }
 
 async function bashStatusSnapshot(

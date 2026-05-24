@@ -8,6 +8,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { __ptyCacheSizeForTests, __resetPtyCacheForTests } from "../shared/pty-cache.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashStatusTool, createBashTool } from "../tools/bash.js";
+import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
@@ -153,7 +154,7 @@ describe("OpenCode bash PTY layer", () => {
     expect(__ptyCacheSizeForTests()).toBe(1);
   });
 
-  test("Test 26b: bash_status waitFor matches PTY bytes", async () => {
+  test("Test 26b: bash_watch pattern matches PTY bytes", async () => {
     const outputPath = await spill("booting\nready on pty\n");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
@@ -161,8 +162,8 @@ describe("OpenCode bash PTY layer", () => {
       mode: "pty",
       output_path: outputPath,
     }));
-    const result = await createBashStatusTool(pluginCtx).execute(
-      { taskId: "bash-pty-wait", waitFor: "ready on pty" },
+    const result = await createBashWatchTool(pluginCtx).execute(
+      { taskId: "bash-pty-wait", pattern: "ready on pty" },
       runtime(),
     );
     expect(result).toContain('matched "ready on pty" at offset 8');

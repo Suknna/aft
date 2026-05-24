@@ -53,8 +53,8 @@ const inputs = [
   "paths /Users/example/project/src/lib.rs and C:\\Temp\\file.txt",
   "SQL: SELECT * FROM users WHERE name = 'Ada' AND active = true;",
   "Markdown **bold** _italic_ `code` [link](https://example.com?q=1&x=2)",
-  "JSONL\n" + Array.from({ length: 20 }, (_, i) => JSON.stringify({ i, text: mixed })).join("\n"),
-  (prose + "\n" + code + mixed + "\n").repeat(120),
+  `JSONL\n${Array.from({ length: 20 }, (_, i) => JSON.stringify({ i, text: mixed })).join("\n")}`,
+  `${prose}\n${code}${mixed}\n`.repeat(120),
   ("0123456789abcdef ".repeat(1024) + mixed).repeat(1),
 ];
 

@@ -467,7 +467,7 @@ describe("bash tool adapter", () => {
     ).rejects.toThrow("Permission ask reached Pi adapter");
   });
 
-  test("bash_status wait_for substring returns waited details", async () => {
+  test("bash_watch pattern substring returns waited matched details", async () => {
     const outputPath = await spill("alpha ready beta\n");
     try {
       const tools = new Map<string, MockToolDef>();
@@ -480,8 +480,8 @@ describe("bash tool adapter", () => {
       const ctx = makeMockContext(bridge);
       registerBashTool(api, ctx);
       const result = (await tools
-        .get("bash_status")!
-        .execute("call", { task_id: "bash-pi-wait", wait_for: "ready" }, undefined, undefined, {
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-pi-wait", pattern: "ready" }, undefined, undefined, {
           cwd: "/test",
         })) as { details: { waited?: { reason: string; match?: string; match_offset?: number } } };
       expect(toolText(result)).toContain('matched "ready" at offset 6');
@@ -498,7 +498,7 @@ describe("bash tool adapter", () => {
     }
   });
 
-  test("bash_status exit true returns waited exited details", async () => {
+  test("bash_watch exit-only returns waited exited details", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge } = makeTrackableMockBridge({
@@ -508,9 +508,10 @@ describe("bash tool adapter", () => {
     });
     const ctx = makeMockContext(bridge);
     registerBashTool(api, ctx);
+    // bash_watch with no pattern in sync mode waits for exit
     const result = (await tools
-      .get("bash_status")!
-      .execute("call", { task_id: "bash-pi-exit", exit: true }, undefined, undefined, {
+      .get("bash_watch")!
+      .execute("call", { task_id: "bash-pi-exit" }, undefined, undefined, {
         cwd: "/test",
       })) as { details: { waited?: { reason: string } } };
     expect(toolText(result)).toContain("task exited (completed, exit 0)");

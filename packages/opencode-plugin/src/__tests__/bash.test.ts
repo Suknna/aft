@@ -13,6 +13,7 @@ import {
 import { consumeToolMetadata } from "../metadata-store.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
+import { createBashWatchTool } from "../tools/bash_watch.js";
 import type { PluginContext } from "../types.js";
 import { mockAsk, noopAsk } from "./test-helpers";
 
@@ -405,7 +406,13 @@ describe("bash_status tool", () => {
       config: {} as PluginContext["config"],
       storageDir: "/tmp/aft-test",
     };
-    return { calls, ctx, statusTool: createBashStatusTool(ctx), killTool: createBashKillTool(ctx) };
+    return {
+      calls,
+      ctx,
+      statusTool: createBashStatusTool(ctx),
+      watchTool: createBashWatchTool(ctx),
+      killTool: createBashKillTool(ctx),
+    };
   }
 
   test("returns running status with anti-polling reminder, no output preview", async () => {
@@ -484,18 +491,18 @@ describe("bash_status tool", () => {
     return file;
   }
 
-  test("waitFor substring match returns matched reason, text, and offset", async () => {
+  test("bash_watch pattern substring match returns matched reason, text, and offset", async () => {
     const outputPath = await spill("prefix Server listening on port 3000\n");
     try {
       const metadata = mock(() => {});
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-wait", waitFor: "Server listening" },
+      const result = await watchTool.execute(
+        { taskId: "bash-wait", pattern: "Server listening" },
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "Server listening" at offset 7');
@@ -509,17 +516,17 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("waitFor regex match returns matched reason, text, and offset", async () => {
+  test("bash_watch pattern regex match returns matched reason, text, and offset", async () => {
     const outputPath = await spill("abc ready: 4242\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-regex", waitFor: { regex: "ready: \\d+" } },
+      const result = await watchTool.execute(
+        { taskId: "bash-regex", pattern: { regex: "ready: \\d+" } },
         createMockSdkContext(),
       );
       expect(result).toContain('matched "ready: 4242" at offset 4');
@@ -528,18 +535,15 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("exit true on already-terminal task returns immediately with reason exited", async () => {
-    const { calls, statusTool } = makeCtx(() => ({
+  test("bash_watch on already-terminal task returns immediately with reason exited", async () => {
+    const { calls, watchTool } = makeCtx(() => ({
       success: true,
       status: "completed",
       exit_code: 0,
       duration_ms: 12,
       output_preview: "done",
     }));
-    const result = await statusTool.execute(
-      { taskId: "bash-done", exit: true },
-      createMockSdkContext(),
-    );
+    const result = await watchTool.execute({ taskId: "bash-done" }, createMockSdkContext());
     expect(result).toContain("task exited (completed, exit 0)");
     expect(result).toContain("done");
     expect(calls).toHaveLength(1);
@@ -547,33 +551,33 @@ describe("bash_status tool", () => {
     expect(calls[0].options?.transportTimeoutMs).toBe(30_000);
   });
 
-  test("exit true on running task that completes mid-poll returns reason exited", async () => {
+  test("bash_watch on running task that completes mid-poll returns reason exited", async () => {
     let polls = 0;
-    const { statusTool } = makeCtx(() => {
+    const { watchTool } = makeCtx(() => {
       polls += 1;
       return polls === 1
         ? { success: true, status: "running" }
         : { success: true, status: "completed", exit_code: 0, output_preview: "finished" };
     });
-    const result = await statusTool.execute(
-      { taskId: "bash-mid", exit: true, timeoutMs: 500 },
+    const result = await watchTool.execute(
+      { taskId: "bash-mid", timeoutMs: 500 },
       createMockSdkContext(),
     );
     expect(result).toContain("task exited (completed, exit 0)");
     expect(polls).toBe(2);
   });
 
-  test("timeoutMs returns timeout when neither wait condition is met", async () => {
+  test("bash_watch timeoutMs returns timeout when pattern never matches", async () => {
     const outputPath = await spill("not yet\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-timeout", waitFor: "never", timeoutMs: 1 },
+      const result = await watchTool.execute(
+        { taskId: "bash-timeout", pattern: "never", timeoutMs: 1 },
         createMockSdkContext(),
       );
       expect(result).toContain("timeout reached without match");
@@ -582,18 +586,18 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("waitFor plus exit true race returns exited when task exits before scanning pattern", async () => {
+  test("bash_watch pattern + exit race returns exited when task exits before scanning pattern", async () => {
     const outputPath = await spill("pattern exists but exit wins\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "completed",
         exit_code: 0,
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-race", waitFor: "pattern", exit: true },
+      const result = await watchTool.execute(
+        { taskId: "bash-race", pattern: "pattern" },
         createMockSdkContext(),
       );
       expect(result).toContain("task exited (completed, exit 0)");
@@ -603,17 +607,17 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("PIPED bash with waitFor reads output_path and matches", async () => {
+  test("bash_watch on PIPED bash with pattern reads output_path and matches", async () => {
     const outputPath = await spill("one\ntwo\nthree\n");
     try {
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "running",
         mode: "pipes",
         output_path: outputPath,
       }));
-      const result = await statusTool.execute(
-        { taskId: "bash-piped", waitFor: "two" },
+      const result = await watchTool.execute(
+        { taskId: "bash-piped", pattern: "two" },
         createMockSdkContext(),
       );
       expect(result).toContain('matched "two" at offset 4');
@@ -622,11 +626,11 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("exit wait consumes pending completion to suppress duplicate reminder", async () => {
+  test("bash_watch exit wait consumes pending completion to suppress duplicate reminder", async () => {
     __resetBgNotificationStateForTests();
     try {
       trackBgTask("s-consume", "bash-consume");
-      const { statusTool } = makeCtx(() => ({
+      const { watchTool } = makeCtx(() => ({
         success: true,
         status: "completed",
         exit_code: 0,
@@ -634,8 +638,8 @@ describe("bash_status tool", () => {
           { task_id: "bash-consume", status: "completed", exit_code: 0, command: "echo done" },
         ],
       }));
-      await statusTool.execute(
-        { taskId: "bash-consume", exit: true },
+      await watchTool.execute(
+        { taskId: "bash-consume" },
         createMockSdkContext({ sessionID: "s-consume" }),
       );
       expect(sessionBgStates.get("s-consume")?.pendingCompletions).toEqual([]);
@@ -893,9 +897,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
       createMockSdkContext({ sessionID: "ses_subagent_bg" }),
     );
     expect(result as string).toContain("Background task started: bash-sub-bg");
-    expect(result as string).toContain(
-      'bash_status({ taskId: "bash-sub-bg", exit: true, timeoutMs: 60000 })',
-    );
+    expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg", timeoutMs: 60000 })');
     expect(calls.find((c) => c.command === "bash")?.params.background).toBe(true);
     expect(calls.find((c) => c.command === "bash")?.params.notify_on_completion).toBe(true);
   });
@@ -918,7 +920,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     );
     expect(result as string).toContain("promoted to background: bash-sub-promote");
     expect(result as string).toContain(
-      'bash_status({ taskId: "bash-sub-promote", exit: true, timeoutMs: 60000 })',
+      'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
     );
     expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_promote"]);
   });

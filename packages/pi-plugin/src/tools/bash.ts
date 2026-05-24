@@ -460,28 +460,10 @@ export function createBashStatusTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const waitFor = parseWaitPattern(
-        (params as Static<typeof BashStatusParams> & { wait_for?: unknown }).wait_for,
-      );
-      const legacyParams = params as Static<typeof BashStatusParams> & {
-        exit?: boolean;
-        timeout_ms?: number;
-      };
-      const shouldWait = waitFor !== undefined || legacyParams.exit === true;
-      const data = shouldWait
-        ? await waitForBashStatus(
-            bridge,
-            extCtx,
-            params.task_id,
-            params.output_mode,
-            waitFor,
-            legacyParams.exit === true,
-            Math.min(
-              legacyParams.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-              MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
-            ),
-          )
-        : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      // bash_status is snapshot-only. wait_for / exit / timeout_ms moved to
+      // bash_watch; if the agent passes them here they're silently ignored
+      // at the TypeBox schema layer.
+      const data = await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode),
@@ -526,10 +508,10 @@ export function createBashWatchTool(ctx: PluginContext) {
           throw new Error(`${String(registered.code ?? "invalid_request")}: ${message}`);
         }
         markExplicitControl(resolveSessionId(extCtx), params.task_id);
-        const snapshot = await bashStatusSnapshot(bridge, extCtx, params.task_id, undefined);
+        const watchDetails = { registered: true, watchId: registered.watch_id } as BashWatchDetails;
         return textResult(
-          JSON.stringify({ registered: true, watchId: registered.watch_id, snapshot }, null, 2),
-          { registered: true, watchId: registered.watch_id, snapshot } as BashWatchDetails,
+          `Watch registered: ${registered.watch_id} on task ${params.task_id}\nA notification will fire when the pattern matches or the task exits.`,
+          watchDetails,
         );
       }
       const data = await waitForBashStatus(
@@ -544,7 +526,13 @@ export function createBashWatchTool(ctx: PluginContext) {
           MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
         ),
       );
-      return textResult(JSON.stringify(data, null, 2), data as BashWatchDetails);
+      const text = await formatBashStatus(
+        extCtx,
+        params.task_id,
+        data as unknown as BashStatusDetails,
+        undefined,
+      );
+      return textResult(text, data as BashWatchDetails);
     },
   };
 }

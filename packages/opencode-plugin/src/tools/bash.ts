@@ -14,7 +14,6 @@ import {
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBridge, projectRootFor } from "./_shared.js";
-import { parseWaitPattern, waitForBashStatus } from "./bash_watch.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -359,22 +358,11 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
     execute: async (args, context) => {
       const taskId = args.taskId as string;
       const outputMode = args.outputMode as string | undefined;
-      const waitFor = parseWaitPattern(args.waitFor);
-      const shouldWait = waitFor !== undefined || args.exit === true;
-      const data = shouldWait
-        ? await waitForBashStatus(
-            ctx,
-            context,
-            taskId,
-            outputMode,
-            waitFor,
-            Math.min((args.timeoutMs as number | undefined) ?? 30_000, 300_000),
-          )
-        : await bashStatusSnapshot(ctx, context, taskId, outputMode);
-      const waited = data.waited as BashStatusWaited | undefined;
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      if (waited) metadata?.({ taskId, status: data.status, waited });
-      return await formatBashStatusText(context, taskId, data, outputMode, waited);
+      // bash_status is snapshot-only as of bash_watch landing. waitFor/exit/
+      // timeoutMs moved to bash_watch — if the agent passes them here, they're
+      // silently ignored at the Zod schema layer (extra keys stripped).
+      const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      return await formatBashStatusText(context, taskId, data, outputMode);
     },
   };
 }
@@ -424,26 +412,17 @@ async function bashStatusSnapshot(
   return data;
 }
 
-type BashStatusWaited = {
-  reason: "matched" | "exited" | "timeout";
-  elapsed_ms: number;
-  match?: string;
-  match_offset?: number;
-};
-
 async function formatBashStatusText(
   runtime: ToolContext,
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
-  waited: BashStatusWaited | undefined,
 ): Promise<string> {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
   const dur =
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
-  if (waited) text += `\n${formatWaitSummary(waited, data)}`;
   if (data.mode === "pty") {
     text += await formatPtyStatus(runtime, taskId, data, requestedOutputMode);
   } else {
@@ -456,18 +435,6 @@ async function formatBashStatusText(
     }
   }
   return text;
-}
-
-function formatWaitSummary(waited: BashStatusWaited, data: Record<string, unknown>): string {
-  if (waited.reason === "matched") {
-    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")} at offset ${waited.match_offset ?? 0}.`;
-  }
-  if (waited.reason === "timeout") {
-    return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;
-  }
-  const status = String(data.status ?? "unknown");
-  const exit = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
-  return `Waited ${waited.elapsed_ms}ms; task exited (${status}${exit}).`;
 }
 
 async function formatPtyStatus(
@@ -516,7 +483,7 @@ function isTerminalStatus(status: unknown): boolean {
 function subagentGuidance(taskId: string): string {
   return `
 
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_status({ taskId: "${taskId}", exit: true, timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
+NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}", timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
 }
 
 function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
