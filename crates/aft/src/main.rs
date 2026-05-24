@@ -299,6 +299,8 @@ fn attach_bg_completions(
             | "bash_write"
             | "bash_promote"
             | "bash_drain_completions"
+            | "bash_notify"
+            | "bash_unnotify"
             | "bash_ack_completions"
     ) {
         return;
@@ -332,6 +334,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
+        "bash_unnotify" => aft::commands::bash_notify::handle_unnotify(&req, ctx),
         "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
         "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "bash_write" => aft::commands::bash_write::handle(&req, ctx),

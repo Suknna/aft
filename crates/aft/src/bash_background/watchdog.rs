@@ -39,6 +39,7 @@ pub(crate) fn start(registry: BgTaskRegistry) {
 
             for task in tasks {
                 let _ = registry.poll_task(&task);
+                registry.scan_task_watch_output(&task);
                 if !task.is_running() {
                     continue;
                 }

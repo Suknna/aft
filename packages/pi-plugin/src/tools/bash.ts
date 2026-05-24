@@ -10,6 +10,7 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
   consumeBgCompletion,
+  markExplicitControl,
   markTaskWaiting,
   trackBgTask,
   unmarkTaskWaiting,
@@ -114,33 +115,16 @@ const BashStatusParams = Type.Object({
         "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
     }),
   ),
-  wait_for: Type.Optional(
-    Type.Union(
-      [
-        Type.String(),
-        Type.Object({
-          regex: Type.String(),
-        }),
-      ],
-      {
-        description:
-          "Wait until this text pattern appears in the task's output. String form: substring match. Object form: regex match (JavaScript regex syntax). The call returns as soon as the pattern is found OR the task reaches terminal status OR timeout_ms elapses.",
-      },
-    ),
-  ),
-  exit: Type.Optional(
-    Type.Boolean({
-      description:
-        "Wait until the task reaches a terminal status (completed/failed/killed/timed_out). Useful for explicitly awaiting a background bash task before returning. Can be combined with wait_for — the call returns on whichever condition fires first.",
-    }),
-  ),
-  timeout_ms: Type.Optional(
-    Type.Integer({
-      minimum: 1,
-      description:
-        "Maximum wait time in milliseconds. Default: 30000 (30s). Hard-capped at 300000 (5min). Ignored when neither wait_for nor exit is specified.",
-    }),
-  ),
+});
+
+const BashWatchParams = Type.Object({
+  task_id: Type.String({
+    description: "Background bash task id returned by bash({ background: true }).",
+  }),
+  pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
+  background: Type.Optional(Type.Boolean()),
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 1 })),
+  once: Type.Optional(Type.Boolean()),
 });
 
 const BashWriteParams = Type.Object({
@@ -213,6 +197,8 @@ interface BashKillDetails {
   success: boolean;
   status: string;
 }
+
+interface BashWatchDetails extends Record<string, unknown> {}
 
 /** Local shape for Pi's render context — mirrors hoisted.ts pattern. */
 interface RenderContextLike {
@@ -409,6 +395,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   // flag only gates explicit `bash({ background: true })` spawning, not the
   // promotion path.
   pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
+  pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
   pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
   pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
 }
@@ -462,8 +449,8 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     description:
-      'Check the status of a background bash task. For PTY tasks, pass output_mode: "screen" (default), "raw", or "both". Pass exit: true and/or wait_for to block until the task exits, the text/regex appears, or timeout_ms elapses.',
-    promptSnippet: "Poll or explicitly wait for a background bash task by task_id",
+      "Read-only snapshot of a background bash task. Returns immediately. Use bash_watch to block on or register for pattern matches and exit events.",
+    promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
       _toolCallId: string,
@@ -473,12 +460,14 @@ export function createBashStatusTool(ctx: PluginContext) {
       extCtx: ExtensionContext,
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const waitFor = parseWaitPattern(params.wait_for);
-      const shouldWait = waitFor !== undefined || params.exit === true;
-      const effectiveWaitMs = Math.min(
-        params.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-        MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+      const waitFor = parseWaitPattern(
+        (params as Static<typeof BashStatusParams> & { wait_for?: unknown }).wait_for,
       );
+      const legacyParams = params as Static<typeof BashStatusParams> & {
+        exit?: boolean;
+        timeout_ms?: number;
+      };
+      const shouldWait = waitFor !== undefined || legacyParams.exit === true;
       const data = shouldWait
         ? await waitForBashStatus(
             bridge,
@@ -486,8 +475,11 @@ export function createBashStatusTool(ctx: PluginContext) {
             params.task_id,
             params.output_mode,
             waitFor,
-            params.exit === true,
-            effectiveWaitMs,
+            legacyParams.exit === true,
+            Math.min(
+              legacyParams.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+              MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+            ),
           )
         : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
       const details = data as unknown as BashStatusDetails;
@@ -495,6 +487,64 @@ export function createBashStatusTool(ctx: PluginContext) {
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode),
         details,
       );
+    },
+  };
+}
+
+export function createBashWatchTool(ctx: PluginContext) {
+  return {
+    name: "bash_watch",
+    label: "bash_watch",
+    description:
+      "Block on a background bash task until a pattern matches, it exits, or timeout elapses; or register an async pattern notification with background:true.",
+    promptSnippet: "Wait for or watch a background bash task",
+    parameters: BashWatchParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof BashWatchParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: ((update: AgentToolResult<BashWatchDetails>) => void) | undefined,
+      extCtx: ExtensionContext,
+    ) {
+      const bridge = bridgeFor(ctx, extCtx.cwd);
+      const waitFor = parseWaitPattern(params.pattern);
+      if (params.background === true) {
+        if (!waitFor) {
+          throw new Error(
+            "invalid_request: Use auto-reminder; bash_watch without pattern in async mode is redundant",
+          );
+        }
+        const notifyParams: Record<string, unknown> = {
+          task_id: params.task_id,
+          once: params.once !== false,
+        };
+        if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
+        else notifyParams.pattern = waitFor.value;
+        const registered = await callBridge(bridge, "bash_notify", notifyParams, extCtx);
+        if (registered.success === false) {
+          const message = String(registered.message ?? "bash_notify failed");
+          throw new Error(`${String(registered.code ?? "invalid_request")}: ${message}`);
+        }
+        markExplicitControl(resolveSessionId(extCtx), params.task_id);
+        const snapshot = await bashStatusSnapshot(bridge, extCtx, params.task_id, undefined);
+        return textResult(
+          JSON.stringify({ registered: true, watchId: registered.watch_id, snapshot }, null, 2),
+          { registered: true, watchId: registered.watch_id, snapshot } as BashWatchDetails,
+        );
+      }
+      const data = await waitForBashStatus(
+        bridge,
+        extCtx,
+        params.task_id,
+        undefined,
+        waitFor,
+        true,
+        Math.min(
+          params.timeout_ms ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+          MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+        ),
+      );
+      return textResult(JSON.stringify(data, null, 2), data as BashWatchDetails);
     },
   };
 }
@@ -600,7 +650,9 @@ function bashKillResult(
   };
 }
 
-type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; value: RegExp };
+type BashWaitPattern =
+  | { kind: "substring"; value: string }
+  | { kind: "regex"; value: RegExp; source: string };
 
 async function bashStatusSnapshot(
   bridge: BinaryBridge,
@@ -723,7 +775,8 @@ async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Bu
 
 function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
-  if (isRegexWaitObject(value)) return { kind: "regex", value: new RegExp(value.regex) };
+  if (isRegexWaitObject(value))
+    return { kind: "regex", value: new RegExp(value.regex), source: value.regex };
   return undefined;
 }
 

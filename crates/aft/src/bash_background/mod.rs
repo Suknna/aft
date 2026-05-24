@@ -7,6 +7,7 @@ pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
 pub mod watchdog;
+pub mod watches;
 
 use crate::context::AppContext;
 use crate::protocol::Response;

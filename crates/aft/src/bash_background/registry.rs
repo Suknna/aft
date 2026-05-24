@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::context::SharedProgressSender;
 use crate::harness::Harness;
-use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, PushFrame};
+use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -34,6 +34,7 @@ use super::process::terminate_pgid;
 use super::process::terminate_pid;
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
+use super::watches::{PatternMatch, WatchPattern, WatchRegistry};
 use super::{BgTaskInfo, BgTaskStatus};
 // Note: `resolve_windows_shell` is no longer imported at module scope —
 // production code in `spawn_detached_child` uses `shell_candidates()`
@@ -135,6 +136,7 @@ pub(crate) struct RegistryInner {
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
+    pub(crate) watch_registry: Mutex<WatchRegistry>,
 }
 
 pub(crate) struct BgTask {
@@ -192,6 +194,7 @@ impl BgTaskRegistry {
                 db_harness: RwLock::new(None),
                 wake_tx,
                 wake_rx,
+                watch_registry: Mutex::new(WatchRegistry::default()),
             }),
         }
     }
@@ -883,6 +886,72 @@ impl BgTaskRegistry {
             }
         }
         Ok(tasks)
+    }
+
+    pub fn register_watch(
+        &self,
+        task_id: String,
+        pattern: WatchPattern,
+        once: bool,
+    ) -> Result<String, &'static str> {
+        let mut registry = self
+            .inner
+            .watch_registry
+            .lock()
+            .map_err(|_| "watch_registry_poisoned")?;
+        registry.register(task_id, pattern, once)
+    }
+
+    pub fn unregister_watch(&self, task_id: &str, watch_id: &str) {
+        if let Ok(mut registry) = self.inner.watch_registry.lock() {
+            registry.unregister(task_id, watch_id);
+        }
+    }
+
+    pub fn active_watch_count(&self, task_id: &str) -> usize {
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.active_count(task_id))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
+        let (mode, stdout, stderr, pty) = match task.state.lock() {
+            Ok(state) => (
+                state.metadata.mode.clone(),
+                task.paths.stdout.clone(),
+                task.paths.stderr.clone(),
+                task.paths.pty.clone(),
+            ),
+            Err(_) => return,
+        };
+        let mut matches = Vec::new();
+        if let Ok(mut registry) = self.inner.watch_registry.lock() {
+            match mode {
+                BgMode::Pipes => {
+                    let stdout_key = format!("{}:stdout", task.task_id);
+                    let stderr_key = format!("{}:stderr", task.task_id);
+                    matches.extend(registry.scan_file_new_bytes(
+                        &stdout_key,
+                        &task.task_id,
+                        &stdout,
+                    ));
+                    matches.extend(registry.scan_file_new_bytes(
+                        &stderr_key,
+                        &task.task_id,
+                        &stderr,
+                    ));
+                }
+                BgMode::Pty => {
+                    let pty_key = format!("{}:pty", task.task_id);
+                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, &pty));
+                }
+            }
+        }
+        for pattern_match in matches {
+            self.emit_bash_pattern_match(&task.session_id, pattern_match);
+        }
     }
 
     pub fn status(
@@ -1933,6 +2002,28 @@ impl BgTaskRegistry {
                     error
                 );
             }
+        }
+    }
+
+    fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        if let Some(sender) = progress_sender.as_ref() {
+            sender(PushFrame::BashPatternMatch(BashPatternMatchFrame::new(
+                pattern_match.task_id,
+                session_id.to_string(),
+                pattern_match.watch_id,
+                pattern_match.match_text,
+                pattern_match.match_offset,
+                pattern_match.context,
+                pattern_match.once,
+            )));
         }
     }
 

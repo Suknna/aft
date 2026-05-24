@@ -178,6 +178,8 @@ export interface BridgeOptions {
     reminder: BashLongRunningPayload,
     bridge: BinaryBridge,
   ) => void | Promise<void>;
+  /** Called for server-pushed bash pattern watch matches. */
+  onBashPatternMatch?: (frame: BashPatternMatchFrame, bridge: BinaryBridge) => void | Promise<void>;
   /**
    * Prefix for user-facing error messages thrown by the bridge (e.g. timeout,
    * stdin-write, configure-failure errors). Hosts pass their own tag so the
@@ -204,6 +206,17 @@ export interface BashLongRunningPayload {
   session_id: string;
   command: string;
   elapsed_ms: number;
+}
+
+export interface BashPatternMatchFrame {
+  type: "bash_pattern_match";
+  task_id: string;
+  session_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
 }
 
 export interface StatusSnapshot {
@@ -287,6 +300,9 @@ export class BinaryBridge {
   private onBashLongRunning:
     | ((reminder: BashLongRunningPayload, bridge: BinaryBridge) => void | Promise<void>)
     | undefined;
+  private onBashPatternMatch:
+    | ((frame: BashPatternMatchFrame, bridge: BinaryBridge) => void | Promise<void>)
+    | undefined;
   private cachedStatus: StatusSnapshot | null = null;
   private statusListeners = new Set<(snapshot: StatusSnapshot) => void>();
   /** Notification clients keyed by session_id for async configure warning pushes. */
@@ -311,6 +327,7 @@ export class BinaryBridge {
     this.onConfigureWarnings = options?.onConfigureWarnings;
     this.onBashCompletion = options?.onBashCompletion;
     this.onBashLongRunning = options?.onBashLongRunning;
+    this.onBashPatternMatch = options?.onBashPatternMatch;
     this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     this.logger = options?.logger;
   }
@@ -1019,6 +1036,10 @@ export class BinaryBridge {
         }
         if (response.type === "bash_long_running") {
           this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
+          continue;
+        }
+        if (response.type === "bash_pattern_match") {
+          this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this);
           continue;
         }
         if (response.type === "configure_warnings") {

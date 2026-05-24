@@ -83,6 +83,19 @@ pub struct BashLongRunningFrame {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BashPatternMatchFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub watch_id: String,
+    pub match_text: String,
+    pub match_offset: u64,
+    pub context: String,
+    pub once: bool,
+}
+
 /// Pushed after configure has completed, when the deferred file walk and
 /// language detection produce warnings (missing formatter/checker/LSP binaries,
 /// or "project too large" file-count exceeded). The walk runs in a background
@@ -129,6 +142,7 @@ pub enum PushFrame {
     Progress(ProgressFrame),
     BashCompleted(BashCompletedFrame),
     BashLongRunning(BashLongRunningFrame),
+    BashPatternMatch(BashPatternMatchFrame),
     ConfigureWarnings(ConfigureWarningsFrame),
     StatusChanged(StatusChangedFrame),
 }
@@ -335,6 +349,29 @@ impl BashLongRunningFrame {
             session_id: session_id.into(),
             command: command.into(),
             elapsed_ms,
+        }
+    }
+}
+
+impl BashPatternMatchFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        watch_id: impl Into<String>,
+        match_text: impl Into<String>,
+        match_offset: u64,
+        context: impl Into<String>,
+        once: bool,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: watch_id.into(),
+            match_text: match_text.into(),
+            match_offset,
+            context: context.into(),
+            once,
         }
     }
 }

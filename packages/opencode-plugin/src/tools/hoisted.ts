@@ -19,6 +19,7 @@ import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import { callBridge } from "./_shared.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
+import { createBashWatchTool } from "./bash_watch.js";
 import { createBashWriteTool } from "./bash_write.js";
 import {
   assertExternalDirectoryPermission,
@@ -1690,6 +1691,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     tools.bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 
@@ -1792,6 +1794,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     tools.aft_bash = createBashTool(ctx);
     tools.bash_status = createBashStatusTool(ctx);
     tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
     tools.bash_kill = createBashKillTool(ctx);
   }
 

@@ -20,6 +20,7 @@ import {
   handleIdleBgCompletions,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
+  handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
@@ -66,6 +67,16 @@ import { semanticTools } from "./tools/semantic.js";
 import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
+
+type BashPatternMatchPayload = {
+  session_id: string;
+  task_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+};
 
 type BashLongRunningPayload = {
   session_id: string;
@@ -397,6 +408,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
+    onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
@@ -508,6 +520,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           serverUrl: input.serverUrl?.toString(),
         },
         reminder,
+      );
+    },
+    onBashPatternMatch: (frame) => {
+      const sessionDir = getSessionDirectoryCached(frame.session_id) ?? input.directory;
+      void handlePushedPatternMatch(
+        {
+          ctx,
+          directory: sessionDir,
+          sessionID: frame.session_id,
+          client: input.client,
+          serverUrl: input.serverUrl?.toString(),
+        },
+        frame,
       );
     },
   };

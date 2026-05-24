@@ -22,6 +22,16 @@ export interface BgCompletion {
   output_path?: string;
 }
 
+export interface PatternMatchEntry {
+  task_id: string;
+  session_id: string;
+  watch_id: string;
+  match_text: string;
+  match_offset: number;
+  context: string;
+  once: boolean;
+}
+
 export interface BgLongRunningReminder {
   task_id: string;
   session_id: string;
@@ -34,6 +44,8 @@ type SessionBgState = {
   outstandingTaskIds: Set<string>;
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
+  pendingPatternMatches: PatternMatchEntry[];
+  explicitControlTasks: Set<string>;
   debounceTimer: NodeJS.Timeout | null;
   firstCompletionAt: number | null;
   scheduledFireAt: number | null;
@@ -108,6 +120,8 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
     state.debounceTimer
   ) {
     clearTimeout(state.debounceTimer);
@@ -135,6 +149,8 @@ export function markTaskWaiting(sessionID: string | undefined, taskId: string): 
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
     state.debounceTimer
   ) {
     clearTimeout(state.debounceTimer);
@@ -176,6 +192,20 @@ export function trackBgTask(sessionID: string | undefined, taskId: string): void
   state.outstandingTaskIds.add(taskId);
 }
 
+export function markExplicitControl(sessionID: string | undefined, taskId: string): void {
+  const state = stateFor(sessionID);
+  state.explicitControlTasks.add(taskId);
+  state.outstandingTaskIds.add(taskId);
+}
+
+export async function handlePushedPatternMatch(
+  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+  frame: PatternMatchEntry,
+): Promise<void> {
+  stateFor(drainContext.sessionID).pendingPatternMatches.push(frame);
+  await triggerWakeIfPending(drainContext, true);
+}
+
 export function ingestBgCompletions(
   sessionID: string | undefined,
   completions: unknown,
@@ -191,6 +221,12 @@ export function ingestBgCompletions(
     // tracking stays accurate. See `consumeBgCompletion` for context.
     if (state.consumedTaskIds.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
+      continue;
+    }
+    if (state.explicitControlTasks.has(completion.task_id)) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      state.explicitControlTasks.delete(completion.task_id);
+      state.pendingPatternMatches.push(completionToExitPattern(completion));
       continue;
     }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
@@ -233,26 +269,37 @@ export async function appendToolResultBgCompletions(
   if (
     state.outstandingTaskIds.size === 0 &&
     state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
   )
     await drainCompletions(drainContext);
   if (
     state.outstandingTaskIds.size === 0 &&
     state.pendingCompletions.length === 0 &&
-    state.pendingLongRunning.length === 0
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
   )
     return undefined;
 
   if (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0)
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
+  )
     return undefined;
 
   const deliveredCompletions = [...state.pendingCompletions];
-  const reminder = formatCombinedSystemReminder(state.pendingCompletions, state.pendingLongRunning);
+  const reminder = formatCombinedSystemReminder(
+    state.pendingCompletions,
+    state.pendingLongRunning,
+    state.pendingPatternMatches,
+  );
   state.pendingCompletions = [];
   state.pendingLongRunning = [];
+  state.pendingPatternMatches = [];
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
   await ackCompletions(drainContext, deliveredCompletions);
@@ -291,7 +338,12 @@ async function triggerWakeIfPending(
   if (!skipDrain && (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)) {
     await drainCompletions(drainContext);
   }
-  if (state.pendingCompletions.length === 0 && state.pendingLongRunning.length === 0) return;
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
+  )
+    return;
 
   scheduleWake(
     state,
@@ -350,13 +402,26 @@ export function formatLongRunningReminder(reminders: readonly BgLongRunningRemin
   return `<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n${bullets}\nUse bash_status({ task_id: "..." }) to inspect output or bash_kill({ task_id: "..." }) to terminate.\n</system-reminder>`;
 }
 
+export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]): string {
+  const bullets = matches
+    .map((match) => {
+      const context = (match.context || match.match_text).replace(/\n/g, "\n      > ");
+      return `- task ${match.task_id} matched ${JSON.stringify(match.match_text)} (offset ${match.match_offset}):\n      > ${context}`;
+    })
+    .join("\n");
+  return `<system-reminder>\n[BG BASH NOTIFY]\n${bullets}\n</system-reminder>`;
+}
+
 function formatCombinedSystemReminder(
   completions: readonly BgCompletion[],
   longRunning: readonly BgLongRunningReminder[],
+  patternMatches: readonly PatternMatchEntry[] = [],
 ): string {
-  if (completions.length === 0) return formatLongRunningReminder(longRunning);
-  if (longRunning.length === 0) return formatSystemReminder(completions);
-  return `${formatSystemReminder(completions)}\n${formatLongRunningReminder(longRunning)}`;
+  const parts: string[] = [];
+  if (completions.length > 0) parts.push(formatSystemReminder(completions));
+  if (longRunning.length > 0) parts.push(formatLongRunningReminder(longRunning));
+  if (patternMatches.length > 0) parts.push(formatPatternMatchReminder(patternMatches));
+  return parts.join("\n");
 }
 
 export function __resetBgNotificationStateForTests(): void {
@@ -423,7 +488,10 @@ function scheduleWake(
   // drains and during final user-message delivery. Multiple hook invocations can
   // interleave only at those awaits, so we gate timer extension on completion count.
   const now = Date.now();
-  const pendingCount = state.pendingCompletions.length + state.pendingLongRunning.length;
+  const pendingCount =
+    state.pendingCompletions.length +
+    state.pendingLongRunning.length +
+    state.pendingPatternMatches.length;
   if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
     return;
   }
@@ -444,6 +512,7 @@ function scheduleWake(
   state.debounceTimer = setTimeout(() => {
     const pending = state.pendingCompletions;
     const pendingLongRunning = state.pendingLongRunning;
+    const pendingPatternMatches = state.pendingPatternMatches;
     state.debounceTimer = null;
     state.firstCompletionAt = null;
     state.scheduledFireAt = null;
@@ -452,10 +521,20 @@ function scheduleWake(
     // drained the pending arrays between schedule and fire and didn't
     // cancel us, just skip — don't ship an empty
     // "[BACKGROUND BASH STILL RUNNING]" shell.
-    if (pending.length === 0 && pendingLongRunning.length === 0) return;
-    const reminder = formatCombinedSystemReminder(pending, pendingLongRunning);
+    if (
+      pending.length === 0 &&
+      pendingLongRunning.length === 0 &&
+      pendingPatternMatches.length === 0
+    )
+      return;
+    const reminder = formatCombinedSystemReminder(
+      pending,
+      pendingLongRunning,
+      pendingPatternMatches,
+    );
     state.pendingCompletions = [];
     state.pendingLongRunning = [];
+    state.pendingPatternMatches = [];
     void sendWake(reminder, pending)
       .then(() => {
         state.retryDelayMs = null;
@@ -465,6 +544,7 @@ function scheduleWake(
       .catch((err) => {
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
         state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
+        state.pendingPatternMatches = [...pendingPatternMatches, ...state.pendingPatternMatches];
         state.wakeRetryAttempts += 1;
         if (state.wakeRetryAttempts >= MAX_WAKE_SEND_ATTEMPTS) {
           state.retryDelayMs = null;
@@ -490,6 +570,8 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       outstandingTaskIds: new Set(),
       pendingCompletions: [],
       pendingLongRunning: [],
+      pendingPatternMatches: [],
+      explicitControlTasks: new Set(),
       debounceTimer: null,
       firstCompletionAt: null,
       scheduledFireAt: null,
@@ -520,6 +602,11 @@ function ingestDrainedBgCompletions(
   for (const completion of completions) {
     if (!isBgCompletion(completion)) continue;
     state.outstandingTaskIds.delete(completion.task_id);
+    if (state.explicitControlTasks.has(completion.task_id)) {
+      state.explicitControlTasks.delete(completion.task_id);
+      state.pendingPatternMatches.push(completionToExitPattern(completion));
+      continue;
+    }
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
@@ -560,6 +647,22 @@ function pruneUnknownCompletions(state: SessionBgState, now: number): void {
   state.unknownCompletions = state.unknownCompletions.filter(
     (entry) => now - entry.receivedAt <= UNKNOWN_COMPLETION_TTL_MS,
   );
+}
+
+function completionToExitPattern(completion: BgCompletion): PatternMatchEntry {
+  const status = formatStatus(completion);
+  const preview = formatOutputPreview(completion).replace(/^ {4}/gm, "").slice(-300);
+  return {
+    task_id: completion.task_id,
+    session_id: "",
+    watch_id: "exit",
+    match_text: `exited (${status})`,
+    match_offset: 0,
+    context: preview
+      ? `task ${completion.task_id} exited (${status})\n${preview}`
+      : `task ${completion.task_id} exited (${status})`,
+    once: true,
+  };
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {
