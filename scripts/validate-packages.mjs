@@ -240,9 +240,10 @@ if (pi?.version && pi.optionalDependencies) {
   }
 }
 
-// Plugins must depend on @cortexkit/aft-bridge at the matching version. Without
-// this check, version-sync drift would let a plugin publish with a stale bridge
-// dep that doesn't exist on npm yet (the failure mode that motivated wiring).
+// Plugins and the unified CLI must depend on @cortexkit/aft-bridge at the
+// matching version. Without this check, version-sync drift would let a package
+// publish with a stale bridge dep that doesn't exist on npm yet (the failure
+// mode that motivated wiring).
 function checkBridgeDep(label, pkg) {
   if (!pkg?.dependencies || !pkg.version) return;
   const bridgeDep = pkg.dependencies["@cortexkit/aft-bridge"];
@@ -259,6 +260,7 @@ function checkBridgeDep(label, pkg) {
 }
 checkBridgeDep("@cortexkit/aft-opencode", core);
 checkBridgeDep("@cortexkit/aft-pi", pi);
+checkBridgeDep("@cortexkit/aft", cli);
 
 // --- Report ---
 
@@ -276,7 +278,7 @@ if (errors.length > 0) {
   console.log("  Platform os/cpu fields correct");
   console.log("  preferUnplugged set on all platform packages");
   console.log("  optionalDependencies complete in @cortexkit/aft-opencode and @cortexkit/aft-pi");
-  console.log("  @cortexkit/aft-bridge dep version aligned in plugin packages");
+  console.log("  @cortexkit/aft-bridge dep version aligned in plugin and CLI packages");
   console.log("  bin, license, repository fields present in @cortexkit/aft and @cortexkit/aft-pi");
   process.exit(0);
 }

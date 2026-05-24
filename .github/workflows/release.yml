@@ -363,33 +363,20 @@ jobs:
       - name: Validate packages
         run: node scripts/validate-packages.mjs
 
-      - name: Install bridge dependencies
-        run: bun install
-        working-directory: packages/aft-bridge
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
 
       - name: Build aft-bridge
         run: bun run build
         working-directory: packages/aft-bridge
 
-      - name: Install plugin dependencies
-        run: bun install
-        working-directory: packages/opencode-plugin
-
       - name: Build OpenCode plugin
         run: bun run build
         working-directory: packages/opencode-plugin
 
-      - name: Install Pi plugin dependencies
-        run: bun install
-        working-directory: packages/pi-plugin
-
       - name: Build Pi plugin
         run: bun run build
         working-directory: packages/pi-plugin
-
-      - name: Install CLI dependencies
-        run: bun install
-        working-directory: packages/aft-cli
 
       - name: Build CLI
         run: bun run build

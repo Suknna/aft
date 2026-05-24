@@ -9,6 +9,7 @@
     "build:all": "bun run --filter '*' build && cargo build --release",
     "typecheck": "bun run --filter '*' typecheck",
     "lint": "biome check .",
+    "lint:workflows": "sh -c 'command -v actionlint >/dev/null 2>&1 || { echo actionlint not found. Install with brew install actionlint on macOS or see https://github.com/rhysd/actionlint#installation; exit 1; }; actionlint .github/workflows/*.yml'",
     "lint:fix": "biome check --write .",
     "format": "biome format --write . && cargo fmt",
     "format:check": "biome format . && cargo fmt --check",

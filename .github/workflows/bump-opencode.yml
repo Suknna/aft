@@ -202,14 +202,37 @@ jobs:
           set -euo pipefail
           branch="${{ steps.pr.outputs.branch }}"
           if [ -z "$branch" ]; then
-            echo "::warning::No bump branch recorded; skipping Tests dispatch."
-            exit 0
+            echo "::error::No bump branch recorded; cannot dispatch Tests."
+            exit 1
           fi
           # `workflow_dispatch` is the documented exception that lets
           # GITHUB_TOKEN trigger another workflow run. The dispatched run
           # appears in the Actions tab tagged to this branch but is NOT
           # attached as a PR check. That's fine — the cron+human review
           # is the merge gate, not branch protection.
+          dispatch_started=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           gh workflow run tests.yml --ref "$branch" \
-            -f ref="$branch" \
-          || echo "::warning::Tests dispatch failed; trigger manually if needed."
+            -f ref="$branch"
+
+          echo "Waiting for Tests workflow dispatch to register..."
+          run_id=""
+          for attempt in 1 2 3 4 5 6; do
+            run_id=$(gh run list \
+              --workflow tests.yml \
+              --branch "$branch" \
+              --event workflow_dispatch \
+              --limit 20 \
+              --json databaseId,createdAt \
+              --jq "map(select(.createdAt >= \"${dispatch_started}\")) | .[0].databaseId // \"\"")
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            echo "Tests run not visible yet (attempt $attempt/6); retrying..."
+            sleep 5
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Tests dispatch did not create a workflow_dispatch run for $branch."
+            exit 1
+          fi
+          echo "Dispatched Tests run: $run_id"

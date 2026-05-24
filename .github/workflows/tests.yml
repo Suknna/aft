@@ -30,6 +30,7 @@ on:
       - ".github/workflows/_unit-suite.yml"
       - ".github/workflows/_e2e-suite.yml"
       - ".github/workflows/bump-opencode.yml"
+      - ".github/workflows/discord-release.yml"
   push:
     branches:
       - main
@@ -48,6 +49,7 @@ on:
       - ".github/workflows/_unit-suite.yml"
       - ".github/workflows/_e2e-suite.yml"
       - ".github/workflows/bump-opencode.yml"
+      - ".github/workflows/discord-release.yml"
   workflow_dispatch:
     inputs:
       ref:
