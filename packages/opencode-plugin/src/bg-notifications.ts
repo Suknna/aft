@@ -293,7 +293,23 @@ export async function handlePushedPatternMatch(
   drainContext: DrainContext & { client: unknown },
   frame: PatternMatchEntry,
 ): Promise<void> {
-  stateFor(drainContext.sessionID).pendingPatternMatches.push(frame);
+  const state = stateFor(drainContext.sessionID);
+  // Dedup: if a pattern match for this task is already pending (e.g. from
+  // markExplicitControl retroactively moving a pending completion, OR from
+  // Rust's scan-on-register firing pattern_match for output that was
+  // already on disk), prefer the most informative entry. Rule:
+  //  - "pattern_match" beats "task_exit" (real pattern match is more
+  //    specific than the exit safety net)
+  //  - otherwise drop the new one (first arrival wins for same reason)
+  const existingIdx = state.pendingPatternMatches.findIndex((m) => m.task_id === frame.task_id);
+  if (existingIdx >= 0) {
+    const existing = state.pendingPatternMatches[existingIdx];
+    if (existing.reason !== "pattern_match" && frame.reason === "pattern_match") {
+      state.pendingPatternMatches[existingIdx] = frame;
+    }
+  } else {
+    state.pendingPatternMatches.push(frame);
+  }
   await triggerWakeIfPending(drainContext, true);
 }
 

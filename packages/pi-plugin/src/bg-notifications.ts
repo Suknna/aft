@@ -233,7 +233,18 @@ export async function handlePushedPatternMatch(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   frame: PatternMatchEntry,
 ): Promise<void> {
-  stateFor(drainContext.sessionID).pendingPatternMatches.push(frame);
+  const state = stateFor(drainContext.sessionID);
+  // Dedup: see OpenCode equivalent. pattern_match beats task_exit; same
+  // reason: first wins.
+  const existingIdx = state.pendingPatternMatches.findIndex((m) => m.task_id === frame.task_id);
+  if (existingIdx >= 0) {
+    const existing = state.pendingPatternMatches[existingIdx];
+    if (existing.reason !== "pattern_match" && frame.reason === "pattern_match") {
+      state.pendingPatternMatches[existingIdx] = frame;
+    }
+  } else {
+    state.pendingPatternMatches.push(frame);
+  }
   await triggerWakeIfPending(drainContext, true);
 }
 
