@@ -288,6 +288,14 @@ impl DiagnosticsStore {
             .retain(|(stored_key, _), _| stored_key.kind != server);
     }
 
+    /// Drop one cached report for a specific server/file pair.
+    pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
+        let cache_key = (key.clone(), file.to_path_buf());
+        self.entries.remove(&cache_key);
+        self.order.retain(|entry_key| entry_key != &cache_key);
+        self.last_publish_at_for_file.remove(&cache_key);
+    }
+
     /// Drop all entries for a specific server instance.
     pub fn clear_for_server(&mut self, key: &ServerKey) {
         self.entries.retain(|(k, _), _| k != key);
@@ -527,6 +535,37 @@ mod tests {
         assert_eq!(messages.len(), 2, "both servers' reports preserved");
         assert!(messages.iter().any(|m| m == &"pyright says X"));
         assert!(messages.iter().any(|m| m == &"ty says Y"));
+    }
+
+    #[test]
+    fn clear_for_server_file_removes_only_exact_entry() {
+        let file_a = PathBuf::from("/tmp/a.rs");
+        let file_b = PathBuf::from("/tmp/b.rs");
+        let mut store = DiagnosticsStore::new();
+        let rust_key = server_key(ServerKind::Rust);
+        let py_key = server_key(ServerKind::Python);
+
+        store.publish(
+            rust_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 1, "rust a", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            rust_key.clone(),
+            file_b.clone(),
+            vec![diag("/tmp/b.rs", 1, "rust b", DiagnosticSeverity::Warning)],
+        );
+        store.publish(
+            py_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 2, "py a", DiagnosticSeverity::Warning)],
+        );
+
+        store.clear_for_server_file(&rust_key, &file_a);
+
+        assert!(!store.has_report_for_server_file(&rust_key, &file_a));
+        assert!(store.has_report_for_server_file(&rust_key, &file_b));
+        assert!(store.has_report_for_server_file(&py_key, &file_a));
     }
 
     #[test]

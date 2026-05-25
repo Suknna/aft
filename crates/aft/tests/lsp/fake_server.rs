@@ -406,6 +406,15 @@ fn main() -> io::Result<()> {
                         std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");
                     let force_error =
                         std::env::var("AFT_FAKE_LSP_PULL_ERROR").ok().as_deref() == Some("1");
+                    let force_method_not_found =
+                        std::env::var("AFT_FAKE_LSP_PULL_METHOD_NOT_FOUND")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                    let force_invalid_params = std::env::var("AFT_FAKE_LSP_PULL_INVALID_PARAMS")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
 
                     if std::env::var("AFT_FAKE_LSP_PULL_EXIT_MODULE_NOT_FOUND")
                         .ok()
@@ -419,7 +428,24 @@ fn main() -> io::Result<()> {
                         std::process::exit(1);
                     }
 
-                    if force_error {
+                    if force_method_not_found || force_invalid_params {
+                        let (code, message) = if force_method_not_found {
+                            (-32601, "fake-lsp: pull method not found")
+                        } else {
+                            (-32602, "fake-lsp: invalid pull params")
+                        };
+                        write_json_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": code,
+                                    "message": message
+                                }
+                            }),
+                        )?;
+                    } else if force_error {
                         write_json_message(
                             &mut writer,
                             &json!({

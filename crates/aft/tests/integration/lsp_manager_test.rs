@@ -166,6 +166,10 @@ while True:
                 "workspaceDiagnostics": True,
                 "identifier": "protocol-test",
             }
+        if mode == "static-watch":
+            capabilities["workspace"] = {
+                "didChangeWatchedFiles": {"watchers": [{"globPattern": "**/*"}]}
+            }
         response(message["id"], {"capabilities": capabilities})
     elif method == "initialized":
         if mode == "watch":
@@ -343,6 +347,58 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
         !client.supports_watched_files(),
         "missing explicit didChangeWatchedFiles capability should default to false"
     );
+}
+
+#[test]
+fn static_watched_file_capability_allows_notification_without_dynamic_registration() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let source = root.join("main.staticwatch");
+    let changed = root.join("config.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("marker.txt"), "marker\n").unwrap();
+    fs::write(&source, "content\n").unwrap();
+    fs::write(&changed, "{}\n").unwrap();
+
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "protocol-static-watch".to_string(),
+            extensions: vec!["staticwatch".to_string()],
+            binary: "protocol-static-watch".to_string(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    let server_kind = ServerKind::Custom(Arc::from("protocol-static-watch"));
+    let mut manager = LspManager::new();
+    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "static-watch");
+
+    let keys = manager.ensure_server_for_file(&source, &config);
+    assert_eq!(keys.len(), 1);
+    assert!(
+        manager
+            .client_for_file(&source, &config)
+            .expect("client")
+            .supports_watched_files(),
+        "initialize-time watched-file support should be captured"
+    );
+
+    manager
+        .notify_files_watched_changed(&[(changed, FileChangeType::CHANGED)], &config)
+        .expect("send watched-file change");
+
+    let watched = collect_optional_notification(
+        &mut manager,
+        "custom/watchedFilesChanged",
+        Duration::from_secs(2),
+    )
+    .expect("static watched-file support should receive notification");
+    assert_eq!(watched["changes"][0]["type"], 2);
 }
 
 #[test]

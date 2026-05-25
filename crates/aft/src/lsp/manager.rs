@@ -606,13 +606,17 @@ impl LspManager {
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                // Only send after the server dynamically registers interest.
-                // `workspace/didChangeWatchedFiles` is client-owned; a server's
-                // initialize-time dynamicRegistration shape is not a subscription.
-                if !client.has_watched_file_registration() {
+                // Send when the server either advertised initialize-time
+                // watched-file support or dynamically registered a watcher.
+                // The dynamic client capability we send during initialize only
+                // permits runtime registration; it is tracked separately via
+                // `has_watched_file_registration()`.
+                let supports_static_watched_files = client.supports_watched_files();
+                let has_dynamic_registration = client.has_watched_file_registration();
+                if !(supports_static_watched_files || has_dynamic_registration) {
                     if self.watched_file_skip_logged.insert(key.clone()) {
                         log::debug!(
-                            "skipping didChangeWatchedFiles for {:?} (not dynamically registered)",
+                            "skipping didChangeWatchedFiles for {:?} (not supported or registered)",
                             key
                         );
                     }
@@ -652,6 +656,8 @@ impl LspManager {
             if let Some(store) = self.documents.get_mut(&key) {
                 store.close(&canonical_path);
             }
+            self.diagnostics
+                .clear_for_server_file(&key, &canonical_path);
         }
 
         Ok(())
@@ -1059,6 +1065,17 @@ impl LspManager {
                         PullFileOutcome::RequestFailed {
                             reason: server_attempt_result_reason(&result),
                         }
+                    } else if recoverable_pull_rejection(&err)
+                        && self.clients.get(&key).is_some_and(|client| {
+                            matches!(
+                                client.state(),
+                                ServerState::Ready | ServerState::Initializing
+                            )
+                        })
+                    {
+                        PullFileOutcome::RequestFailed {
+                            reason: format!("pull_rejected_push_fallback: {err}"),
+                        }
                     } else {
                         PullFileOutcome::RequestFailed {
                             reason: err.to_string(),
@@ -1270,9 +1287,19 @@ impl LspManager {
                 }
             }
             lsp_types::DocumentDiagnosticReport::Unchanged(_unchanged) => {
-                // The server says cache is still valid. We don't refresh
-                // anything; the existing entry's diagnostics remain authoritative.
-                PullFileOutcome::Unchanged
+                // The server says cache is still valid. That is only usable if
+                // we already have a report for this exact server/file; an
+                // initial `unchanged` response cannot prove freshness.
+                if self
+                    .diagnostics
+                    .has_report_for_server_file(key, canonical_path)
+                {
+                    PullFileOutcome::Unchanged
+                } else {
+                    PullFileOutcome::RequestFailed {
+                        reason: "no_cache_for_unchanged".to_string(),
+                    }
+                }
             }
         }
     }
@@ -1484,6 +1511,16 @@ fn wait_for_stderr_tail(client: &mut LspClient) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn recoverable_pull_rejection(err: &LspError) -> bool {
+    matches!(
+        err,
+        LspError::ServerError {
+            code: -32601 | -32602,
+            ..
+        }
+    )
 }
 
 fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {

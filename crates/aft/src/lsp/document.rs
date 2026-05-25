@@ -3,9 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+const CONTENT_HASH_SIZE_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-document state tracked for LSP synchronization.
 ///
-/// We track `mtime` and `size` so we can detect when a file has been changed
+/// We track `mtime`, `size`, and (for small files) a content hash so we can
+/// detect when a file has been changed
 /// outside the AFT pipeline (another tool, another session, manual edit) and
 /// resync the LSP server before issuing diagnostic requests. Without this,
 /// `ensure_file_open` would skip already-open files and return diagnostics
@@ -22,6 +25,10 @@ pub struct DocumentEntry {
     /// Filesystem byte size at the moment we last synced. `None` for the
     /// same reasons as `mtime`.
     pub size: Option<u64>,
+    /// BLAKE3 content hash captured at the last sync for files up to
+    /// `CONTENT_HASH_SIZE_LIMIT_BYTES`. Large files skip hashing and rely on
+    /// `(mtime, size)` to avoid expensive reads.
+    pub content_hash: Option<[u8; 32]>,
 }
 
 /// Tracks document state for LSP synchronization.
@@ -31,7 +38,7 @@ pub struct DocumentEntry {
 /// 2. Version numbers must be monotonically increasing
 /// 3. Full content sent with each change (TextDocumentSyncKind::Full)
 ///
-/// This store ALSO records (mtime, size) at sync time so callers can detect
+/// This store ALSO records (mtime, size, content hash) at sync time so callers can detect
 /// disk drift via `is_stale_on_disk()` and resync stale entries before
 /// issuing pull-diagnostic requests against potentially stale server state.
 #[derive(Debug, Default)]
@@ -51,32 +58,34 @@ impl DocumentStore {
         self.entries.contains_key(path)
     }
 
-    /// Open a new document, recording the current on-disk metadata. Returns
+    /// Open a new document, recording the current on-disk metadata/hash. Returns
     /// the initial version (0). If the file's metadata cannot be read, the
     /// document is still tracked but `mtime`/`size` will be `None`, which
     /// causes `is_stale_on_disk()` to conservatively report stale on the
     /// next check (forcing a resync).
     pub fn open(&mut self, path: PathBuf) -> i32 {
-        let (mtime, size) = read_metadata(&path);
+        let (mtime, size, content_hash) = read_metadata_and_hash(&path);
         let entry = DocumentEntry {
             version: 0,
             mtime,
             size,
+            content_hash,
         };
         self.entries.insert(path, entry);
         0
     }
 
     /// Bump the version for an already-open document and refresh the
-    /// recorded mtime/size from disk (the caller is presumed to be sending
+    /// recorded mtime/size/hash from disk (the caller is presumed to be sending
     /// a `didChange` with fresh content right after this call). Returns the
     /// new version, or `None` if the document is not open.
     pub fn bump_version(&mut self, path: &Path) -> Option<i32> {
-        let (new_mtime, new_size) = read_metadata(path);
+        let (new_mtime, new_size, new_content_hash) = read_metadata_and_hash(path);
         let entry = self.entries.get_mut(path)?;
         entry.version += 1;
         entry.mtime = new_mtime;
         entry.size = new_size;
+        entry.content_hash = new_content_hash;
         Some(entry.version)
     }
 
@@ -116,14 +125,22 @@ impl DocumentStore {
             // stale assumptions.
             return true;
         };
-        let (current_mtime, current_size) = read_metadata(path);
+        let (current_mtime, current_size, current_content_hash) = read_metadata_and_hash(path);
 
         match (entry.mtime, current_mtime) {
             (Some(prev), Some(now)) if prev == now => {
-                // Same mtime — only stale if size somehow drifted (rare; a
-                // touch with same content but different length implies real
-                // drift even at same timestamp).
-                entry.size != current_size
+                if entry.size != current_size {
+                    return true;
+                }
+
+                match current_size {
+                    Some(size) if size > CONTENT_HASH_SIZE_LIMIT_BYTES => false,
+                    Some(_) => match (entry.content_hash, current_content_hash) {
+                        (Some(prev_hash), Some(now_hash)) => prev_hash != now_hash,
+                        _ => true,
+                    },
+                    None => true,
+                }
             }
             (Some(_), Some(_)) => true, // mtimes differ
             // Either we didn't record before or can't read now — be safe.
@@ -132,17 +149,25 @@ impl DocumentStore {
     }
 }
 
-/// Read filesystem metadata, returning `(mtime, size)`. Both fields are
-/// `None` if the path cannot be statted or if the platform doesn't support
-/// the queried metadata (rare).
-fn read_metadata(path: &Path) -> (Option<SystemTime>, Option<u64>) {
+/// Read filesystem metadata and, for small files, a BLAKE3 content hash.
+/// Metadata fields are `None` if the path cannot be statted or if the
+/// platform doesn't support the queried metadata (rare). The hash is `None`
+/// for unreadable files and files above `CONTENT_HASH_SIZE_LIMIT_BYTES`.
+fn read_metadata_and_hash(path: &Path) -> (Option<SystemTime>, Option<u64>, Option<[u8; 32]>) {
     match std::fs::metadata(path) {
         Ok(meta) => {
             let mtime = meta.modified().ok();
             let size = Some(meta.len());
-            (mtime, size)
+            let content_hash = if meta.len() <= CONTENT_HASH_SIZE_LIMIT_BYTES {
+                std::fs::read(path)
+                    .ok()
+                    .map(|bytes| *blake3::hash(&bytes).as_bytes())
+            } else {
+                None
+            };
+            (mtime, size, content_hash)
         }
-        Err(_) => (None, None),
+        Err(_) => (None, None, None),
     }
 }
 
@@ -233,6 +258,33 @@ mod tests {
     }
 
     #[test]
+    fn opened_file_same_size_and_mtime_but_different_hash_is_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("same-size.txt");
+        write_file(&path, "hello");
+        let original_mtime = fs::metadata(&path)
+            .expect("stat original")
+            .modified()
+            .expect("original mtime");
+
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        assert!(!store.is_stale_on_disk(&path));
+
+        write_file(&path, "jello");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .expect("restore original mtime");
+
+        assert!(
+            store.is_stale_on_disk(&path),
+            "same mtime+size should still be stale when content hash differs"
+        );
+
+        store.bump_version(&path);
+        assert!(!store.is_stale_on_disk(&path));
+    }
+
+    #[test]
     fn opened_file_then_deleted_is_stale() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("c.txt");
@@ -288,5 +340,6 @@ mod tests {
         assert_eq!(entry.version, 0);
         assert!(entry.mtime.is_some());
         assert_eq!(entry.size, Some(3));
+        assert!(entry.content_hash.is_some());
     }
 }

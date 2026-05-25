@@ -106,9 +106,9 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
-    /// Whether the server advertised `workspace.didChangeWatchedFiles` support
-    /// during `initialize`. When `false` (or `None` pre-init), we skip sending
-    /// `workspace/didChangeWatchedFiles` notifications to avoid spec violations.
+    /// Whether the server advertised static `workspace.didChangeWatchedFiles`
+    /// support during `initialize`. Dynamic registration is tracked separately
+    /// in `watched_file_registrations`; either path permits notifications.
     /// Intentional default: `false` (conservative — requires server opt-in).
     supports_watched_files: bool,
     /// Dynamic `workspace/didChangeWatchedFiles` registrations requested by
@@ -403,9 +403,11 @@ impl LspClient {
             .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
 
-        // Capture whether the server supports workspace/didChangeWatchedFiles.
-        // Missing capability is unsupported by default; callers must not send
-        // notifications unless the server explicitly opted in.
+        // Capture initialize-time (static) workspace/didChangeWatchedFiles
+        // support. Runtime client/registerCapability subscriptions are recorded
+        // separately by the reader thread. Missing capability is unsupported by
+        // default; callers must not send notifications unless one of those two
+        // server opt-in paths is present.
         self.supports_watched_files = caps_value
             .pointer("/workspace/didChangeWatchedFiles/dynamicRegistration")
             .and_then(|v| v.as_bool())
@@ -429,8 +431,9 @@ impl LspClient {
         self.diagnostic_caps.as_ref()
     }
 
-    /// Whether the server supports `workspace/didChangeWatchedFiles`.
-    /// Captured from the `initialize` response. Default `false` (conservative).
+    /// Whether the server advertised initialize-time
+    /// `workspace/didChangeWatchedFiles` support. Dynamic registrations are
+    /// reported by `has_watched_file_registration()`.
     pub fn supports_watched_files(&self) -> bool {
         self.supports_watched_files
     }

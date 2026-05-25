@@ -1316,6 +1316,103 @@ fn test_pull_diagnostics_falls_back_when_unsupported() {
     );
 }
 
+#[test]
+fn test_unchanged_pull_without_cache_falls_back_to_push() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_lsp();
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_UNCHANGED", "1");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-unchanged-no-cache",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 500
+    }))
+    .expect("request parses");
+
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+
+    assert_eq!(response["success"], true, "response: {response}");
+    assert_eq!(response["complete"], true, "response: {response}");
+    assert_eq!(
+        response["total"], 2,
+        "push fallback should return didOpen diagnostics"
+    );
+    assert_eq!(
+        response["lsp_servers_used"][0]["status"],
+        "pull_no_cache_for_unchanged"
+    );
+}
+
+fn assert_rejected_pull_falls_back_to_push(env_key: &str) {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_lsp();
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env(env_key, "1");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": format!("diag-rejected-{env_key}"),
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 500
+    }))
+    .expect("request parses");
+
+    let response =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+
+    assert_eq!(response["success"], true, "response: {response}");
+    assert_eq!(response["complete"], true, "response: {response}");
+    assert_eq!(
+        response["total"], 2,
+        "push fallback should return didOpen diagnostics"
+    );
+    assert_eq!(
+        response["lsp_servers_used"][0]["status"],
+        "pull_rejected_push_fallback"
+    );
+}
+
+#[test]
+fn test_method_not_found_pull_rejection_falls_back_to_push() {
+    assert_rejected_pull_falls_back_to_push("AFT_FAKE_LSP_PULL_METHOD_NOT_FOUND");
+}
+
+#[test]
+fn test_invalid_params_pull_rejection_falls_back_to_push() {
+    assert_rejected_pull_falls_back_to_push("AFT_FAKE_LSP_PULL_INVALID_PARAMS");
+}
+
+#[test]
+fn closing_file_clears_cached_diagnostics_before_reopen() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let mut manager = manager_with_fake_server();
+
+    manager
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("open file");
+    wait_for_publish(&mut manager);
+    assert_eq!(manager.get_diagnostics_for_file(file).len(), 2);
+
+    manager
+        .notify_file_changed_default(file, "fn main() { println!(\"changed\"); }\n")
+        .expect("change file");
+    wait_for_publish(&mut manager);
+    assert_eq!(manager.get_diagnostics_for_file(file).len(), 1);
+
+    manager.notify_file_closed(file).expect("close file");
+
+    assert!(
+        manager.get_diagnostics_for_file(file).is_empty(),
+        "close should clear cached diagnostics immediately, before any reopen"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Document staleness: didChange when disk content drifts
 // ────────────────────────────────────────────────────────────────────────────

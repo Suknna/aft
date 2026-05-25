@@ -203,6 +203,56 @@ fn test_read_malformed_header() {
 }
 
 #[test]
+fn test_read_content_type_without_charset() {
+    let json = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+    let payload = format!(
+        "Content-Type: application/vscode-jsonrpc\r\nContent-Length: {}\r\n\r\n{}",
+        json.len(),
+        json
+    )
+    .into_bytes();
+    let mut reader = Cursor::new(payload);
+
+    assert!(read_message(&mut reader).unwrap().is_some());
+}
+
+#[test]
+fn test_read_rejects_wrong_content_type_media() {
+    let json = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+    let payload = format!(
+        "Content-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+        json.len(),
+        json
+    )
+    .into_bytes();
+    let mut reader = Cursor::new(payload);
+
+    let error = read_message(&mut reader).expect_err("wrong media type should fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error
+        .to_string()
+        .contains("unsupported Content-Type media type"));
+}
+
+#[test]
+fn test_read_rejects_wrong_content_type_charset() {
+    let json = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+    let payload = format!(
+        "Content-Type: application/vscode-jsonrpc; charset=utf-16\r\nContent-Length: {}\r\n\r\n{}",
+        json.len(),
+        json
+    )
+    .into_bytes();
+    let mut reader = Cursor::new(payload);
+
+    let error = read_message(&mut reader).expect_err("wrong charset should fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error
+        .to_string()
+        .contains("unsupported Content-Type charset"));
+}
+
+#[test]
 fn test_read_extra_headers_ignored() {
     let json = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
     let payload = format!(

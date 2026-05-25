@@ -247,7 +247,7 @@ fn handle_file_mode(
     for entry in &server_status {
         match entry.status.as_str() {
             "pull_ok" | "pull_unchanged" => {}
-            "push_only" => {
+            "push_only" | "pull_rejected_push_fallback" | "pull_no_cache_for_unchanged" => {
                 let fresh = outcomes.successful.iter().any(|key| {
                     key.kind.id_str() == entry.server_id && proven_push_servers.contains(key)
                 });
@@ -429,10 +429,25 @@ fn wait_for_push(ctx: &AppContext, wait_ms: u64) {
 }
 
 fn needs_push_wait(pull_results: &[PullFileResult]) -> bool {
-    pull_results
-        .iter()
-        .any(|r| matches!(r.outcome, PullFileOutcome::PullNotSupported))
-        || pull_results.is_empty()
+    pull_results.iter().any(|r| match &r.outcome {
+        PullFileOutcome::PullNotSupported => true,
+        PullFileOutcome::RequestFailed { reason } => request_failure_needs_push(reason),
+        _ => false,
+    }) || pull_results.is_empty()
+}
+
+fn request_failure_needs_push(reason: &str) -> bool {
+    reason == "no_cache_for_unchanged" || reason.starts_with("pull_rejected_push_fallback:")
+}
+
+fn request_failure_status(reason: &str) -> String {
+    if reason == "no_cache_for_unchanged" {
+        "pull_no_cache_for_unchanged".to_string()
+    } else if reason.starts_with("pull_rejected_push_fallback:") {
+        "pull_rejected_push_fallback".to_string()
+    } else {
+        format!("pull_failed: {reason}")
+    }
 }
 
 fn update_status_with_pull(
@@ -456,7 +471,7 @@ fn update_status_with_pull(
             PullFileOutcome::Unchanged => "pull_unchanged".to_string(),
             PullFileOutcome::PullNotSupported => "push_only".to_string(),
             PullFileOutcome::PartialNotSupported => "pull_partial_skipped".to_string(),
-            PullFileOutcome::RequestFailed { reason } => format!("pull_failed: {reason}"),
+            PullFileOutcome::RequestFailed { reason } => request_failure_status(reason),
         };
     }
 }

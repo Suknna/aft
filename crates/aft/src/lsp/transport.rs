@@ -12,6 +12,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 /// Format: "Content-Length: N\r\n\r\n{json body of N bytes}"
 pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<ServerMessage>> {
     let mut content_length = None;
+    let mut content_type = None;
     let mut saw_header = false;
 
     loop {
@@ -57,7 +58,13 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<ServerMessag
             }
 
             content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("Content-Type") {
+            content_type = Some(value.trim().to_string());
         }
+    }
+
+    if let Some(content_type) = content_type {
+        validate_content_type(&content_type)?;
     }
 
     let content_length =
@@ -81,6 +88,32 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<ServerMessag
     ServerMessage::from_json(&json)
         .map(Some)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn validate_content_type(value: &str) -> io::Result<()> {
+    let mut parts = value.split(';');
+    let media_type = parts.next().unwrap_or_default().trim();
+    if !media_type.eq_ignore_ascii_case("application/vscode-jsonrpc") {
+        return Err(invalid_data(format!(
+            "unsupported Content-Type media type: {media_type}"
+        )));
+    }
+
+    for parameter in parts {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("charset") {
+            let charset = raw_value.trim().trim_matches('"');
+            if !charset.eq_ignore_ascii_case("utf-8") {
+                return Err(invalid_data(format!(
+                    "unsupported Content-Type charset: {charset}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn write_message(writer: &mut impl Write, payload: &str) -> io::Result<()> {
