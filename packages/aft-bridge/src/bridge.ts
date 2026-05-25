@@ -888,6 +888,17 @@ export class BinaryBridge {
       ...(envPath ? { PATH: envPath } : {}),
     };
 
+    // Diagnostic: prove the spawnProcess code path executes and what
+    // useFastembedBackend / parent ORT_DYLIB_PATH look like at spawn time.
+    // The E2E harness asserts ORT_DYLIB_PATH propagation through plugin log;
+    // earlier targeted log lines never appeared in CI runs even though the
+    // dist contained them, so this unconditional marker proves whether the
+    // code path is reached at all.
+    this.logVia(
+      `bridge.spawnProcess: useFastembedBackend=${useFastembedBackend}, ` +
+        `parentORT=${process.env.ORT_DYLIB_PATH ?? "(unset)"}, ` +
+        `ortLibraryPath=${ortLibraryPath ?? "(none)"}`,
+    );
     if (useFastembedBackend) {
       // Store fastembed model files alongside the semantic index, not the project cwd.
       // This is only relevant when the fastembed backend is selected.
