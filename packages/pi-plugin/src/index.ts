@@ -17,7 +17,7 @@
  *   - aft_outline    Structural outline (symbols, headings) for files/URLs
  *   - aft_zoom       Symbol-level inspection with call-graph annotations
  *   - aft_search     Semantic search (when semantic_search=true)
- *   - aft_navigate   Call-graph navigation (callers, call_tree, impact, trace_to, trace_data)
+ *   - aft_navigate   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
  *   - aft_conflicts  One-call merge conflict inspection
  *   - aft_import     Language-aware import add/remove/organize
  *   - aft_safety     Per-file undo, checkpoints, restore

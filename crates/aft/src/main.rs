@@ -462,6 +462,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
+        "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
         "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),

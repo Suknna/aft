@@ -50,6 +50,7 @@ pub mod state;
 pub mod status;
 pub mod trace_data;
 pub mod trace_to;
+pub mod trace_to_symbol;
 pub mod transaction;
 pub mod trust_filter_project;
 pub mod undo;

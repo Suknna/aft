@@ -232,7 +232,7 @@ export const AftConfigSchema = z
     semantic: SemanticConfigSchema.optional(),
     /**
      * Maximum source files allowed for call-graph operations (callers, trace_to,
-     * trace_data, impact). Projects above this size return `project_too_large`
+     * trace_to_symbol, trace_data, impact). Projects above this size return `project_too_large`
      * instead of attempting the reverse-index build. Does not affect grep,
      * glob, read, edit, or any other tool. Default: 5000.
      */

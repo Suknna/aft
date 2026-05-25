@@ -5,7 +5,7 @@
 //! detection.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -58,6 +58,10 @@ fn symbol_identity(symbol: &Symbol) -> String {
 
 fn symbol_unqualified_name(symbol: &str) -> &str {
     symbol.rsplit("::").next().unwrap_or(symbol)
+}
+
+fn symbol_query_matches(symbol: &str, query: &str) -> bool {
+    symbol == query || symbol_unqualified_name(symbol) == query
 }
 
 fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
@@ -369,6 +373,38 @@ pub struct TraceToResult {
     pub max_depth_reached: bool,
     /// Number of paths that reached a dead end (no callers, not entry point).
     pub truncated_paths: usize,
+}
+
+/// A single hop in a `trace_to_symbol` path.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolHop {
+    /// Symbol name at this hop.
+    pub symbol: String,
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Candidate target location for an ambiguous `trace_to_symbol` request.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolCandidate {
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Result of a `trace_to_symbol` query.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolResult {
+    /// Shortest path from the origin symbol to the target symbol, if found.
+    pub path: Option<Vec<TraceToSymbolHop>>,
+    /// Whether traversal was complete within the requested depth.
+    pub complete: bool,
+    /// Machine-readable explanation when `path` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,12 +1115,9 @@ impl CallGraph {
             .count()
     }
 
-    /// Build the reverse index by scanning all project files.
-    ///
-    /// For each file, builds the call data (if not cached), then for each
-    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
-    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
-    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+    /// Build call data for all project files, failing fast when the configured
+    /// source-file cap is exceeded.
+    fn ensure_project_files_built(&mut self, max_files: usize) -> Result<(), AftError> {
         // Bounded count first — never populate project_files on oversized roots.
         // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
         // iterator), so this costs at most (max_files + 1) directory entries
@@ -1099,10 +1132,10 @@ impl CallGraph {
 
         // TODO(v0.16): rust-side deadline for graceful timeout recovery
         // (unbounded walks remain a soft cliff for users who raise the cap).
-        // Discover all project files first
+        // Discover all project files first.
         let all_files = self.project_files().to_vec();
 
-        // Build file data for all project files
+        // Build file data for all project files.
         let uncached_files: Vec<PathBuf> = all_files
             .iter()
             .filter(|f| self.lookup_file_data(f).is_none())
@@ -1117,6 +1150,18 @@ impl CallGraph {
         for (file, data) in computed {
             self.data.insert(file, data);
         }
+
+        Ok(())
+    }
+
+    /// Build the reverse index by scanning all project files.
+    ///
+    /// For each file, builds the call data (if not cached), then for each
+    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
+    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
+    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+        self.ensure_project_files_built(max_files)?;
+        let all_files = self.project_files().to_vec();
 
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
@@ -1514,6 +1559,253 @@ impl CallGraph {
             max_depth_reached,
             truncated_paths,
         })
+    }
+
+    /// Find all files that define a symbol matching a `trace_to_symbol` target query.
+    ///
+    /// The result is de-duplicated by file because `toFile` is only required
+    /// when a target symbol name exists in multiple files.
+    pub fn trace_to_symbol_candidates(
+        &mut self,
+        to_symbol: &str,
+        max_files: usize,
+    ) -> Result<Vec<TraceToSymbolCandidate>, AftError> {
+        self.ensure_project_files_built(max_files)?;
+
+        let mut candidates_by_file: HashMap<PathBuf, u32> = HashMap::new();
+        let all_files = self.project_files().to_vec();
+
+        for file in all_files {
+            let canon = self.canonicalize(&file)?;
+            let Some(file_data) = self
+                .lookup_file_data(&canon)
+                .or_else(|| self.lookup_file_data(&file))
+            else {
+                continue;
+            };
+
+            let symbol_candidates = symbol_query_candidates(file_data, to_symbol);
+            if symbol_candidates.is_empty() {
+                continue;
+            }
+
+            let line = symbol_candidates
+                .iter()
+                .filter_map(|symbol| file_data.symbol_metadata.get(symbol).map(|meta| meta.line))
+                .min()
+                .unwrap_or(1);
+
+            candidates_by_file
+                .entry(canon)
+                .and_modify(|existing| *existing = (*existing).min(line))
+                .or_insert(line);
+        }
+
+        let mut candidates: Vec<TraceToSymbolCandidate> = candidates_by_file
+            .into_iter()
+            .map(|(file, line)| TraceToSymbolCandidate {
+                file: self.relative_path(&file),
+                line,
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        Ok(candidates)
+    }
+
+    /// Find the shortest forward call path from one symbol to another symbol.
+    ///
+    /// Performs breadth-first traversal over resolved call edges. A global
+    /// `(file, symbol)` visited set keeps cycles finite while preserving BFS's
+    /// shortest-path guarantee.
+    pub fn trace_to_symbol(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+        max_files: usize,
+    ) -> Result<TraceToSymbolResult, AftError> {
+        let canon = self.canonicalize(file)?;
+
+        // Ensure the origin file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
+
+        self.ensure_project_files_built(max_files)?;
+
+        let target_file = to_file.map(|path| self.canonicalize(path)).transpose()?;
+        let effective_max = if max_depth == 0 {
+            10
+        } else {
+            max_depth.min(16)
+        };
+
+        let start_hop = self.trace_to_symbol_hop(&canon, &resolved_symbol);
+        if Self::trace_to_symbol_matches_target(&canon, &resolved_symbol, to_symbol, &target_file) {
+            return Ok(TraceToSymbolResult {
+                path: Some(vec![start_hop]),
+                complete: true,
+                reason: None,
+            });
+        }
+
+        let mut queue: VecDeque<(PathBuf, String, Vec<TraceToSymbolHop>, usize)> = VecDeque::new();
+        queue.push_back((canon.clone(), resolved_symbol.clone(), vec![start_hop], 0));
+
+        let mut visited: HashSet<(PathBuf, String)> = HashSet::new();
+        visited.insert((canon, resolved_symbol));
+        let mut max_depth_exhausted = false;
+
+        while let Some((current_file, current_symbol, path, depth)) = queue.pop_front() {
+            let callees = self.forward_resolved_callees(&current_file, &current_symbol)?;
+
+            if depth >= effective_max {
+                if callees
+                    .iter()
+                    .any(|(file, symbol)| !visited.contains(&(file.clone(), symbol.clone())))
+                {
+                    max_depth_exhausted = true;
+                }
+                continue;
+            }
+
+            for (callee_file, callee_symbol) in callees {
+                let visit_key = (callee_file.clone(), callee_symbol.clone());
+                if !visited.insert(visit_key) {
+                    continue;
+                }
+
+                let mut next_path = path.clone();
+                next_path.push(self.trace_to_symbol_hop(&callee_file, &callee_symbol));
+
+                if Self::trace_to_symbol_matches_target(
+                    &callee_file,
+                    &callee_symbol,
+                    to_symbol,
+                    &target_file,
+                ) {
+                    return Ok(TraceToSymbolResult {
+                        path: Some(next_path),
+                        complete: true,
+                        reason: None,
+                    });
+                }
+
+                queue.push_back((callee_file, callee_symbol, next_path, depth + 1));
+            }
+        }
+
+        if max_depth_exhausted {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: false,
+                reason: Some("max_depth_exhausted".to_string()),
+            })
+        } else {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: true,
+                reason: Some("no_path_found".to_string()),
+            })
+        }
+    }
+
+    fn trace_to_symbol_matches_target(
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: &Option<PathBuf>,
+    ) -> bool {
+        if !symbol_query_matches(symbol, to_symbol) {
+            return false;
+        }
+
+        if let Some(target_file) = to_file {
+            file == target_file
+        } else {
+            true
+        }
+    }
+
+    fn trace_to_symbol_hop(&self, file: &Path, symbol: &str) -> TraceToSymbolHop {
+        let (line, _) = self
+            .lookup_file_data(file)
+            .map(|data| get_symbol_meta_from_data(data, symbol))
+            .unwrap_or_else(|| get_symbol_meta(file, symbol));
+
+        TraceToSymbolHop {
+            symbol: symbol.to_string(),
+            file: self.relative_path(file),
+            line,
+        }
+    }
+
+    fn forward_resolved_callees(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+    ) -> Result<Vec<(PathBuf, String)>, AftError> {
+        let canon = self.canonicalize(file)?;
+        let (import_block, call_sites) = {
+            let file_data = self.build_file(&canon)?;
+            (
+                file_data.import_block.clone(),
+                file_data
+                    .calls_by_symbol
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+
+        let mut callees = Vec::new();
+        for call_site in call_sites {
+            let edge = self.resolve_cross_file_edge(
+                &call_site.full_callee,
+                &call_site.callee_name,
+                &canon,
+                &import_block,
+            );
+
+            match edge {
+                EdgeResolution::Resolved {
+                    file: target_file,
+                    symbol: target_symbol,
+                } => {
+                    let target_canon = self.canonicalize(&target_file)?;
+                    if self.build_file(&target_canon).is_err() {
+                        continue;
+                    }
+
+                    let resolved_target_symbol = self
+                        .lookup_file_data(&target_canon)
+                        .and_then(|data| {
+                            resolve_symbol_query_in_data(data, &target_canon, &target_symbol).ok()
+                        })
+                        .unwrap_or(target_symbol);
+
+                    callees.push((target_canon, resolved_target_symbol));
+                }
+                EdgeResolution::Unresolved { callee_name } => {
+                    if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                        continue;
+                    }
+
+                    let local_symbol = self.lookup_file_data(&canon).and_then(|data| {
+                        resolve_symbol_query_in_data(data, &canon, &callee_name).ok()
+                    });
+
+                    if let Some(local_symbol) = local_symbol {
+                        callees.push((canon.clone(), local_symbol));
+                    }
+                }
+            }
+        }
+
+        Ok(callees)
     }
 
     /// Impact analysis: enriched callers query.

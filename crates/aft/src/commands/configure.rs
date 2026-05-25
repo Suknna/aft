@@ -1308,7 +1308,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     if exceeds {
         slog_warn!(
-            "project has >{} source files. Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
+            "project has >{} source files. Call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
             max_callgraph_files
         );
     }

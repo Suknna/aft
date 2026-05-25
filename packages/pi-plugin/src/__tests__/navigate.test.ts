@@ -60,4 +60,34 @@ describe("aft_navigate adapter", () => {
     expect(calls[0].command).toBe("trace_data");
     expect(calls[0].params).toMatchObject({ expression: "config.apiKey" });
   });
+  test("trace_to_symbol requires and forwards target fields", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    registerNavigateTool(api, makePluginContext(bridge));
+
+    await expect(
+      executeTool(tools.get("aft_navigate")!, {
+        op: "trace_to_symbol",
+        filePath: "src/app.ts",
+        symbol: "run",
+      }),
+    ).rejects.toThrow("toSymbol");
+
+    await executeTool(tools.get("aft_navigate")!, {
+      op: "trace_to_symbol",
+      filePath: "src/app.ts",
+      symbol: "run",
+      toSymbol: "target",
+      toFile: "src/target.ts",
+      depth: 3,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("trace_to_symbol");
+    expect(calls[0].params).toMatchObject({
+      toSymbol: "target",
+      toFile: "src/target.ts",
+      depth: 3,
+    });
+  });
 });

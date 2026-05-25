@@ -1,6 +1,6 @@
 /**
  * aft_navigate — call-graph navigation across files.
- * Ops: call_tree, callers, trace_to, impact, trace_data.
+ * Ops: call_tree, callers, trace_to, trace_to_symbol, impact, trace_data.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -25,14 +25,28 @@ import {
 
 function navigateParamsSchema() {
   return Type.Object({
-    op: StringEnum(["call_tree", "callers", "trace_to", "impact", "trace_data"] as const, {
-      description: "Navigation operation",
-    }),
+    op: StringEnum(
+      ["call_tree", "callers", "trace_to", "trace_to_symbol", "impact", "trace_data"] as const,
+      {
+        description: "Navigation operation",
+      },
+    ),
     filePath: Type.String({ description: "Source file containing the symbol" }),
     symbol: Type.String({ description: "Name of the symbol to analyze" }),
     depth: optionalInt(1, Number.MAX_SAFE_INTEGER),
     expression: Type.Optional(
       Type.String({ description: "Expression to track (required for trace_data)" }),
+    ),
+    toSymbol: Type.Optional(
+      Type.String({
+        description: "Target symbol for trace_to_symbol; the returned path ends here",
+      }),
+    ),
+    toFile: Type.Optional(
+      Type.String({
+        description:
+          "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
+      }),
     ),
   });
 }
@@ -118,6 +132,27 @@ export function buildNavigateSections(
     return sections;
   }
 
+  if (args.op === "trace_to_symbol") {
+    const path = asRecords(response.path);
+    const complete = asBoolean(response.complete);
+    const reason = asString(response.reason);
+    if (path.length === 0) {
+      const prefix =
+        complete === false ? theme.fg("warning", "No complete path") : theme.fg("muted", "No path");
+      return [`${prefix}${reason ? ` (${reason})` : ""}`];
+    }
+    const lines = [theme.fg("success", `${path.length} hop${path.length === 1 ? "" : "s"}`)];
+    path.forEach((hop, index) => {
+      const symbol = asString(hop.symbol) ?? "(unknown)";
+      const file = shortenPath(asString(hop.file) ?? "(unknown file)");
+      const line = asNumber(hop.line);
+      lines.push(
+        treeLine(index + 1, `${symbol} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}`),
+      );
+    });
+    return lines;
+  }
+
   if (args.op === "trace_to") {
     const paths = asRecords(response.paths);
     const warning = depthWarning(response, theme, "max_depth_reached", "truncated_paths");
@@ -190,6 +225,7 @@ export function renderNavigateCall(args: NavigateArgs, theme: Theme, context: Re
     theme.fg("accent", args.op),
     accentPath(theme, args.filePath),
     theme.fg("toolOutput", args.symbol),
+    args.toSymbol ? theme.fg("toolOutput", `→ ${args.toSymbol}`) : undefined,
   ]
     .filter(Boolean)
     .join(" ");
@@ -215,11 +251,14 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_navigate",
     label: "navigate",
     description:
-      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `impact` for blast radius, `trace_data` to follow a value.",
+      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `trace_to_symbol` for a path from one symbol to another, `impact` for blast radius, `trace_data` to follow a value.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (params.op === "trace_data" && !params.expression) {
         throw new Error("op='trace_data' requires an `expression`");
+      }
+      if (params.op === "trace_to_symbol" && !params.toSymbol) {
+        throw new Error("op='trace_to_symbol' requires a `toSymbol`");
       }
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = {
@@ -230,6 +269,8 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       const depth = coerceOptionalInt(params.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
       if (depth !== undefined) req.depth = depth;
       if (params.expression !== undefined) req.expression = params.expression;
+      if (params.toSymbol !== undefined) req.toSymbol = params.toSymbol;
+      if (params.toFile !== undefined) req.toFile = params.toFile;
       const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

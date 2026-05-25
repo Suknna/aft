@@ -241,7 +241,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
         );
         assert_eq!(err.code(), "project_too_large");
     }
