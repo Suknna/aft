@@ -556,7 +556,14 @@ mod tests {
     use std::fs;
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("aft_checkpoint_tests");
+        // Per-test-name + per-process subdirectory so parallel test threads (and
+        // re-runs that overlap with stale state) never share the same file
+        // path. Previously every test used /tmp/aft_checkpoint_tests/<name>,
+        // which caused sessions_isolate_checkpoint_names to flake under
+        // `cargo test --release` parallel execution.
+        let dir = std::env::temp_dir()
+            .join("aft_checkpoint_tests")
+            .join(format!("{}-{}", std::process::id(), name));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, content).unwrap();
