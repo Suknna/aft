@@ -124,7 +124,9 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       const taskId = resultDetails(bashEnd).task_id;
       expect(taskId).toEqual(expect.stringMatching(BASH_TASK_ID));
       expect(resultText(bashEnd)).toContain(`Background task started: ${taskId}`);
-      await client.waitForEvent((event) => event.type === "agent_end", 60_000);
+      // 90s budget: macOS CI runners under load can take >60s for the
+      // post-tool agent_end (model emits followup + Pi flushes).
+      await client.waitForEvent((event) => event.type === "agent_end", 90_000);
 
       aimock.registerToolCallFixture({
         predicate: (request) =>
