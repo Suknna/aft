@@ -1208,6 +1208,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
+    if let Some(raw) = params.get("url_fetch_allow_private") {
+        let Some(value) = raw.as_bool() else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "configure: url_fetch_allow_private must be a boolean",
+            );
+        };
+        next_config.url_fetch_allow_private = value;
+    }
     if let Some(v) = params.get("semantic") {
         next_config.semantic = match parse_semantic_config(v, &next_config.semantic) {
             Ok(config) => config,
@@ -1363,6 +1373,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    match crate::url_fetch::cleanup_url_cache(&storage_root) {
+        Ok(0) => {}
+        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+    }
     let db_path = storage_root.join("aft.db");
     match crate::db::open(&db_path) {
         Ok(conn) => {

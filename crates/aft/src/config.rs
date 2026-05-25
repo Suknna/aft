@@ -169,6 +169,9 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// Allow URL-fetch commands to access private network hosts.
+    /// Default false; hosting plugins only forward this from user-level config.
+    pub url_fetch_allow_private: bool,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
     pub harness: Option<Harness>,
@@ -232,6 +235,7 @@ impl Default for Config {
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
+            url_fetch_allow_private: false,
             harness: None,
             diagnostic_cache_size: 5000,
         }

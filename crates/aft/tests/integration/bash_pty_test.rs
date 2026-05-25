@@ -6,7 +6,7 @@ use aft::bash_background::persistence::{
     task_bundle_files, task_paths, write_task, BgMode, PersistedTask, SCHEMA_VERSION,
 };
 use aft::bash_background::pty_runtime::CompletionCoordinator;
-use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
+use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
 use serde_json::json;
 
 const SESSION: &str = "pty-phase-1a";
@@ -64,6 +64,21 @@ fn wait_for_status(
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "timed out waiting for {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_completion(registry: &BgTaskRegistry, task_id: &str) -> BgCompletion {
+    let started = Instant::now();
+    loop {
+        let completions = registry.drain_completions_for_session(Some(SESSION));
+        if let Some(completion) = completions.into_iter().find(|c| c.task_id == task_id) {
+            return completion;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for completion for {task_id}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -808,8 +823,7 @@ fn pty_completion_preview_is_empty() {
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
 
-    let completions = registry.drain_completions_for_session(Some(SESSION));
-    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    let completion = wait_for_completion(&registry, &task_id);
     assert_eq!(completion.output_preview, "");
     assert!(!completion.output_truncated);
 }
@@ -828,8 +842,7 @@ fn pty_completion_token_counts_returns_skipped_sentinel() {
     );
     wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
 
-    let completions = registry.drain_completions_for_session(Some(SESSION));
-    let completion = completions.iter().find(|c| c.task_id == task_id).unwrap();
+    let completion = wait_for_completion(&registry, &task_id);
     assert_eq!(completion.original_tokens, None);
     assert_eq!(completion.compressed_tokens, None);
     assert!(completion.tokens_skipped);

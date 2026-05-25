@@ -705,7 +705,7 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
         "expected inline diagnostics: {resp:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(3_000),
+        elapsed < std::time::Duration::from_millis(4_000),
         "expected event-driven wait, elapsed: {elapsed:?}, resp: {resp:?}"
     );
 

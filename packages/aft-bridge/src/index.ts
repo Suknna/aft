@@ -69,8 +69,6 @@ export type {
   StatusResponse,
 } from "./protocol.js";
 export { findBinary, findBinarySync, platformKey } from "./resolver.js";
-// --- URL fetch (shared by aft_outline / aft_zoom URL targets) ---
-export { _isPrivateIpv4, cleanupUrlCache, fetchUrlToTempFile } from "./url-fetch.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type { ZoomResponseLike } from "./zoom-format.js";
 export { formatZoomText } from "./zoom-format.js";

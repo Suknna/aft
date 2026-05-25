@@ -161,15 +161,9 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
 });
 
 /**
- * URL-mode coverage. These are critical because they exercise undici's
- * `connect.lookup` callback under the actual Node runtime — exactly the path
- * that surfaced as `ERR_INVALID_IP_ADDRESS: Invalid IP address: undefined`
- * when the dispatcher's pinned-DNS callback was called with the legacy
- * 3-arg `(err, address, family)` shape against a Node 18+ connector that
- * passes `opts.all: true` and expects `(err, [{address, family}])`.
- *
- * The mock server binds to 127.0.0.1, so we need `url_fetch_allow_private`
- * to bypass the SSRF guard.
+ * URL-mode coverage. These exercise the plugin → Rust pass-through path: Rust
+ * owns SSRF validation, fetching, and disk cache lookup. The mock server binds
+ * to 127.0.0.1, so we need `url_fetch_allow_private` to bypass the SSRF guard.
  */
 const urlMaybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
 
@@ -243,10 +237,7 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
     });
     const text = harness.text(result);
 
-    // This is the test that locks in the Node-runtime fetch fix. Before the
-    // dual-shape lookup callback was added, this call surfaced as
-    // `ERR_INVALID_IP_ADDRESS: Invalid IP address: undefined` from
-    // net:emitLookup under Node 18+.
+    // Locks in URL pass-through to Rust fetch/cache.
     expect(text).toContain("Test Document");
     expect(text).toContain("Section A");
     expect(text).toContain("Section B");

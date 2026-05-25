@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { fetchUrlToTempFile, formatZoomText } from "@cortexkit/aft-bridge";
+import { formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -47,16 +47,13 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           (target.startsWith("http://") || target.startsWith("https://"));
         const isArray = Array.isArray(target) && target.length > 0;
 
-        // URL mode: fetch to temp file, then outline the cached copy
+        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
         if (hasUrl) {
-          const cachedPath = await fetchUrlToTempFile(target as string, ctx.storageDir, {
-            allowPrivate: ctx.config.url_fetch_allow_private === true,
-          });
-          const response = await callBridge(ctx, context, "outline", { file: cachedPath });
+          const response = await callBridge(ctx, context, "outline", { file: target });
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
           }
-          return response.text as string;
+          return formatOutlineText(response);
         }
 
         // Multi-file mode
@@ -139,12 +136,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
         }
 
-        // URL mode: fetch to temp file, then zoom into the cached copy
-        const file = hasUrl
-          ? await fetchUrlToTempFile(args.url as string, ctx.storageDir, {
-              allowPrivate: ctx.config.url_fetch_allow_private === true,
-            })
-          : (args.filePath as string);
+        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
+        const file = hasUrl ? (args.url as string) : (args.filePath as string);
 
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? (args.url as string) : (args.filePath as string)) ?? file;

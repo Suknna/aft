@@ -3,7 +3,6 @@ import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import {
   BridgePool,
-  cleanupUrlCache,
   ensureBinary,
   ensureOnnxRuntime,
   ensureStorageMigrated,
@@ -256,6 +255,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...resolveProjectOverridesForConfigure(aftConfig),
     bash_permissions: true,
   };
+  // url_fetch_allow_private is user-config only (project config is stripped in loadAftConfig).
+  if (aftConfig.url_fetch_allow_private !== undefined) {
+    configOverrides.url_fetch_allow_private = aftConfig.url_fetch_allow_private;
+  }
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -758,13 +761,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   });
 
   rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
-
-  // Periodic URL cache cleanup (fire-and-forget, removes entries older than 24 hours)
-  try {
-    cleanupUrlCache(storageDir);
-  } catch {
-    // best-effort
-  }
 
   try {
     ensureTuiPluginEntry();

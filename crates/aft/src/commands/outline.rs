@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -8,6 +8,7 @@ use crate::error::AftError;
 use crate::parser::detect_language;
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
+use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -93,7 +94,12 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Single-file mode (original behavior)
-    let file = match req.params.get("file").and_then(|v| v.as_str()) {
+    let file = match req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("target"))
+        .and_then(|v| v.as_str())
+    {
         Some(f) => f,
         None => {
             return Response::error(
@@ -104,7 +110,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+    let path = match resolve_file_or_url(req, ctx, file) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
@@ -134,6 +140,33 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         serde_json::json!({ "text": text, "complete": true }),
     )
+}
+
+fn resolve_file_or_url(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+) -> Result<PathBuf, Response> {
+    if is_http_url(file) {
+        let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let allow_private = ctx.config().url_fetch_allow_private
+            || req
+                .params
+                .get("allow_private")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        return fetch_url_to_cache(
+            file,
+            &storage_dir,
+            UrlFetchOptions {
+                allow_private,
+                ..UrlFetchOptions::default()
+            },
+        )
+        .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
+    }
+
+    ctx.validate_path(&req.id, Path::new(file))
 }
 
 /// Build a nested outline tree from a flat symbol list.
