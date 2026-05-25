@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
-import { getLiveServerClient, useLiveServerWake } from "./shared/live-server-client.js";
+import {
+  getLiveServerClient,
+  setLiveServerWakeAvailable,
+  useLiveServerWake,
+} from "./shared/live-server-client.js";
 import type { PluginContext } from "./types.js";
 
 /**
@@ -43,6 +47,8 @@ export interface PatternMatchEntry {
   context: string;
   once: boolean;
   reason?: "pattern_match" | "task_exit";
+  /** Ack the underlying bash completion after this task-exit reminder is delivered. */
+  ackCompletionOnDelivery?: boolean;
 }
 
 export interface BgLongRunningReminder {
@@ -280,7 +286,7 @@ export function markExplicitControl(
   if (idx >= 0) {
     const completion = state.pendingCompletions[idx];
     state.pendingCompletions.splice(idx, 1);
-    queuePendingPatternMatch(state, completionToExitPattern(completion));
+    queuePendingPatternMatch(state, completionToExitPattern(completion, true));
     state.wakeDeferredTaskIds.delete(taskId);
   }
 }
@@ -317,7 +323,7 @@ function routeExplicitControlCompletions(state: SessionBgState): void {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
       state.wakeDeferredTaskIds.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
     } else {
       remaining.push(completion);
     }
@@ -354,7 +360,7 @@ export function ingestBgCompletions(
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
       continue;
     }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
@@ -424,6 +430,8 @@ export async function appendInTurnBgCompletions(
     return;
 
   const deliveredCompletions = [...state.pendingCompletions];
+  const deliveredPatternMatches = [...state.pendingPatternMatches];
+  const completionAcks = completionAcksForDelivery(deliveredCompletions, deliveredPatternMatches);
   const reminder = formatCombinedSystemReminder(
     state.pendingCompletions,
     state.pendingLongRunning,
@@ -449,7 +457,7 @@ export async function appendInTurnBgCompletions(
   state.pendingPatternMatches = [];
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
-  await ackCompletions(drainContext, deliveredCompletions);
+  await ackCompletions(drainContext, completionAcks);
   // Cancel any pending debounced wake — its captured pendingCompletions /
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body system-reminder ("[BACKGROUND BASH STILL RUNNING]"
@@ -497,36 +505,13 @@ async function triggerWakeIfPending(
   scheduleWake(
     state,
     async (reminder, deliveredCompletions) => {
-      // Wake transport selection (per-process decision, set once at plugin
-      // init via `setLiveServerWakeAvailable()`):
-      //
-      //   • `useLiveServerWake() === true`  — live HTTP listener was
-      //     reachable when probed at startup. Build a separate
-      //     `createOpencodeClient` pointed at `input.serverUrl` so requests
-      //     hit the same Effect memoMap as the live UI. This works around
-      //     the promptAsync runner-split bug (anomalyco/opencode#28202).
-      //
-      //   • `useLiveServerWake() === false` — listener was unreachable
-      //     (typically plain TUI started without `opencode --port 0`).
-      //     Fall back to `drainContext.client.session.promptAsync`. This
-      //     accepts the upstream duplicate-runner bug in exchange for
-      //     wakes still arriving at all instead of throwing each turn.
-      //
-      // The choice is logged via `wake_client_path` so post-mortem can
-      // tell which transport delivered each wake.
-      let client: OpenCodeClient;
-      let clientPath: "live-server" | "in-process-fallback";
-      if (useLiveServerWake() && drainContext.serverUrl) {
-        client = getLiveServerClient(
-          drainContext.serverUrl,
-          drainContext.directory,
-        ) as OpenCodeClient;
-        clientPath = "live-server";
-      } else {
+      const taskIDs = deliveredCompletions.map((completion) => completion.task_id);
+
+      const getInProcessClient = (): OpenCodeClient => {
         if (!drainContext.client) {
           sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake client unavailable`, {
             event: "bash_completion_wake_client_unavailable",
-            task_ids: deliveredCompletions.map((c) => c.task_id),
+            task_ids: taskIDs,
             directory: drainContext.directory,
             attempt: state.wakeRetryAttempts + 1,
           });
@@ -536,106 +521,159 @@ async function triggerWakeIfPending(
         }
         // Cast the unknown `input.client` (real SDK shape with a generated
         // narrower promptAsync signature) to the loose structural shape
-        // the wake closure uses. The runtime check on
-        // `client.session?.promptAsync` below confirms shape before use.
-        client = drainContext.client as OpenCodeClient;
-        clientPath = "in-process-fallback";
-      }
-      if (typeof client.session?.promptAsync !== "function") {
-        throw new Error(`wake client.session.promptAsync is unavailable (path=${clientPath})`);
-      }
-      // Pass the previous turn's prompt context (agent + model + variant)
-      // explicitly. OpenCode's `createUserMessage` resolves variant
-      // relative to the chosen agent's model — passing model alone makes
-      // OpenCode pick the default agent and its model match check fails,
-      // bypassing our variant. This call uses noReply: false so it DOES
-      // trigger an assistant turn — preserving cache here matters.
-      // Mirrors the resolution `opencode-xtra` uses for its
-      // background-agent notifications. See shared/last-assistant-model.ts.
-      const promptContext = await resolvePromptContext(client, drainContext.sessionID);
-      const body: Record<string, unknown> = {
-        noReply: false,
-        parts: [{ type: "text", text: reminder }],
+        // the wake closure uses. The runtime check in `sendPrompt` confirms
+        // shape before use.
+        return drainContext.client as OpenCodeClient;
       };
-      if (promptContext?.agent) body.agent = promptContext.agent;
-      if (promptContext?.model) {
-        body.model = {
-          providerID: promptContext.model.providerID,
-          modelID: promptContext.model.modelID,
-        };
-      }
-      if (promptContext?.variant) body.variant = promptContext.variant;
 
-      // Trace #3 of 7: about to call promptAsync. The deliveryID uniquely
-      // identifies this single promptAsync invocation across the rest of
-      // the trace chain (#3 start → #4 ok / #5 error → #6 ack_ok). One
-      // deliveryID = one HTTP POST to OpenCode's session prompt endpoint.
-      // When the DB shows multiple assistant children but logs show one
-      // start event with this deliveryID, the duplication is downstream
-      // of AFT.
-      const deliveryID = `aftdel_${randomUUID()}`;
-      const taskIDs = deliveredCompletions.map((c) => c.task_id);
-      const wakeMeta = {
-        delivery_id: deliveryID,
-        attempt: state.wakeRetryAttempts + 1,
-        task_ids: taskIDs,
-        directory: drainContext.directory,
-        reminder_sha256: hashReminder(reminder),
-        reminder_chars: reminder.length,
-        // `live-server` = wake POSTed through `createOpencodeClient` aimed
-        // at `input.serverUrl` (anomalyco/opencode#28202 workaround, no
-        // duplicate runs). `in-process-fallback` = wake POSTed through
-        // `input.client.session.promptAsync` because the live listener
-        // wasn't reachable at startup; this accepts the upstream bug so
-        // wakes still arrive at all instead of throwing each turn.
-        wake_client_path: clientPath,
-        prompt_context: promptContext
-          ? {
-              agent: promptContext.agent,
-              model: promptContext.model
-                ? {
-                    providerID: promptContext.model.providerID,
-                    modelID: promptContext.model.modelID,
-                  }
-                : null,
-              variant: promptContext.variant ?? null,
-            }
-          : null,
-      };
-      sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync start`, {
-        event: "bash_completion_wake_prompt_async_start",
-        ...wakeMeta,
-      });
-      try {
-        await client.session.promptAsync({
-          path: { id: drainContext.sessionID },
-          body,
-        });
-      } catch (err) {
-        // Trace #5 of 7: promptAsync rejected. Counted toward MAX_WAKE_SEND_ATTEMPTS
-        // by the catch in scheduleWake. Re-throw so the retry path runs.
-        sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
-          event: "bash_completion_wake_prompt_async_error",
+      const sendPrompt = async (
+        client: OpenCodeClient,
+        clientPath: "live-server" | "in-process-fallback",
+      ): Promise<string> => {
+        if (typeof client.session?.promptAsync !== "function") {
+          throw new Error(`wake client.session.promptAsync is unavailable (path=${clientPath})`);
+        }
+        // Pass the previous turn's prompt context (agent + model + variant)
+        // explicitly. OpenCode's `createUserMessage` resolves variant
+        // relative to the chosen agent's model — passing model alone makes
+        // OpenCode pick the default agent and its model match check fails,
+        // bypassing our variant. This call uses noReply: false so it DOES
+        // trigger an assistant turn — preserving cache here matters.
+        // Mirrors the resolution `opencode-xtra` uses for its
+        // background-agent notifications. See shared/last-assistant-model.ts.
+        const promptContext = await resolvePromptContext(client, drainContext.sessionID);
+        const body: Record<string, unknown> = {
+          noReply: false,
+          parts: [{ type: "text", text: reminder }],
+        };
+        if (promptContext?.agent) body.agent = promptContext.agent;
+        if (promptContext?.model) {
+          body.model = {
+            providerID: promptContext.model.providerID,
+            modelID: promptContext.model.modelID,
+          };
+        }
+        if (promptContext?.variant) body.variant = promptContext.variant;
+
+        // Trace #3 of 7: about to call promptAsync. The deliveryID uniquely
+        // identifies this single promptAsync invocation across the rest of
+        // the trace chain (#3 start → #4 ok / #5 error → #6 ack_ok). One
+        // deliveryID = one HTTP POST to OpenCode's session prompt endpoint.
+        // When the DB shows multiple assistant children but logs show one
+        // start event with this deliveryID, the duplication is downstream
+        // of AFT.
+        const deliveryID = `aftdel_${randomUUID()}`;
+        const wakeMeta = {
           delivery_id: deliveryID,
           attempt: state.wakeRetryAttempts + 1,
           task_ids: taskIDs,
-          error: err instanceof Error ? err.message : String(err),
+          directory: drainContext.directory,
+          reminder_sha256: hashReminder(reminder),
+          reminder_chars: reminder.length,
+          // `live-server` = wake POSTed through `createOpencodeClient` aimed
+          // at `input.serverUrl` (anomalyco/opencode#28202 workaround, no
+          // duplicate runs). `in-process-fallback` = wake POSTed through
+          // `input.client.session.promptAsync` because the live listener
+          // wasn't reachable at startup or failed mid-session; this accepts
+          // the upstream bug so wakes still arrive instead of hard-stopping.
+          wake_client_path: clientPath,
+          prompt_context: promptContext
+            ? {
+                agent: promptContext.agent,
+                model: promptContext.model
+                  ? {
+                      providerID: promptContext.model.providerID,
+                      modelID: promptContext.model.modelID,
+                    }
+                  : null,
+                variant: promptContext.variant ?? null,
+              }
+            : null,
+        };
+        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync start`, {
+          event: "bash_completion_wake_prompt_async_start",
+          ...wakeMeta,
         });
-        throw err;
+        try {
+          await client.session.promptAsync({
+            path: { id: drainContext.sessionID },
+            body,
+          });
+        } catch (err) {
+          // Trace #5 of 7: promptAsync rejected. Counted toward
+          // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake unless a
+          // live-server failure can be delivered by the in-process fallback
+          // below. Re-throw so the retry/fallback path runs.
+          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
+            event: "bash_completion_wake_prompt_async_error",
+            delivery_id: deliveryID,
+            attempt: state.wakeRetryAttempts + 1,
+            task_ids: taskIDs,
+            wake_client_path: clientPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+        // Trace #4 of 7: promptAsync resolved. OpenCode has accepted the
+        // synthetic user message and will run the agent turn. A subsequent
+        // assistant child with finish="stop" should appear in OpenCode's
+        // DB for this parent user message; if MORE than one appears for
+        // the same parent + reminder_sha256, the duplication is in the
+        // OpenCode runner, not in AFT (only one promptAsync call exists
+        // with this deliveryID in the log).
+        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync ok`, {
+          event: "bash_completion_wake_prompt_async_ok",
+          delivery_id: deliveryID,
+          attempt: state.wakeRetryAttempts + 1,
+          task_ids: taskIDs,
+          wake_client_path: clientPath,
+        });
+        return deliveryID;
+      };
+
+      // Wake transport selection is keyed by serverUrl. A reachable live
+      // server gets the anomalyco/opencode#28202 workaround; otherwise we
+      // fall back to the plugin-provided in-process client. If the live
+      // server fails after an earlier successful probe, demote that cached
+      // serverUrl decision and retry this same delivery through the
+      // in-process client before spending the scheduler retry budget.
+      if (useLiveServerWake(drainContext.serverUrl) && drainContext.serverUrl) {
+        try {
+          const liveClient = getLiveServerClient(
+            drainContext.serverUrl,
+            drainContext.directory,
+          ) as OpenCodeClient;
+          const deliveryID = await sendPrompt(liveClient, "live-server");
+          await ackCompletions(drainContext, deliveredCompletions, deliveryID);
+          return;
+        } catch (err) {
+          setLiveServerWakeAvailable(drainContext.serverUrl, false);
+          sessionWarn(
+            drainContext.sessionID,
+            `${LOG_PREFIX} live-server wake failed; falling back`,
+            {
+              event: "bash_completion_wake_live_server_fallback",
+              task_ids: taskIDs,
+              directory: drainContext.directory,
+              server_url: drainContext.serverUrl,
+              attempt: state.wakeRetryAttempts + 1,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+          const fallbackClient = getInProcessClient();
+          const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
+          // This delivery succeeded by switching transports; do not carry
+          // over retry attempts spent on the now-demoted live-server path.
+          state.retryDelayMs = null;
+          state.wakeRetryAttempts = 0;
+          state.wakeHardStopped = false;
+          await ackCompletions(drainContext, deliveredCompletions, deliveryID);
+          return;
+        }
       }
-      // Trace #4 of 7: promptAsync resolved. OpenCode has accepted the
-      // synthetic user message and will run the agent turn. A subsequent
-      // assistant child with finish="stop" should appear in OpenCode's
-      // DB for this parent user message; if MORE than one appears for
-      // the same parent + reminder_sha256, the duplication is in the
-      // OpenCode runner, not in AFT (only one promptAsync call exists
-      // with this deliveryID in the log).
-      sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync ok`, {
-        event: "bash_completion_wake_prompt_async_ok",
-        delivery_id: deliveryID,
-        attempt: state.wakeRetryAttempts + 1,
-        task_ids: taskIDs,
-      });
+
+      const fallbackClient = getInProcessClient();
+      const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
       await ackCompletions(drainContext, deliveredCompletions, deliveryID);
     },
     (err, hardStopped) => {
@@ -910,7 +948,8 @@ function scheduleWake(
     for (const taskId of deliveredTaskIds) state.wakeDeferredTaskIds.delete(taskId);
     state.pendingLongRunning = [];
     state.pendingPatternMatches = [];
-    void sendWake(reminder, pending)
+    const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
+    void sendWake(reminder, completionAcks)
       .then(() => {
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
@@ -985,7 +1024,7 @@ function ingestDrainedBgCompletions(
     state.outstandingTaskIds.delete(completion.task_id);
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
       continue;
     }
     // Suppress completions for tasks already consumed inline by a
@@ -1030,10 +1069,13 @@ function pruneUnknownCompletions(state: SessionBgState, now: number): void {
   );
 }
 
-function completionToExitPattern(completion: BgCompletion): PatternMatchEntry {
+function completionToExitPattern(
+  completion: BgCompletion,
+  ackCompletionOnDelivery = false,
+): PatternMatchEntry {
   const status = formatStatus(completion);
   const preview = formatOutputPreview(completion).replace(/^ {4}/gm, "").slice(-300);
-  return {
+  const entry: PatternMatchEntry = {
     task_id: completion.task_id,
     session_id: "",
     watch_id: "exit",
@@ -1045,6 +1087,22 @@ function completionToExitPattern(completion: BgCompletion): PatternMatchEntry {
     once: true,
     reason: "task_exit",
   };
+  if (ackCompletionOnDelivery) entry.ackCompletionOnDelivery = true;
+  return entry;
+}
+
+function completionAcksForDelivery(
+  completions: readonly BgCompletion[],
+  patternMatches: readonly PatternMatchEntry[],
+): BgCompletion[] {
+  const acks = [...completions];
+  const ackedTaskIds = new Set(acks.map((completion) => completion.task_id));
+  for (const match of patternMatches) {
+    if (!match.ackCompletionOnDelivery || ackedTaskIds.has(match.task_id)) continue;
+    acks.push({ task_id: match.task_id, status: "unknown", exit_code: null, command: "" });
+    ackedTaskIds.add(match.task_id);
+  }
+  return acks;
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {

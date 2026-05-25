@@ -75,7 +75,7 @@ describe("resolvePromptContext (xtra-style: reads from messages API)", () => {
     });
   });
 
-  test("prefers assistant role over user role", async () => {
+  test("uses the newest assistant when it is newer than the user", async () => {
     const client = makeClient([
       {
         info: {
@@ -97,6 +97,33 @@ describe("resolvePromptContext (xtra-style: reads from messages API)", () => {
     const result = await resolvePromptContext(client, "s1");
     expect(result?.model?.modelID).toBe("claude-opus-4-7");
     expect(result?.variant).toBe("thinking");
+  });
+
+  test("newer user model switch wins while older assistant fills missing agent", async () => {
+    const client = makeClient([
+      {
+        info: {
+          role: "assistant",
+          agent: "build",
+          providerID: "anthropic",
+          modelID: "claude-opus-4-7",
+          variant: "thinking",
+        },
+      },
+      {
+        info: {
+          role: "user",
+          model: { providerID: "openai", modelID: "gpt-5.5", variant: "high" },
+        },
+      },
+    ]);
+    const result = await resolvePromptContext(client, "s1");
+
+    expect(result).toEqual({
+      agent: "build",
+      model: { providerID: "openai", modelID: "gpt-5.5" },
+      variant: "high",
+    });
   });
 
   test("walks newest-first within same role", async () => {

@@ -23,11 +23,12 @@
  * reachable. OpenCode Desktop (Electron+Node) and TUI launched with
  * `opencode --port 0` bind a real API listener; plain TUI binds an
  * internal-only listener that 404s for `/session/*`. We probe once at
- * plugin init and cache the result. When the listener is unreachable
- * the wake path silently uses the in-process `input.client.session.promptAsync`,
- * which keeps wakes flowing (at the cost of the upstream duplicate-runner
- * bug) instead of producing no notification at all or nagging the user
- * to relaunch with a different flag.
+ * plugin init and cache the result by `serverUrl`. When that server is
+ * unreachable, the wake path silently uses the in-process
+ * `input.client.session.promptAsync`, which keeps wakes flowing (at the
+ * cost of the upstream duplicate-runner bug) instead of producing no
+ * notification at all or nagging the user to relaunch with a different
+ * flag.
  *
  * Tracked upstream as anomalyco/opencode#28202. When OpenCode fixes the
  * runtime split, this helper and its single consumer in `bg-notifications.ts`
@@ -49,6 +50,14 @@ const clientCache = new Map<string, LiveServerClient>();
 
 function cacheKey(serverUrl: string, directory: string): string {
   return `${serverUrl}|${directory}`;
+}
+
+function normalizeServerUrl(serverUrl: string): string {
+  try {
+    return new URL(serverUrl).toString();
+  } catch {
+    return serverUrl;
+  }
 }
 
 /**
@@ -95,80 +104,103 @@ export function __resetLiveServerClientCacheForTests(): void {
 }
 
 /**
- * Probe whether `serverUrl` accepts a connection within `timeoutMs`.
- * Returns `true` for any HTTP response (including 4xx / 5xx) since the
- * goal is to confirm the listener exists. Returns `false` on connection
- * refused, DNS failure, timeout, or undefined URL.
+ * Per-server decision: should bg-notifications use the live-server wake
+ * transport (workaround for anomalyco/opencode#28202), or fall back to the
+ * in-process `input.client.session.promptAsync` path?
  *
- * Used at plugin init to decide whether bg-notifications should use the
- * live-server wake transport (workaround for anomalyco/opencode#28202)
- * or fall back to the in-process `input.client.session.promptAsync`
- * path. Plain TUI (no `--port 0`) binds an internal-only listener that
- * 404s for `/session/...`, so this returns false there; OpenCode
- * Desktop, `opencode run`, and `opencode --port 0` TUI return true.
+ * Keying by `serverUrl` matters because one plugin process can host
+ * multiple OpenCode windows with different live listener URLs. A missing
+ * keyed decision defaults to `false` for safety: the in-process client is
+ * part of the plugin contract, while the live-server path requires a
+ * probe-confirmed listener.
+ *
+ * `legacyLiveServerWakeAvailable` is retained only for older callers/tests
+ * that do not pass a `serverUrl`; keyed wake callers never read it.
+ */
+const liveServerWakeAvailableByServerUrl = new Map<string, boolean>();
+let legacyLiveServerWakeAvailable = false;
+
+/**
+ * Probe whether `serverUrl` serves OpenCode's HTTP API within `timeoutMs`.
+ * Returns `true` only when `/session` proves the API is usable: any 2xx
+ * response is reachable, and 401/403 also count as reachable because an
+ * auth-protected listener still exists. Returns `false` for 404 (plain
+ * TUI's internal listener), 5xx, connection refused, DNS failure, timeout,
+ * malformed URL, or undefined URL.
+ *
+ * The probe records its result in the per-`serverUrl` wake-availability
+ * cache. That keeps multiple OpenCode windows with different live listener
+ * URLs from sharing one process-global transport decision.
  */
 export async function probeServerReachable(
   serverUrl: string | undefined,
   timeoutMs = 1500,
 ): Promise<boolean> {
   if (!serverUrl) return false;
+  const normalizedServerUrl = normalizeServerUrl(serverUrl);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let reachable = false;
   try {
     // Hit a path that actually exists on the OpenCode HTTP API so a
-    // 200 confirms the API server is up, not just any random listener
-    // (e.g. an internal IPC port that happens to accept TCP but rejects
-    // all paths with 404 — which is exactly what TUI binds without
+    // successful response confirms the API server is up, not just any
+    // random listener (e.g. an internal IPC port that accepts TCP but
+    // rejects all paths with 404 — exactly what TUI binds without
     // `--port 0`).
     const probeUrl = new URL("/session", serverUrl).toString();
     const res = await globalThis.fetch(probeUrl, {
       method: "GET",
+      headers: serverAuthHeaders(),
       signal: controller.signal,
     });
-    return res.status >= 200 && res.status < 500;
+    reachable = res.ok || res.status === 401 || res.status === 403;
   } catch {
-    return false;
+    reachable = false;
   } finally {
     clearTimeout(timer);
+    liveServerWakeAvailableByServerUrl.set(normalizedServerUrl, reachable);
   }
+  return reachable;
 }
 
 /**
- * Per-plugin-process decision: should bg-notifications use the live-server
- * wake transport (workaround for anomalyco/opencode#28202), or fall back
- * to the in-process `input.client.session.promptAsync` path?
- *
- * Set once at plugin init from the result of `probeServerReachable()`.
- * Defaults to `false` if no decision has been recorded yet — that's the
- * safe direction because `input.client.session.promptAsync` is always
- * available (it's part of the plugin contract), whereas the live-server
- * path needs both a probe-confirmed listener and the workaround code
- * itself to be live.
- *
- * Read at wake time (not cached on a closure) so background probes that
- * complete after plugin init still take effect on the next wake.
+ * Record a probe result. Prefer the `(serverUrl, available)` form; the
+ * single-boolean form is a compatibility fallback for old call sites and
+ * tests that do not yet have a URL to key by.
  */
-let liveServerWakeAvailable = false;
-
-/**
- * Record the probe result. Idempotent; if you record twice, the latest
- * value wins. The wake path reads through `useLiveServerWake()`.
- */
-export function setLiveServerWakeAvailable(available: boolean): void {
-  liveServerWakeAvailable = available;
+export function setLiveServerWakeAvailable(available: boolean): void;
+export function setLiveServerWakeAvailable(serverUrl: string | undefined, available: boolean): void;
+export function setLiveServerWakeAvailable(
+  serverUrlOrAvailable: string | boolean | undefined,
+  available?: boolean,
+): void {
+  if (typeof serverUrlOrAvailable === "boolean") {
+    legacyLiveServerWakeAvailable = serverUrlOrAvailable;
+    return;
+  }
+  if (!serverUrlOrAvailable) {
+    legacyLiveServerWakeAvailable = available ?? false;
+    return;
+  }
+  liveServerWakeAvailableByServerUrl.set(
+    normalizeServerUrl(serverUrlOrAvailable),
+    available ?? false,
+  );
 }
 
 /**
- * Read the cached probe decision. `true` means the wake path should use
- * `getLiveServerClient(serverUrl, directory)` and POST through the live
- * HTTP listener. `false` means fall back to the in-process client passed
- * via plugin context (`input.client`).
+ * Read the cached probe decision for `serverUrl`. `true` means the wake path
+ * should use `getLiveServerClient(serverUrl, directory)` and POST through
+ * the live HTTP listener. `false` means fall back to the in-process client
+ * passed via plugin context (`input.client`).
  */
-export function useLiveServerWake(): boolean {
-  return liveServerWakeAvailable;
+export function useLiveServerWake(serverUrl?: string): boolean {
+  if (!serverUrl) return legacyLiveServerWakeAvailable;
+  return liveServerWakeAvailableByServerUrl.get(normalizeServerUrl(serverUrl)) ?? false;
 }
 
 /** Test helper — reset the decision cache between cases. */
 export function __resetLiveServerWakeForTests(): void {
-  liveServerWakeAvailable = false;
+  liveServerWakeAvailableByServerUrl.clear();
+  legacyLiveServerWakeAvailable = false;
 }

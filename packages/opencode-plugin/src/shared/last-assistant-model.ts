@@ -8,12 +8,11 @@
  * prefix cache that the previous assistant turn warmed.
  *
  * APPROACH: Mirror what `opencode-xtra` does in production. Read recent
- * messages from `client.session.messages()`, prefer the most recent
- * assistant message, fall back to any role, MERGE across messages so
- * partial fields (e.g. agent set on user message but not assistant) are
- * filled in, and read BOTH the flat shape (`info.providerID`) used by
- * AssistantMessage and the nested shape (`info.model.providerID`) used
- * by UserMessage.
+ * messages from `client.session.messages()`, walk newest→oldest across
+ * roles, and MERGE field-by-field so the newest context-bearing message
+ * wins while older messages only fill fields it did not provide. Read BOTH
+ * the flat shape (`info.providerID`) used by AssistantMessage and the
+ * nested shape (`info.model.providerID`) used by UserMessage.
  *
  * IMPORTANT: This context is only meaningful for callers that DO trigger
  * LLM inference (e.g. background-bash idle wakes with `noReply: false`).
@@ -47,11 +46,6 @@ function extractMessages(response: unknown): unknown[] {
   if (Array.isArray(response)) return response;
   if (isRecord(response) && Array.isArray(response.data)) return response.data;
   return [];
-}
-
-function getRole(message: unknown): string | undefined {
-  if (!isRecord(message) || !isRecord(message.info)) return undefined;
-  return typeof message.info.role === "string" ? message.info.role : undefined;
 }
 
 function extractFromMessage(message: unknown): ResolvedPromptContext | null {
@@ -103,10 +97,10 @@ function isComplete(ctx: ResolvedPromptContext): boolean {
 }
 
 /**
- * Read recent messages from the OpenCode session and resolve the most
- * recent assistant prompt context. Falls back to user messages if no
- * assistant has the field. Merges across messages so partial fields are
- * filled in. Returns null if no usable context is found.
+ * Read recent messages from the OpenCode session and resolve the newest
+ * effective prompt context across roles. Merges across messages so partial
+ * fields are filled in from older messages only when the newer context did
+ * not provide them. Returns null if no usable context is found.
  *
  * Mirrors `resolveSessionPromptParams` in `opencode-xtra` (the working
  * reference implementation).
@@ -153,19 +147,7 @@ export async function resolvePromptContext(
   }
   if (messages.length === 0) return null;
 
-  // Pass 1: prefer the most recent assistant, merge older assistants to
-  // fill missing fields.
   let result: ResolvedPromptContext = {};
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (getRole(messages[i]) !== "assistant") continue;
-    const ctx = extractFromMessage(messages[i]);
-    if (!ctx) continue;
-    result = mergeContexts(result, ctx);
-    if (isComplete(result)) return result;
-  }
-
-  // Pass 2: fall back to any role (covers user messages, which carry
-  // model nested under `info.model`).
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const ctx = extractFromMessage(messages[i]);
     if (!ctx) continue;

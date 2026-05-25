@@ -110,6 +110,30 @@ describe("Pi background notifications", () => {
     expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
   });
 
+  test("retroactively converted task-exit notify is acked after tool-result delivery", async () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    markExplicitControl("s1", "task-1", false);
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-1"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "watch registered" }],
+    );
+
+    const reminder = content?.[1]?.type === "text" ? content[1].text : "";
+    expect(reminder).toContain("[BG BASH NOTIFY]");
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
   test("late async watch renders one notify and suppresses default completion on drain", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness((command) =>

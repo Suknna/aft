@@ -62,9 +62,13 @@ mock.module("../shared/live-server-client.js", () => ({
     }
     return liveServerClient;
   },
-  useLiveServerWake: () => liveServerAvailable,
-  setLiveServerWakeAvailable: (available: boolean) => {
-    liveServerAvailable = available;
+  useLiveServerWake: (_serverUrl?: string) => liveServerAvailable,
+  setLiveServerWakeAvailable: (
+    serverUrlOrAvailable: string | boolean | undefined,
+    available?: boolean,
+  ) => {
+    liveServerAvailable =
+      typeof serverUrlOrAvailable === "boolean" ? serverUrlOrAvailable : (available ?? false);
   },
   __resetLiveServerClientCacheForTests: () => {
     liveServerClient = null;
@@ -498,6 +502,27 @@ describe("OpenCode background notifications", () => {
     expect(stateAfter?.wakeDeferredTaskIds.has("task-1")).toBe(false);
   });
 
+  test("retroactively converted task-exit notify is acked after in-turn delivery", async () => {
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "sleep 3 && echo X")]);
+    markExplicitControl("s1", "task-1", false);
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-1"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const output = { output: "watch registered" };
+
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+
+    expect(output.output).toContain("[BG BASH NOTIFY]");
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-1"],
+    });
+  });
+
   test("late async watch renders one notify and suppresses default completion on drain", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness((command) =>
@@ -627,17 +652,18 @@ describe("OpenCode background notifications", () => {
   });
 
   test("failed wake keeps pending completions and retries", async () => {
+    setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    installLiveServerClient(promptAsync);
+    const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: {},
+      client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
 
@@ -646,7 +672,7 @@ describe("OpenCode background notifications", () => {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: {},
+        client: fallbackClient,
         serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
@@ -659,17 +685,18 @@ describe("OpenCode background notifications", () => {
   });
 
   test("failed wake hard-stops after capped retries", async () => {
+    setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    installLiveServerClient(promptAsync);
+    const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
       sessionID: "s1",
-      client: {},
+      client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
 
@@ -678,7 +705,7 @@ describe("OpenCode background notifications", () => {
         ctx,
         directory: "/tmp/project",
         sessionID: "s1",
-        client: {},
+        client: fallbackClient,
         serverUrl: TEST_SERVER_URL,
       },
       completion("task-1", "npm test"),
@@ -974,6 +1001,54 @@ describe("OpenCode background notifications", () => {
       serverUrl: TEST_SERVER_URL,
       directory: "/tmp/project",
     });
+  });
+
+  test("live-server failure falls back in-process and demotes subsequent wakes", async () => {
+    setTestLiveServerAvailable(true);
+    const responses: BridgeResponse[] = [
+      { success: true, bg_completions: [completion("task-1", "npm test")] },
+      { success: true, bg_completions: [completion("task-2", "npm test again")] },
+    ];
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? (responses.shift() ?? { success: true, bg_completions: [] })
+        : { success: true, acked_task_ids: [] },
+    );
+    const { ctx } = harness(send);
+    const livePromptAsync = mock(async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1");
+    });
+    installLiveServerClient(livePromptAsync);
+    const fallbackClient = makeClient(mock(async () => {}));
+
+    trackBgTask("s1", "task-1");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.promptAsync, 1);
+
+    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(liveServerAvailable).toBe(false);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
+
+    trackBgTask("s1", "task-2");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.promptAsync, 2);
+
+    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(2);
   });
 
   test("in-process fallback wake uses drainContext.client and tags trace accordingly", async () => {
