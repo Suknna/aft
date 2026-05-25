@@ -141,7 +141,11 @@ process.stdin.on("data", (chunk) => {
     });
 
     try {
-      const response = await bridge.send("ping", {}, { transportTimeoutMs: 1_000 });
+      // 5s budget proves the same contract (caller's transportTimeoutMs is
+      // used for implicit configure + version RPCs instead of the bridge's
+      // default 50ms) while tolerating CI/Mac load. Node startup + 2x 120ms
+      // server delays could exceed the previous 1s under load.
+      const response = await bridge.send("ping", {}, { transportTimeoutMs: 5_000 });
       expect(response).toMatchObject({ success: true, command: "ping" });
     } finally {
       await bridge.shutdown();
