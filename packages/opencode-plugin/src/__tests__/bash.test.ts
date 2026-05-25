@@ -538,6 +538,18 @@ describe("bash_status tool", () => {
     return file;
   }
 
+  async function spillPair(
+    stdout: string,
+    stderr: string,
+  ): Promise<{ dir: string; stdoutPath: string; stderrPath: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "aft-bash-status-test-"));
+    const stdoutPath = join(dir, "task.out");
+    const stderrPath = join(dir, "task.err");
+    await writeFile(stdoutPath, stdout);
+    await writeFile(stderrPath, stderr);
+    return { dir, stdoutPath, stderrPath };
+  }
+
   test("bash_watch pattern substring match returns matched reason, text, and offset", async () => {
     const outputPath = await spill("prefix Server listening on port 3000\n");
     try {
@@ -633,8 +645,8 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("bash_watch pattern + exit race returns exited when task exits before scanning pattern", async () => {
-    const outputPath = await spill("pattern exists but exit wins\n");
+  test("bash_watch pattern + exit race scans terminal output before returning exited", async () => {
+    const outputPath = await spill("pattern exists and match wins\n");
     try {
       const { watchTool } = makeCtx(() => ({
         success: true,
@@ -647,8 +659,8 @@ describe("bash_status tool", () => {
         { taskId: "bash-race", pattern: "pattern" },
         createMockSdkContext(),
       );
-      expect(result).toContain("task exited (completed, exit 0)");
-      expect(result).not.toContain("matched");
+      expect(result).toContain('matched "pattern" at offset 0');
+      expect(result).not.toContain("task exited");
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }
@@ -670,6 +682,26 @@ describe("bash_status tool", () => {
       expect(result).toContain('matched "two" at offset 4');
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("bash_watch on PIPED bash scans stderr_path as well as output_path", async () => {
+    const spill = await spillPair("stdout\n", "warning: READY on stderr\n");
+    try {
+      const { watchTool } = makeCtx(() => ({
+        success: true,
+        status: "running",
+        mode: "pipes",
+        output_path: spill.stdoutPath,
+        stderr_path: spill.stderrPath,
+      }));
+      const result = await watchTool.execute(
+        { taskId: "bash-stderr", pattern: "READY" },
+        createMockSdkContext(),
+      );
+      expect(result).toContain('matched "READY" at offset 16');
+    } finally {
+      await rm(spill.dir, { recursive: true, force: true });
     }
   });
 
@@ -819,6 +851,36 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(bashCall?.params.notify_on_completion).toBe(false);
     // Subagents must never call bash_promote even when caller requested
     // background:true — the conversion happens upstream of promotion.
+    expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
+  });
+
+  test("subagent forced foreground does not promote after its poll deadline", async () => {
+    _resetSubagentCacheForTest();
+    let statusCalls = 0;
+    const { calls, tool: bash } = createSubagentHarness((command) => {
+      if (command === "bash")
+        return { success: true, status: "running", task_id: "bash-no-promote" };
+      if (command === "bash_status") {
+        statusCalls += 1;
+        if (statusCalls === 1) return { success: true, status: "running" };
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          output_preview: "finished inline",
+          output_truncated: false,
+        };
+      }
+      return { success: true };
+    });
+
+    const result = await bash.execute(
+      { command: "slow-subagent", timeout: 0 },
+      createMockSdkContext({ sessionID: "ses_subagent_deadline" }),
+    );
+
+    expect(result as string).toContain("finished inline");
+    expect(calls.map((c) => c.command)).toEqual(["bash", "bash_status", "bash_status"]);
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 

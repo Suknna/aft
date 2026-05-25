@@ -280,6 +280,10 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
             return rendered;
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
+            if (subagentForcedForeground) {
+              await sleep(FOREGROUND_POLL_INTERVAL_MS);
+              continue;
+            }
             const promoted = await callBridge(ctx, context, "bash_promote", { task_id: taskId });
             if (promoted.success === false) {
               throw new Error((promoted.message as string | undefined) ?? "bash_promote failed");

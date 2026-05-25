@@ -914,9 +914,11 @@ impl BgTaskRegistry {
         pattern: WatchPattern,
         once: bool,
     ) -> Result<String, &'static str> {
-        let task = self.task(&task_id);
-        let task_paths = task.as_ref().and_then(|task| {
-            task.state.lock().ok().map(|state| {
+        let task = self.task(&task_id).ok_or("task_not_found")?;
+        let (mode, terminal_at_registration, stdout, stderr, pty) = task
+            .state
+            .lock()
+            .map(|state| {
                 (
                     state.metadata.mode.clone(),
                     state.metadata.status.is_terminal(),
@@ -925,9 +927,10 @@ impl BgTaskRegistry {
                     task.paths.pty.clone(),
                 )
             })
-        });
+            .map_err(|_| "background_task_lock_poisoned")?;
 
         let mut terminal_matches = Vec::new();
+        let scanned_terminal = terminal_at_registration;
         let watch_id = {
             let mut registry = self
                 .inner
@@ -935,61 +938,97 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "watch_registry_poisoned")?;
             let watch_id = registry.register(task_id.clone(), pattern, once)?;
-            if let Some((mode, terminal, stdout, stderr, pty)) = task_paths {
-                match mode {
-                    BgMode::Pipes => {
-                        let stdout_key = format!("{task_id}:stdout");
-                        let stderr_key = format!("{task_id}:stderr");
-                        if terminal {
-                            registry.set_file_cursor(&stdout_key, 0);
-                            registry.set_file_cursor(&stderr_key, 0);
-                            terminal_matches.extend(registry.scan_file_new_bytes(
-                                &stdout_key,
-                                &task_id,
-                                &stdout,
-                            ));
-                            terminal_matches.extend(registry.scan_file_new_bytes(
-                                &stderr_key,
-                                &task_id,
-                                &stderr,
-                            ));
-                        } else {
-                            registry.prime_file_cursor(&stdout_key, &stdout);
-                            registry.prime_file_cursor(&stderr_key, &stderr);
-                        }
+            match &mode {
+                BgMode::Pipes => {
+                    let stdout_key = format!("{task_id}:stdout");
+                    let stderr_key = format!("{task_id}:stderr");
+                    if terminal_at_registration {
+                        registry.set_file_cursor(&stdout_key, 0);
+                        registry.set_file_cursor(&stderr_key, 0);
+                        terminal_matches.extend(registry.scan_file_new_bytes(
+                            &stdout_key,
+                            &task_id,
+                            &stdout,
+                        ));
+                        terminal_matches.extend(registry.scan_file_new_bytes(
+                            &stderr_key,
+                            &task_id,
+                            &stderr,
+                        ));
+                    } else {
+                        registry.prime_file_cursor(&stdout_key, &stdout);
+                        registry.prime_file_cursor(&stderr_key, &stderr);
                     }
-                    BgMode::Pty => {
-                        let pty_key = format!("{task_id}:pty");
-                        if terminal {
-                            registry.set_file_cursor(&pty_key, 0);
-                            terminal_matches
-                                .extend(registry.scan_file_new_bytes(&pty_key, &task_id, &pty));
-                        } else {
-                            registry.prime_file_cursor(&pty_key, &pty);
-                        }
+                }
+                BgMode::Pty => {
+                    let pty_key = format!("{task_id}:pty");
+                    if terminal_at_registration {
+                        registry.set_file_cursor(&pty_key, 0);
+                        terminal_matches
+                            .extend(registry.scan_file_new_bytes(&pty_key, &task_id, &pty));
+                    } else {
+                        registry.prime_file_cursor(&pty_key, &pty);
                     }
                 }
             }
             watch_id
         };
 
-        if let Some(task) = task.as_ref() {
-            if task.is_terminal() {
-                let completion = self.remove_pending_completion(&task_id).or_else(|| {
-                    self.completion_snapshot_for_task(task, BG_COMPLETION_PREVIEW_BYTES)
-                });
-                if terminal_matches.is_empty() {
-                    if let Some(completion) = completion.as_ref() {
-                        self.emit_bash_watch_exit(completion);
+        if task.is_terminal() {
+            if !scanned_terminal {
+                terminal_matches = {
+                    let mut registry = self
+                        .inner
+                        .watch_registry
+                        .lock()
+                        .map_err(|_| "watch_registry_poisoned")?;
+                    match &mode {
+                        BgMode::Pipes => {
+                            let stdout_key = format!("{task_id}:stdout");
+                            let stderr_key = format!("{task_id}:stderr");
+                            registry.set_file_cursor(&stdout_key, 0);
+                            registry.set_file_cursor(&stderr_key, 0);
+                            let mut matches =
+                                registry.scan_file_new_bytes(&stdout_key, &task_id, &stdout);
+                            matches.extend(registry.scan_file_new_bytes(
+                                &stderr_key,
+                                &task_id,
+                                &stderr,
+                            ));
+                            matches
+                        }
+                        BgMode::Pty => {
+                            let pty_key = format!("{task_id}:pty");
+                            registry.set_file_cursor(&pty_key, 0);
+                            registry.scan_file_new_bytes(&pty_key, &task_id, &pty)
+                        }
                     }
-                } else {
-                    for pattern_match in terminal_matches {
-                        self.emit_bash_pattern_match(&task.session_id, pattern_match);
-                    }
-                }
-                let _ = task.set_completion_delivered(true, self);
-                self.clear_task_watch_state(&task_id);
+                };
             }
+
+            let (watch_controlled, watch_matched) = self.task_watch_state(&task_id);
+            if terminal_matches.is_empty() && (!watch_controlled || watch_matched) {
+                if watch_matched {
+                    let _ = task.set_completion_delivered(true, self);
+                    self.clear_task_watch_state(&task_id);
+                }
+                return Ok(watch_id);
+            }
+
+            let completion = self
+                .remove_pending_completion(&task_id)
+                .or_else(|| self.completion_snapshot_for_task(&task, BG_COMPLETION_PREVIEW_BYTES));
+            if terminal_matches.is_empty() {
+                if let Some(completion) = completion.as_ref() {
+                    self.emit_bash_watch_exit(completion);
+                }
+            } else {
+                for pattern_match in terminal_matches {
+                    self.emit_bash_pattern_match(&task.session_id, pattern_match);
+                }
+            }
+            let _ = task.set_completion_delivered(true, self);
+            self.clear_task_watch_state(&task_id);
         }
 
         Ok(watch_id)
@@ -3300,6 +3339,81 @@ mod tests {
         assert!(replayed
             .drain_completions_for_session(Some("session"))
             .is_empty());
+    }
+
+    #[test]
+    fn register_watch_rejects_unknown_task() {
+        let registry = BgTaskRegistry::default();
+
+        let result = registry.register_watch(
+            "missing-task".to_string(),
+            WatchPattern::Substring("READY".into()),
+            true,
+        );
+
+        assert_eq!(result, Err("task_not_found"));
+    }
+
+    #[test]
+    fn register_watch_on_terminal_task_scans_existing_output() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+            captured.lock().unwrap().push(frame);
+        })
+            as Box<dyn Fn(PushFrame) + Send + Sync>);
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        std::fs::write(&task.paths.stdout, "READY\n").unwrap();
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
+        frames.lock().unwrap().clear();
+        registry.inner.completions.lock().unwrap().clear();
+
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+
+        let frames = frames.lock().unwrap();
+        let frame = frames
+            .iter()
+            .find_map(|frame| match frame {
+                PushFrame::BashPatternMatch(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("terminal watch registration should emit pattern frame");
+        assert_eq!(frame.reason, "pattern_match");
+        assert_eq!(frame.task_id, task_id);
+        assert_eq!(frame.session_id, "session");
+        assert_eq!(frame.match_text, "READY");
+        assert_eq!(frame.match_offset, 0);
+        assert_eq!(registry.active_watch_count(&frame.task_id), 0);
+        let metadata = read_task(&task.paths.json).unwrap();
+        assert!(metadata.completion_delivered);
     }
 
     #[test]

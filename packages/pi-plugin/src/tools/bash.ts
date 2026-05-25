@@ -667,6 +667,7 @@ function bashKillResult(
 type BashWaitPattern =
   | { kind: "substring"; value: string }
   | { kind: "regex"; value: RegExp; source: string };
+type OutputCursor = { output: number; stderr: number; combined: number };
 
 async function bashStatusSnapshot(
   bridge: BinaryBridge,
@@ -696,7 +697,7 @@ async function waitForBashStatus(
 ): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
   const startedAt = Date.now();
   const deadline = startedAt + effectiveWaitMs;
-  let spillCursor = 0;
+  let spillCursor: OutputCursor = { output: 0, stderr: 0, combined: 0 };
   let scanText = "";
   let scanBaseOffset = 0;
   const bridgeOptions = {
@@ -713,15 +714,7 @@ async function waitForBashStatus(
   try {
     while (true) {
       const data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
-      if (waitForExit && isTerminalStatus(data.status)) {
-        sawTerminal = true;
-        consumeBgCompletion(sessionId, taskId);
-        await markBgCompletionDelivered(
-          { ctx, directory: extCtx.cwd, sessionID: sessionId },
-          taskId,
-        );
-        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
-      }
+      const terminal = isTerminalStatus(data.status);
 
       if (waitFor) {
         const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
@@ -731,6 +724,14 @@ async function waitForBashStatus(
           scanText += scan.text;
           const match = findWaitMatch(scanText, waitFor);
           if (match) {
+            if (waitForExit && terminal) {
+              sawTerminal = true;
+              consumeBgCompletion(sessionId, taskId);
+              await markBgCompletionDelivered(
+                { ctx, directory: extCtx.cwd, sessionID: sessionId },
+                taskId,
+              );
+            }
             return withWaited(data, {
               reason: "matched",
               elapsed_ms: Date.now() - startedAt,
@@ -740,9 +741,18 @@ async function waitForBashStatus(
             });
           }
         }
-        if (isTerminalStatus(data.status)) {
-          return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
+
+      if (terminal) {
+        if (waitForExit) {
+          sawTerminal = true;
+          consumeBgCompletion(sessionId, taskId);
+          await markBgCompletionDelivered(
+            { ctx, directory: extCtx.cwd, sessionID: sessionId },
+            taskId,
+          );
         }
+        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
       }
 
       if (Date.now() >= deadline) {
@@ -759,20 +769,47 @@ async function readNewTaskOutput(
   extCtx: ExtensionContext,
   taskId: string,
   data: Record<string, unknown>,
-  cursor: number,
-): Promise<{ text: string; baseOffset: number; nextCursor: number } | undefined> {
+  cursor: OutputCursor,
+): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
-  if (!outputPath) return undefined;
   if (data.mode === "pty") {
+    if (!outputPath) return undefined;
     const { rows, cols } = ptyDimensions(data);
-    const state = await getOrCreatePtyTerminal(ptyCacheKey(extCtx, taskId), outputPath, rows, cols);
+    const state = await getOrCreatePtyTerminal(
+      watchPtyCacheKey(extCtx, taskId),
+      outputPath,
+      rows,
+      cols,
+    );
     const baseOffset = state.offset;
     const bytes = await readPtyBytes(state);
-    return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
+    if (bytes.length === 0) return undefined;
+    return {
+      text: bytes.toString("utf8"),
+      baseOffset,
+      nextCursor: { output: state.offset, stderr: 0, combined: state.offset },
+    };
   }
 
-  const bytes = await readFileBytesFrom(outputPath, cursor);
-  return { text: bytes.toString("utf8"), baseOffset: cursor, nextCursor: cursor + bytes.length };
+  const stderrPath = data.stderr_path as string | undefined;
+  if (!outputPath && !stderrPath) return undefined;
+  const stdoutBytes = outputPath
+    ? await readFileBytesFrom(outputPath, cursor.output)
+    : Buffer.alloc(0);
+  const stderrBytes = stderrPath
+    ? await readFileBytesFrom(stderrPath, cursor.stderr)
+    : Buffer.alloc(0);
+  const bytesRead = stdoutBytes.length + stderrBytes.length;
+  if (bytesRead === 0) return undefined;
+  return {
+    text: Buffer.concat([stdoutBytes, stderrBytes]).toString("utf8"),
+    baseOffset: cursor.combined,
+    nextCursor: {
+      output: cursor.output + stdoutBytes.length,
+      stderr: cursor.stderr + stderrBytes.length,
+      combined: cursor.combined + bytesRead,
+    },
+  };
 }
 
 async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
@@ -916,6 +953,9 @@ function ptyDimensions(data: { pty_rows?: unknown; pty_cols?: unknown }): {
 
 function ptyCacheKey(extCtx: ExtensionContext, taskId: string): string {
   return `${extCtx.cwd}::${resolveSessionId(extCtx) ?? "__default__"}::${taskId}`;
+}
+function watchPtyCacheKey(extCtx: ExtensionContext, taskId: string): string {
+  return `${ptyCacheKey(extCtx, taskId)}::watch`;
 }
 
 function isTerminalStatus(status: unknown): boolean {

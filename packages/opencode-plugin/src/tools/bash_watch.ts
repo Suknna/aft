@@ -32,6 +32,7 @@ export type BashStatusWaited = {
   match_offset?: number;
 };
 type BashStatusWithWait = Record<string, unknown> & { waited?: BashStatusWaited };
+type OutputCursor = { output: number; stderr: number; combined: number };
 
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -181,7 +182,7 @@ export async function waitForBashStatus(
 ): Promise<BashStatusWithWait> {
   const startedAt = Date.now();
   const deadline = startedAt + effectiveWaitMs;
-  let spillCursor = 0;
+  let spillCursor: OutputCursor = { output: 0, stderr: 0, combined: 0 };
   let scanText = "";
   let scanBaseOffset = 0;
   const bridgeOptions: BridgeRequestOptions = {
@@ -189,17 +190,11 @@ export async function waitForBashStatus(
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
   };
   markTaskWaiting(runtime.sessionID, taskId);
+  let sawTerminal = false;
   try {
     while (true) {
       const data = await bashStatusSnapshot(ctx, runtime, taskId, outputMode, bridgeOptions);
-      if (isTerminalStatus(data.status)) {
-        consumeBgCompletion(runtime.sessionID, taskId);
-        await markBgCompletionDelivered(
-          { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
-          taskId,
-        );
-        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
-      }
+      const terminal = isTerminalStatus(data.status);
       if (waitFor) {
         const scan = await readNewTaskOutput(runtime, taskId, data, spillCursor);
         if (scan) {
@@ -208,7 +203,14 @@ export async function waitForBashStatus(
           scanText += scan.text;
           const match = findWaitMatch(scanText, waitFor);
           if (match) {
-            unmarkTaskWaiting(runtime.sessionID, taskId);
+            if (terminal) {
+              sawTerminal = true;
+              consumeBgCompletion(runtime.sessionID, taskId);
+              await markBgCompletionDelivered(
+                { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
+                taskId,
+              );
+            }
             return withWaited(data, {
               reason: "matched",
               elapsed_ms: Date.now() - startedAt,
@@ -219,15 +221,22 @@ export async function waitForBashStatus(
           }
         }
       }
+      if (terminal) {
+        sawTerminal = true;
+        consumeBgCompletion(runtime.sessionID, taskId);
+        await markBgCompletionDelivered(
+          { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
+          taskId,
+        );
+        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+      }
       if (Date.now() >= deadline) {
-        unmarkTaskWaiting(runtime.sessionID, taskId);
         return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
       }
       await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
     }
-  } catch (err) {
-    unmarkTaskWaiting(runtime.sessionID, taskId);
-    throw err;
+  } finally {
+    if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);
   }
 }
 
@@ -235,18 +244,41 @@ async function readNewTaskOutput(
   runtime: ToolContext,
   taskId: string,
   data: Record<string, unknown>,
-  cursor: number,
-): Promise<{ text: string; baseOffset: number; nextCursor: number } | undefined> {
+  cursor: OutputCursor,
+): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
-  if (!outputPath) return undefined;
   if (data.mode === "pty") {
-    const state = await getOrCreatePtyTerminal(ptyCacheKey(runtime, taskId), outputPath);
+    if (!outputPath) return undefined;
+    const state = await getOrCreatePtyTerminal(watchPtyCacheKey(runtime, taskId), outputPath);
     const baseOffset = state.offset;
     const bytes = await readPtyBytes(state);
-    return { text: bytes.toString("utf8"), baseOffset, nextCursor: state.offset };
+    if (bytes.length === 0) return undefined;
+    return {
+      text: bytes.toString("utf8"),
+      baseOffset,
+      nextCursor: { output: state.offset, stderr: 0, combined: state.offset },
+    };
   }
-  const bytes = await readFileBytesFrom(outputPath, cursor);
-  return { text: bytes.toString("utf8"), baseOffset: cursor, nextCursor: cursor + bytes.length };
+
+  const stderrPath = data.stderr_path as string | undefined;
+  if (!outputPath && !stderrPath) return undefined;
+  const stdoutBytes = outputPath
+    ? await readFileBytesFrom(outputPath, cursor.output)
+    : Buffer.alloc(0);
+  const stderrBytes = stderrPath
+    ? await readFileBytesFrom(stderrPath, cursor.stderr)
+    : Buffer.alloc(0);
+  const bytesRead = stdoutBytes.length + stderrBytes.length;
+  if (bytesRead === 0) return undefined;
+  return {
+    text: Buffer.concat([stdoutBytes, stderrBytes]).toString("utf8"),
+    baseOffset: cursor.combined,
+    nextCursor: {
+      output: cursor.output + stdoutBytes.length,
+      stderr: cursor.stderr + stderrBytes.length,
+      combined: cursor.combined + bytesRead,
+    },
+  };
 }
 
 async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
@@ -303,6 +335,9 @@ function isTerminalStatus(status: unknown): boolean {
 }
 function ptyCacheKey(runtime: ToolContext, taskId: string): string {
   return `${projectRootFor(runtime)}::${runtime.sessionID ?? "__default__"}::${taskId}`;
+}
+function watchPtyCacheKey(runtime: ToolContext, taskId: string): string {
+  return `${ptyCacheKey(runtime, taskId)}::watch`;
 }
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

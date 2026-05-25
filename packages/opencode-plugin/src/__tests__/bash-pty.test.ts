@@ -196,6 +196,28 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).toContain("ready on pty");
   });
 
+  test("Test 26c: bash_watch PTY scan is independent from bash_status cursor", async () => {
+    const outputPath = await spill("rea");
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-pty-shared", outputMode: "raw" },
+      runtime(),
+    );
+    await appendFile(outputPath, "dy\n");
+
+    const result = await createBashWatchTool(pluginCtx).execute(
+      { taskId: "bash-pty-shared", pattern: "ready", timeoutMs: 1 },
+      runtime(),
+    );
+
+    expect(result).toContain('matched "ready" at offset 0');
+  });
+
   test("Test 27: bash_status cache disposes on terminal status", async () => {
     const outputPath = await spill("done");
     const { ctx: pluginCtx } = ctx(() => ({

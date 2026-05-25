@@ -9,6 +9,7 @@ use serde::Serialize;
 const MAX_WATCHES_PER_TASK: usize = 8;
 const CONTEXT_BEFORE: usize = 100;
 const CONTEXT_AFTER: usize = 500;
+const SCAN_OVERLAP_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WatchSpec {
@@ -47,6 +48,7 @@ pub struct PatternMatch {
 pub struct WatchRegistry {
     watches: HashMap<String, Vec<WatchSpec>>,
     scan_cursors: HashMap<String, u64>,
+    scan_overlaps: HashMap<String, Vec<u8>>,
     controlled_tasks: HashSet<String>,
     matched_tasks: HashSet<String>,
     next_watch: u64,
@@ -91,6 +93,8 @@ impl WatchRegistry {
         let prefix = format!("{task_id}:");
         self.scan_cursors
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
+        self.scan_overlaps
+            .retain(|key, _| key != task_id && !key.starts_with(&prefix));
     }
 
     pub fn has_controlled_task(&self, task_id: &str) -> bool {
@@ -118,6 +122,7 @@ impl WatchRegistry {
 
     pub fn set_file_cursor(&mut self, cursor_key: &str, offset: u64) {
         self.scan_cursors.insert(cursor_key.to_string(), offset);
+        self.scan_overlaps.remove(cursor_key);
     }
 
     pub fn scan_file_new_bytes(
@@ -150,18 +155,19 @@ impl WatchRegistry {
         }
         let next = cursor.saturating_add(bytes.len() as u64);
         self.scan_cursors.insert(cursor_key.to_string(), next);
-        self.scan_new_bytes_at(task_id, &bytes, cursor)
+        self.scan_new_bytes_at(cursor_key, task_id, &bytes, cursor)
     }
 
     pub fn scan_new_bytes(&mut self, task_id: &str, bytes: &[u8]) -> Vec<PatternMatch> {
         let base = self.scan_cursors.get(task_id).copied().unwrap_or(0);
         self.scan_cursors
             .insert(task_id.to_string(), base.saturating_add(bytes.len() as u64));
-        self.scan_new_bytes_at(task_id, bytes, base)
+        self.scan_new_bytes_at(task_id, task_id, bytes, base)
     }
 
     fn scan_new_bytes_at(
         &mut self,
+        cursor_key: &str,
         task_id: &str,
         bytes: &[u8],
         base_offset: u64,
@@ -169,17 +175,27 @@ impl WatchRegistry {
         let Some(watches) = self.watches.get(task_id).cloned() else {
             return Vec::new();
         };
-        let text = String::from_utf8_lossy(bytes);
+        let overlap = self
+            .scan_overlaps
+            .get(cursor_key)
+            .cloned()
+            .unwrap_or_default();
+        let prefix_len = overlap.len();
+        let mut scan_bytes = Vec::with_capacity(prefix_len.saturating_add(bytes.len()));
+        scan_bytes.extend_from_slice(&overlap);
+        scan_bytes.extend_from_slice(bytes);
+        let text = String::from_utf8_lossy(&scan_bytes);
+        let scan_base_offset = base_offset.saturating_sub(prefix_len as u64);
         let mut matches = Vec::new();
         let mut remove_once = Vec::new();
         for watch in watches {
-            if let Some((start, end, matched)) = find_match(&watch.pattern, &text) {
+            if let Some((start, end, matched)) = find_match(&watch.pattern, &text, prefix_len) {
                 self.matched_tasks.insert(task_id.to_string());
                 matches.push(PatternMatch {
                     watch_id: watch.watch_id.clone(),
                     task_id: watch.task_id.clone(),
                     match_text: matched,
-                    match_offset: base_offset.saturating_add(start as u64),
+                    match_offset: scan_base_offset.saturating_add(start as u64),
                     context: context_snippet(&text, start, end),
                     once: watch.once,
                 });
@@ -191,18 +207,40 @@ impl WatchRegistry {
         for watch_id in remove_once {
             self.unregister(task_id, &watch_id);
         }
+        let keep = scan_bytes.len().min(SCAN_OVERLAP_BYTES);
+        self.scan_overlaps.insert(
+            cursor_key.to_string(),
+            scan_bytes[scan_bytes.len().saturating_sub(keep)..].to_vec(),
+        );
         matches
     }
 }
 
-fn find_match(pattern: &WatchPattern, text: &str) -> Option<(usize, usize, String)> {
+fn find_match(
+    pattern: &WatchPattern,
+    text: &str,
+    min_end_exclusive: usize,
+) -> Option<(usize, usize, String)> {
     match pattern {
-        WatchPattern::Substring(needle) => text.find(needle).map(|start| {
-            let end = start + needle.len();
-            (start, end, needle.clone())
-        }),
+        WatchPattern::Substring(needle) => {
+            if needle.is_empty() {
+                return None;
+            }
+            let mut search_start = min_end_exclusive.saturating_sub(needle.len().saturating_sub(1));
+            while search_start > 0 && !text.is_char_boundary(search_start) {
+                search_start -= 1;
+            }
+            text.get(search_start..).and_then(|tail| {
+                tail.find(needle).and_then(|relative_start| {
+                    let start = search_start + relative_start;
+                    let end = start + needle.len();
+                    (end > min_end_exclusive).then(|| (start, end, needle.clone()))
+                })
+            })
+        }
         WatchPattern::Regex(regex) => regex
-            .find(text)
+            .find_iter(text)
+            .find(|m| m.end() > min_end_exclusive)
             .map(|m| (m.start(), m.end(), m.as_str().to_string())),
     }
 }
@@ -284,5 +322,63 @@ mod tests {
             .unwrap();
         let hits = registry.scan_new_bytes(&task_id, b"listening on port 3000\n");
         assert_eq!(hits[0].match_text, "port 3000");
+    }
+
+    #[test]
+    fn substring_pattern_can_span_scans() {
+        let mut registry = WatchRegistry::default();
+        let task_id = "bash-1".to_string();
+        registry
+            .register(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+
+        assert!(registry.scan_new_bytes(&task_id, b"RE").is_empty());
+        let hits = registry.scan_new_bytes(&task_id, b"ADY\n");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_text, "READY");
+        assert_eq!(hits[0].match_offset, 0);
+    }
+
+    #[test]
+    fn regex_pattern_can_span_scans() {
+        let mut registry = WatchRegistry::default();
+        let task_id = "bash-1".to_string();
+        registry
+            .register(
+                task_id.clone(),
+                WatchPattern::regex("ready: \\d{4}").unwrap(),
+                true,
+            )
+            .unwrap();
+
+        assert!(registry
+            .scan_new_bytes(&task_id, b"prefix ready: 4")
+            .is_empty());
+        let hits = registry.scan_new_bytes(&task_id, b"242\n");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_text, "ready: 4242");
+        assert_eq!(hits[0].match_offset, 7);
+    }
+
+    #[test]
+    fn overlap_does_not_repeat_fully_previous_match() {
+        let mut registry = WatchRegistry::default();
+        let task_id = "bash-1".to_string();
+        registry
+            .register(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(registry.scan_new_bytes(&task_id, b"READY").len(), 1);
+        assert!(registry.scan_new_bytes(&task_id, b"\n").is_empty());
     }
 }

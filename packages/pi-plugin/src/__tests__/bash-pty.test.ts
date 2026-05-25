@@ -256,6 +256,36 @@ describe("Pi bash PTY layer", () => {
     expect(__ptyCacheSizeForTests()).toBe(1);
   });
 
+  test("bash_watch PTY scan is independent from bash_status cursor", async () => {
+    const outputPath = await spill("rea");
+    const tools = new Map<string, MockToolDef>();
+    const { ctx: pluginCtx } = ctx(() => ({
+      success: true,
+      status: "running",
+      mode: "pty",
+      output_path: outputPath,
+    }));
+    registerBashTool(api(tools), pluginCtx);
+    await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-pty-shared", output_mode: "raw" }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+    await appendFile(outputPath, "dy\n");
+
+    const result = await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-pty-shared", pattern: "ready", timeout_ms: 1 },
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
+
+    expect(text(result)).toContain('matched "ready" at offset 0');
+  });
+
   test("bash_status cache disposes on terminal status", async () => {
     const outputPath = await spill("done");
     const tools = new Map<string, MockToolDef>();
