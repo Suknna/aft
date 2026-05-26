@@ -232,6 +232,12 @@ fn outline_files_mode_uses_fresh_symbol_cache_without_reparsing() {
     let file = write_file(dir.path(), "cached.ts", &content);
     let original_len = fs::metadata(&file).unwrap().len() as usize;
 
+    // Pin mtime BEFORE warming the cache so platform mtime-precision differences
+    // (e.g. Linux tmpfs truncating sub-microsecond bits) can't cause the cached
+    // mtime to differ from what we set later.
+    let fixed_mtime = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_mtime(&file, fixed_mtime).unwrap();
+
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
 
@@ -244,10 +250,9 @@ fn outline_files_mode_uses_fresh_symbol_cache_without_reparsing() {
         }),
     );
     assert_eq!(warm["success"], true, "cache warm outline failed: {warm:?}");
-    let original_mtime = fs::metadata(&file).unwrap().modified().unwrap();
 
     fs::write(&file, vec![0xff; original_len]).unwrap();
-    set_file_mtime(&file, FileTime::from_system_time(original_mtime)).unwrap();
+    set_file_mtime(&file, fixed_mtime).unwrap();
 
     let resp = outline_files(&mut aft, dir.path());
     assert_eq!(
