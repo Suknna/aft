@@ -346,7 +346,7 @@
       "type": "integer",
       "minimum": 1,
       "default": 5000,
-      "description": "Maximum source files allowed for call-graph operations (callers, trace_to, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool."
+      "description": "Maximum source files allowed for call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool."
     },
     "auto_update": {
       "type": "boolean",
