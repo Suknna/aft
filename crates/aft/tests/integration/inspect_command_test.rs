@@ -155,7 +155,7 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
 }
 
 #[test]
-fn inspect_command_diagnostics_reports_unimplemented_category_as_failed() {
+fn inspect_command_diagnostics_is_not_active_in_v0_33() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/app.ts", "export function app() { return 1; }\n");
     let ctx = configured_context(&root);
@@ -169,17 +169,15 @@ fn inspect_command_diagnostics_reports_unimplemented_category_as_failed() {
         }),
     );
 
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let failed = response["scanner_state"]["failed_categories"]
-        .as_array()
-        .expect("failed categories array");
+    assert_eq!(
+        response["success"], false,
+        "diagnostics should be inactive: {response:#}"
+    );
+    assert_eq!(response["code"], "invalid_request");
     assert!(
-        failed.iter().any(|category| {
-            category["category"] == "diagnostics"
-                && category["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("implementation pending"))
-        }),
-        "diagnostics should surface as a failed scanner: {response:#}"
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("registered but disabled in v0.33")),
+        "diagnostics should be rejected while deferred: {response:#}"
     );
 }

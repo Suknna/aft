@@ -30,8 +30,7 @@ pub enum InspectCategory {
 }
 
 impl InspectCategory {
-    pub const ACTIVE: [InspectCategory; 6] = [
-        InspectCategory::Diagnostics,
+    pub const ACTIVE: [InspectCategory; 5] = [
         InspectCategory::Metrics,
         InspectCategory::Todos,
         InspectCategory::DeadCode,

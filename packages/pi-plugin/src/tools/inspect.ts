@@ -5,7 +5,7 @@
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, coerceOptionalInt, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
@@ -27,11 +27,16 @@ const InspectParams = Type.Object({
   scope: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())], {
       description:
-        "Restrict drill-down items to paths under this scope (file or directory, absolute or relative to project root). Tier 2 categories scan project-wide regardless of scope and apply scope as a result filter.",
+        "Restrict scan/results to paths under this scope (file or directory, absolute or relative to project root). Tier 1 scopes the scan; Tier 2 scans project-wide and applies scope as a result filter.",
     }),
   ),
   topK: Type.Optional(
-    Type.Number({ description: "Max drill-down items per category. Default 20, max 100." }),
+    Type.Integer({
+      minimum: 1,
+      maximum: 100,
+      default: 20,
+      description: "Max drill-down items per category. Default 20, max 100.",
+    }),
   ),
 });
 
@@ -39,6 +44,17 @@ type StringOrStringArray = string | string[];
 
 function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined {
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
+}
+
+function validateOptionalTopK(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error("topK must be an integer between 1 and 100");
+  }
+  if (value < 1 || value > 100) {
+    throw new Error("topK must be between 1 and 100");
+  }
+  return value;
 }
 
 function countFrom(summary: Record<string, unknown> | undefined, key: string): number | undefined {
@@ -52,7 +68,6 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
   if (!response) return [theme.fg("muted", "No inspect snapshot available.")];
 
   const summary = asRecord(response.summary);
-  const diagnostics = asRecord(summary?.diagnostics);
   const metrics = asRecord(summary?.metrics);
   const scannerState = asRecord(response.scanner_state);
   const stale = Array.isArray(scannerState?.stale_categories)
@@ -64,7 +79,6 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
 
   const parts = [
     `todos ${countFrom(summary, "todos") ?? 0}`,
-    `diagnostics ${asNumber(diagnostics?.errors) ?? 0} errors/${asNumber(diagnostics?.warnings) ?? 0} warnings`,
     `metrics ${asNumber(metrics?.files) ?? 0} files/${asNumber(metrics?.symbols) ?? 0} symbols`,
     `dead code ${countFrom(summary, "dead_code") ?? 0}`,
     `unused exports ${countFrom(summary, "unused_exports") ?? 0}`,
@@ -127,8 +141,8 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_inspect",
     label: "inspect",
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, LSP diagnostics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics, diagnostics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results if a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while the cache warms (waits up to 1s for fresh data before falling back to cached). Pi does not warm Tier 2 automatically between calls.\n\n" +
       "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
     parameters: InspectParams,
     async execute(
@@ -141,7 +155,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const sections = normalizeStringOrArray(params.sections);
       const scope = normalizeStringOrArray(params.scope);
-      const topK = coerceOptionalInt(params.topK, "topK", 1, 100);
+      const topK = validateOptionalTopK(params.topK);
       const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx);
       return textResult(
         (response.text as string | undefined) ?? JSON.stringify(response, null, 2),

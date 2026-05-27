@@ -67,6 +67,12 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
 }
 
 #[test]
+fn inspect_engine_active_categories_defer_diagnostics() {
+    assert!(!InspectCategory::active().contains(&InspectCategory::Diagnostics));
+    assert!(!InspectCategory::Diagnostics.is_active());
+}
+
+#[test]
 fn inspect_engine_cache_persists_tier2_contributions_and_aggregate() {
     let (_temp_dir, root, file) = fixture_project();
     let inspect_dir = root.join(".aft-cache").join("inspect");
@@ -244,7 +250,7 @@ fn inspect_engine_command_returns_lane_a_shape() {
         response["success"], true,
         "inspect should succeed: {response:?}"
     );
-    assert!(response["summary"]["diagnostics"].is_object());
+    assert!(response["summary"].get("diagnostics").is_none());
     assert!(response["summary"]["metrics"].is_object());
     assert!(response["summary"]["todos"].is_object());
     assert!(response["details"]["dead_code"].is_array());

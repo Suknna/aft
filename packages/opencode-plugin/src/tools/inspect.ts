@@ -88,8 +88,8 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, LSP diagnostics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics, diagnostics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results if a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
       "Use when: starting work on unfamiliar code, before a refactor, before review, or to verify cleanup completeness.",
     args: {
       sections: arg(
@@ -105,7 +105,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Restrict drill-down items to paths under this scope (file or directory, absolute or relative to project root). Tier 2 categories scan project-wide regardless of scope and apply scope as a result filter.",
+            "Restrict scan/results to paths under this scope (file or directory, absolute or relative to project root). Tier 1 scopes the scan; Tier 2 scans project-wide and applies scope as a result filter.",
           ),
       ),
       topK: arg(

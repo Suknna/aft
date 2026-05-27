@@ -24,6 +24,7 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("Use `aft_navigate`");
     expect(out).toContain("**Codebase health**");
     expect(out).toContain("`aft_inspect`");
+    expect(out).not.toContain("diagnostics");
     expect(out).toContain("**Long-running commands**");
     // Anti-polling guidance must be present so agents stop calling
     // bash_status back-to-back. Mirrors OpenCode plugin parity.

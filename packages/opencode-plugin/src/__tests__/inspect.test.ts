@@ -49,6 +49,11 @@ function createMockSdkContext(directory = "/tmp/inspect-tests"): ToolContext {
   };
 }
 
+function schemaDescription(schema: unknown): string {
+  const record = schema as { description?: string; _def?: { description?: string } };
+  return record.description ?? record._def?.description ?? "";
+}
+
 function createInspectHarness(
   sendImpl: (
     command: string,
@@ -72,6 +77,19 @@ function createInspectHarness(
 }
 
 describe("aft_inspect tool", () => {
+  test("description omits deferred diagnostics and documents scope behavior", () => {
+    const { tools } = createInspectHarness(() => ({ success: true, summary: {} }));
+    const inspect = tools.aft_inspect;
+
+    expect(inspect.description).not.toContain("diagnostics");
+    expect(inspect.description).toContain("Tier 1 (todos, metrics)");
+    expect(inspect.description).toContain("triggered on session idle");
+    expect(schemaDescription(inspect.args.scope)).toContain("Tier 1 scopes the scan");
+    expect(schemaDescription(inspect.args.scope)).toContain(
+      "Tier 2 scans project-wide and applies scope as a result filter",
+    );
+  });
+
   test("sends corrected inspect field names to the bridge", async () => {
     const { sendCalls, tools } = createInspectHarness(() => ({ success: true, summary: {} }));
 
