@@ -35,6 +35,7 @@ export interface AftStatusSnapshot {
     files?: number | null;
     entries_done?: number | null;
     entries_total?: number | null;
+    refreshing_count: number;
     entries: number | null;
     dimension: number | null;
     error?: string | null;
@@ -118,6 +119,19 @@ function formatCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
 }
 
+export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
+  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
+    return "Rebuilding (model changed)";
+  }
+  return status;
+}
+
+export function formatSemanticRefreshing(refreshingCount: number): string | null {
+  if (!Number.isFinite(refreshingCount) || refreshingCount <= 0) return null;
+  if (refreshingCount > 20) return "Ready (many files refreshing)";
+  return `Ready (${refreshingCount} file(s) refreshing)`;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -173,6 +187,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       files: readOptionalNumber(semanticIndex.files),
       entries_done: readOptionalNumber(semanticIndex.entries_done),
       entries_total: readOptionalNumber(semanticIndex.entries_total),
+      refreshing_count: readNumber(semanticIndex.refreshing_count),
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
@@ -216,9 +231,13 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${status.semantic_index.status}`,
-    `- entries: ${formatCount(status.semantic_index.entries)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- ${refreshing}`);
+  }
+  lines.push(`- entries: ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- backend: ${status.semantic_index.backend}`);
   }
@@ -283,9 +302,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${status.semantic_index.status}\``,
-    `- **Entries:** ${formatCount(status.semantic_index.entries)}`,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- **Refresh:** ${refreshing}`);
+  }
+  lines.push(`- **Entries:** ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- **Backend:** ${status.semantic_index.backend}`);
   }

@@ -384,7 +384,14 @@ fn handle_semantic_or_hybrid_search(
                 },
             );
         }
-        SemanticIndexStatus::Ready => {}
+        SemanticIndexStatus::Ready { refreshing } => {
+            if !refreshing.is_empty() {
+                warnings.push(format!(
+                    "{} file(s) refreshing; results for those files may be temporarily missing",
+                    refreshing.len()
+                ));
+            }
+        }
     }
 
     let query_vector = match embed_query(&params.query, ctx) {
@@ -423,8 +430,6 @@ fn handle_semantic_or_hybrid_search(
     // No score threshold: silent filtering produced "0 results" even when the
     // model had reasonable matches the agent could have judged. Surface every
     // hit with its score so the caller can decide.
-
-    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
 
     search_response(
         req,
@@ -891,7 +896,7 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
 
 fn semantic_status_label(status: &SemanticIndexStatus) -> &'static str {
     match status {
-        SemanticIndexStatus::Ready => "ready",
+        SemanticIndexStatus::Ready { .. } => "ready",
         SemanticIndexStatus::Building { .. } => "building",
         SemanticIndexStatus::Disabled => "disabled",
         SemanticIndexStatus::Failed(_) => "unavailable",
@@ -1198,7 +1203,7 @@ mod tests {
                 ..Config::default()
             },
         );
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
         *ctx.semantic_index().borrow_mut() =
             Some(SemanticIndex::new(project.path().to_path_buf(), 384));
 

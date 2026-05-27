@@ -166,6 +166,15 @@ fn detect_worktree_bridge(project_root: &Path) -> (bool, Option<PathBuf>) {
     (git_dir != common_dir, Some(common_dir))
 }
 
+fn semantic_fingerprint_config_changed(
+    previous: &SemanticBackendConfig,
+    next: &SemanticBackendConfig,
+) -> bool {
+    previous.backend != next.backend
+        || previous.model != next.model
+        || previous.base_url != next.base_url
+}
+
 fn parse_semantic_config(
     value: &serde_json::Value,
     current: &SemanticBackendConfig,
@@ -1593,8 +1602,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if semantic_search {
+        let semantic_initial_stage = if previous_config.semantic_search
+            && previous_project_root.as_deref() == Some(root_path.as_path())
+            && semantic_fingerprint_config_changed(&previous_config.semantic, &semantic_config)
+        {
+            "fingerprint_change"
+        } else {
+            "initial"
+        };
         *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-            stage: "queued".to_string(),
+            stage: semantic_initial_stage.to_string(),
             files: None,
             entries_done: None,
             entries_total: None,

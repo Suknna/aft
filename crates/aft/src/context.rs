@@ -88,13 +88,48 @@ use crate::semantic_index::SemanticIndex;
 pub enum SemanticIndexStatus {
     Disabled,
     Building {
+        /// Cold-build only — index is not queryable.
         stage: String,
         files: Option<usize>,
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
-    Ready,
+    Ready {
+        /// Files currently being re-embedded after recent edits. The index is
+        /// still queryable; results for these files may be temporarily missing.
+        refreshing: Vec<PathBuf>,
+    },
     Failed(String),
+}
+
+impl SemanticIndexStatus {
+    pub fn ready() -> Self {
+        Self::Ready {
+            refreshing: Vec::new(),
+        }
+    }
+
+    pub fn add_refreshing_file(&mut self, path: PathBuf) {
+        if let Self::Ready { refreshing } = self {
+            if !refreshing.iter().any(|existing| existing == &path) {
+                refreshing.push(path);
+                refreshing.sort();
+            }
+        }
+    }
+
+    pub fn remove_refreshing_file(&mut self, path: &Path) {
+        if let Self::Ready { refreshing } = self {
+            refreshing.retain(|existing| existing != path);
+        }
+    }
+
+    pub fn refreshing_count(&self) -> usize {
+        match self {
+            Self::Ready { refreshing } => refreshing.len(),
+            _ => 0,
+        }
+    }
 }
 
 pub enum SemanticIndexEvent {

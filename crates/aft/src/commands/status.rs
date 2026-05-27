@@ -72,20 +72,30 @@ impl AppContext {
 
         // Semantic index status
         let semantic_index_info = {
+            let status = self.semantic_index_status().borrow().clone();
+            let refreshing_count = status.refreshing_count();
             let index = self.semantic_index().borrow();
             match index.as_ref() {
                 Some(idx) => {
+                    let status_label = match status {
+                        SemanticIndexStatus::Ready { .. } => "ready",
+                        _ => idx.status_label(),
+                    };
                     serde_json::json!({
-                        "status": idx.status_label(),
+                        "status": status_label,
+                        "state": status_label,
+                        "refreshing_count": refreshing_count,
                         "entries": idx.entry_count(),
                         "dimension": idx.dimension(),
                         "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
                         "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                     })
                 }
-                None => match &*self.semantic_index_status().borrow() {
+                None => match status {
                     SemanticIndexStatus::Disabled => serde_json::json!({
                         "status": "disabled",
+                        "state": "disabled",
+                        "refreshing_count": 0,
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
@@ -96,6 +106,8 @@ impl AppContext {
                         entries_total,
                     } => serde_json::json!({
                         "status": "loading",
+                        "state": "loading",
+                        "refreshing_count": 0,
                         "stage": stage,
                         "files": files,
                         "entries_done": entries_done,
@@ -103,13 +115,17 @@ impl AppContext {
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
-                    SemanticIndexStatus::Ready => serde_json::json!({
+                    SemanticIndexStatus::Ready { refreshing } => serde_json::json!({
                         "status": "ready",
+                        "state": "ready",
+                        "refreshing_count": refreshing.len(),
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
                     SemanticIndexStatus::Failed(error) => serde_json::json!({
                         "status": "failed",
+                        "state": "failed",
+                        "refreshing_count": 0,
                         "error": error,
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),

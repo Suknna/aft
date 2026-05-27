@@ -11,7 +11,13 @@ import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus, type StatusCompression } from "../shared/status";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatSemanticIndexStatus,
+  formatSemanticRefreshing,
+  type StatusCompression,
+} from "../shared/status";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 
 const SINGLE_BORDER = { type: "single" } as any;
@@ -341,7 +347,16 @@ const SidebarContent = (props: {
   // Pre-compute display values so the JSX stays readable. createMemo for
   // each derived field would be overkill — these are cheap derivations.
   const searchStatus = () => statusDisplay(s()?.search_index?.status ?? "disabled");
-  const semanticStatus = () => statusDisplay(s()?.semantic_index?.status ?? "disabled");
+  const semanticStatus = () => {
+    const rawStatus = s()?.semantic_index?.status ?? "disabled";
+    const display = statusDisplay(rawStatus);
+    return {
+      ...display,
+      label: formatSemanticIndexStatus(rawStatus, s()?.semantic_index?.stage),
+    };
+  };
+  const semanticRefreshing = () =>
+    formatSemanticRefreshing(s()?.semantic_index?.refreshing_count ?? 0);
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
@@ -463,6 +478,11 @@ const SidebarContent = (props: {
             value={semanticStatus().label}
             tone={semanticStatus().tone}
           />
+          {semanticRefreshing() && (
+            <box width="100%">
+              <text fg={props.theme.textMuted}>{semanticRefreshing()}</text>
+            </box>
+          )}
           {/* When loading, magic-context-style progress hint helps users see
           background work is making progress instead of stuck. */}
           {s()?.semantic_index?.status === "loading" &&

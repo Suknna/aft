@@ -734,29 +734,37 @@ fn drain_watcher_events(ctx: &AppContext) {
     }
 
     let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
+    let mut semantic_status_changed = false;
     if let Some(index) = semantic_index_ref.as_mut() {
-        let mut semantic_stale = false;
+        let mut stale_paths = Vec::new();
         for path in &changed {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if SOURCE_EXTENSIONS.contains(&ext) {
                     index.invalidate_file(path);
                     if path.exists() {
-                        semantic_stale = true;
+                        stale_paths.push(path.clone());
                     }
                 }
             }
         }
-        if semantic_stale {
-            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-                stage: "stale_after_file_change".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
+        if !stale_paths.is_empty() {
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in stale_paths {
+                    status.add_refreshing_file(path);
+                }
+                semantic_status_changed = true;
+            }
         }
     }
 
+    drop(semantic_index_ref);
+    drop(index_ref);
+
     aft::slog_info!("invalidated {} files", changed.len());
+    if semantic_status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
 }
 
 fn drain_search_index_events(ctx: &AppContext) {
@@ -816,7 +824,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
             }
             SemanticIndexEvent::Ready(index) => {
                 *ctx.semantic_index().borrow_mut() = Some(index);
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
                 keep_receiver = false;
                 status_changed = true;
             }

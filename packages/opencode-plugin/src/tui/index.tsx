@@ -6,7 +6,13 @@ import { createMemo, createSignal, onCleanup } from "solid-js";
 
 import { version as packageVersion } from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatBytes,
+  formatSemanticIndexStatus,
+  formatSemanticRefreshing,
+} from "../shared/status";
 import {
   createAftSidebarSlot,
   formatCompressionSidebarRows,
@@ -331,9 +337,19 @@ const StatusDialog = (props: StatusDialogProps) => {
             <R
               theme={t()}
               label="Status"
-              value={status()!.semantic_index.status}
+              value={formatSemanticIndexStatus(
+                status()!.semantic_index.status,
+                status()!.semantic_index.stage,
+              )}
               tone={statusTone(status()!.semantic_index.status)}
             />
+            {formatSemanticRefreshing(status()!.semantic_index.refreshing_count) ? (
+              <box width="100%">
+                <text fg={t().textMuted}>
+                  {formatSemanticRefreshing(status()!.semantic_index.refreshing_count)}
+                </text>
+              </box>
+            ) : null}
             <R
               theme={t()}
               label="Entries"
