@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
 import { askGrepPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -48,8 +48,12 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       ),
     },
     execute: async (args, context): Promise<string> => {
-      if (typeof args.query !== "string" || args.query.length === 0) {
-        throw new Error("semantic_search: invalid params: missing field `query`");
+      if (
+        isEmptyParam(args.query) ||
+        typeof args.query !== "string" ||
+        args.query.trim().length === 0
+      ) {
+        throw new Error("semantic_search: invalid params: `query` must be a non-empty string");
       }
       const query = args.query;
       const hint = typeof args.hint === "string" ? args.hint : undefined;
@@ -79,11 +83,21 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         throw new Error((response.message as string) || "semantic_search failed");
       }
 
-      if (typeof response.text === "string") {
+      if (
+        typeof response.text === "string" &&
+        response.status === "disabled" &&
+        Array.isArray(response.results) &&
+        response.results.length === 0
+      ) {
         return response.text;
       }
 
-      return JSON.stringify(response);
+      const structured = JSON.stringify(response, null, 2);
+      if (typeof response.text === "string" && response.text.length > 0) {
+        return `${response.text}\n\nStructured response:\n${structured}`;
+      }
+
+      return structured;
     },
   };
 

@@ -73,6 +73,14 @@ function createMockSemanticHarness(
   };
 }
 
+function parseStructuredOutput(output: string): Record<string, unknown> {
+  const marker = "\n\nStructured response:\n";
+  const json = output.includes(marker)
+    ? output.slice(output.indexOf(marker) + marker.length)
+    : output;
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
 describe("semanticTools", () => {
   test("registers aft_search", () => {
     const { tools } = createMockSemanticHarness({}, () => ({ success: true }));
@@ -80,12 +88,28 @@ describe("semanticTools", () => {
     expect(Object.keys(tools)).toEqual(["aft_search"]);
   });
 
-  test("returns response.text and sends semantic_search params", async () => {
+  test("returns text plus structured response and sends semantic_search params", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
-    const { bridgeCalls, sendCalls, tools } = createMockSemanticHarness({}, () => ({
+    const bridgeResponse = {
       success: true,
       text: "src/auth.ts\nvalidateToken [function] lines 10-32 score 0.913",
-    }));
+      interpreted_as: "hybrid",
+      semantic_status: "ready",
+      more_available: true,
+      engine_capped: false,
+      fully_degraded: false,
+      warnings: ["short_query_rerouted"],
+      results: [
+        {
+          file: "src/auth.ts",
+          name: "validateToken",
+          kind: "function",
+          source: "hybrid",
+          score: 0.913,
+        },
+      ],
+    };
+    const { bridgeCalls, sendCalls, tools } = createMockSemanticHarness({}, () => bridgeResponse);
 
     const output = await tools.aft_search.execute(
       { query: "authentication logic", topK: 5 },
@@ -104,7 +128,31 @@ describe("semanticTools", () => {
         },
       },
     ]);
-    expect(output).toBe("src/auth.ts\nvalidateToken [function] lines 10-32 score 0.913");
+    expect(output).toContain(bridgeResponse.text);
+    const structured = parseStructuredOutput(output);
+    expect(structured.interpreted_as).toBe("hybrid");
+    expect(structured.semantic_status).toBe("ready");
+    expect(structured.more_available).toBe(true);
+    expect(structured.engine_capped).toBe(false);
+    expect(structured.fully_degraded).toBe(false);
+    expect(structured.warnings).toEqual(["short_query_rerouted"]);
+    const results = structured.results as Array<Record<string, unknown>>;
+    expect(results[0].source).toBe("hybrid");
+  });
+
+  test("rejects blank queries before permission or bridge calls", async () => {
+    const ask = mockAsk();
+    const sdkCtx = createMockSdkContext("/tmp/project", ask);
+    const sendImpl = mock(() => ({ success: true, text: "should not call" }));
+    const { sendCalls, tools } = createMockSemanticHarness({}, sendImpl);
+
+    await expect(tools.aft_search.execute({ query: "   " }, sdkCtx)).rejects.toThrow(
+      "invalid params",
+    );
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(sendCalls).toEqual([]);
+    expect(sendImpl).not.toHaveBeenCalled();
   });
 
   test("returns semantic runtime errors as user-friendly text", async () => {

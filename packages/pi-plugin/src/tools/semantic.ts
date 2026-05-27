@@ -7,7 +7,7 @@
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
@@ -28,7 +28,12 @@ const SearchParams = Type.Object({
       "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
   }),
   topK: Type.Optional(
-    Type.Number({ description: "Maximum number of results (default: 10, max: 100)" }),
+    Type.Integer({
+      minimum: 1,
+      maximum: 100,
+      default: 10,
+      description: "Maximum number of results (default: 10, max: 100)",
+    }),
   ),
   hint: Type.Optional(
     Type.Union(
@@ -180,12 +185,23 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       _onUpdate,
       extCtx,
     ) {
+      if (
+        isEmptyParam(params.query) ||
+        typeof params.query !== "string" ||
+        params.query.trim().length === 0
+      ) {
+        throw new Error("semantic_search: invalid params: `query` must be a non-empty string");
+      }
+
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = { query: params.query };
       if (params.topK !== undefined) req.top_k = params.topK;
       if (params.hint !== undefined) req.hint = params.hint;
       const response = await callBridge(bridge, "semantic_search", req, extCtx);
-      return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
+      return textResult(
+        (response.text as string | undefined) ?? JSON.stringify(response, null, 2),
+        response,
+      );
     },
     renderCall(args, theme, context) {
       return renderSemanticCall(args, theme, context);
