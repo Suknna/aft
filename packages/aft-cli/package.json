@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortexkit/aft"
+    "url": "git+https://github.com/cortexkit/aft.git"
   },
   "bin": {
     "aft": "dist/index.js"
