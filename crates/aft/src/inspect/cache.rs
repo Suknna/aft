@@ -370,6 +370,32 @@ impl InspectCache {
         }
     }
 
+    pub(crate) fn touch_tier2_last_full_run(
+        &self,
+        category: InspectCategory,
+    ) -> Result<i64, InspectCacheError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let tx = conn.transaction()?;
+        let previous = tx
+            .query_row(
+                "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+                params![category.as_str(), self.project_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let now = unix_seconds_now();
+        let last_full_run = previous.map_or(now, |previous| now.max(previous.saturating_add(1)));
+        tx.execute(
+            "INSERT INTO tier2_meta (category, project_key, last_full_run) VALUES (?1, ?2, ?3)              ON CONFLICT(category, project_key) DO UPDATE SET last_full_run = excluded.last_full_run",
+            params![category.as_str(), self.project_key, last_full_run],
+        )?;
+        tx.commit()?;
+        Ok(last_full_run)
+    }
+
     pub(crate) fn store_tier2_aggregate(
         &self,
         key: JobKey,

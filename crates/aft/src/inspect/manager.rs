@@ -369,6 +369,9 @@ impl InspectManager {
             .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
             .map_err(|error| error.to_string())?
         {
+            cache
+                .touch_tier2_last_full_run(job.category)
+                .map_err(|error| error.to_string())?;
             let contributions = load_contributions(cache, job)?;
             return Ok(InspectScanSuccess {
                 scanned_files: scan_files,
@@ -672,86 +675,12 @@ fn roll_up_tier2_contributions(job: &InspectJob, contributions: &[FileContributi
 }
 
 fn roll_up_dead_code_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
-    let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
-        return json!({
-            "count": 0,
-            "items": [],
-            "drill_down_capped": false,
-            "callgraph_available": false,
-            "scanned_files": job.scope_files.len(),
-            "notes": ["callgraph_unavailable"],
-        });
-    };
-
-    let parsed = contributions
-        .iter()
-        .filter_map(|contribution| {
-            serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone()).ok()
-        })
-        .collect::<Vec<_>>();
-
-    let mut exports_by_symbol: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for contribution in &parsed {
-        for export in &contribution.exports {
-            exports_by_symbol
-                .entry(export.symbol.clone())
-                .or_default()
-                .push(contribution.file.clone());
-        }
+    if job.callgraph_snapshot.is_none() {
+        return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
     }
 
-    let mut callers_by_export: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    for contribution in &parsed {
-        for call in &contribution.internal_calls {
-            if let Some(files) = exports_by_symbol.get(&call.symbol) {
-                for file in files {
-                    callers_by_export
-                        .entry((file.clone(), call.symbol.clone()))
-                        .or_default()
-                        .insert(contribution.file.clone());
-                }
-            }
-        }
-    }
-
-    let entry_points = snapshot
-        .entry_points
-        .iter()
-        .map(|file| relative_display_path(&job.project_root, file))
-        .collect::<BTreeSet<_>>();
-    let public_api_files = collect_dead_code_public_api_files(&job.project_root);
-
-    let mut dead_items = Vec::new();
-    for contribution in &parsed {
-        let is_entry_point_file = entry_points.contains(&contribution.file);
-        let is_public_api_file = public_api_files.contains(&contribution.file);
-        for export in &contribution.exports {
-            if callers_by_export.contains_key(&(contribution.file.clone(), export.symbol.clone())) {
-                continue;
-            }
-            if is_entry_point_file || is_public_api_file {
-                continue;
-            }
-            dead_items.push(json!({
-                "file": contribution.file,
-                "symbol": export.symbol,
-                "kind": export.kind,
-                "line": export.line,
-            }));
-        }
-    }
-
-    let count = dead_items.len();
-    let drill_down_capped = count > MAX_DRILL_DOWN_ITEMS;
-    dead_items.truncate(MAX_DRILL_DOWN_ITEMS);
-
-    json!({
-        "count": count,
-        "items": dead_items,
-        "drill_down_capped": drill_down_capped,
-        "callgraph_available": true,
-        "scanned_files": contributions.len(),
-    })
+    let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
+    super::scanners::dead_code::aggregate_dead_code_contributions(contributions, &public_api_files)
 }
 
 fn roll_up_unused_exports_contributions(
@@ -837,122 +766,20 @@ fn roll_up_unused_exports_contributions(
 }
 
 fn roll_up_duplicate_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
-    let parsed = contributions
-        .iter()
-        .filter_map(|contribution| {
-            serde_json::from_value::<DuplicateContribution>(contribution.contribution.clone()).ok()
-        })
-        .collect::<Vec<_>>();
-    let mut by_hash = BTreeMap::<String, Vec<DuplicateOccurrence>>::new();
-
-    for scan in &parsed {
-        for fragment in &scan.fragments {
-            by_hash
-                .entry(fragment.hash.clone())
-                .or_default()
-                .push(DuplicateOccurrence {
-                    file: scan.file.clone(),
-                    start_line: fragment.start_line,
-                    end_line: fragment.end_line,
-                    cost: fragment.cost,
-                });
-        }
-    }
-
-    let mut groups = by_hash
-        .into_values()
-        .filter_map(|mut occurrences| {
-            occurrences.sort_by(|left, right| {
-                left.file
-                    .cmp(&right.file)
-                    .then(left.start_line.cmp(&right.start_line))
-                    .then(left.end_line.cmp(&right.end_line))
-            });
-            if occurrences.len() < 2 {
-                return None;
-            }
-            let sample = &occurrences[0];
-            Some(json!({
-                "files": occurrences
-                    .iter()
-                    .map(|occurrence| format!(
-                        "{}:{}-{}",
-                        occurrence.file, occurrence.start_line, occurrence.end_line
-                    ))
-                    .collect::<Vec<_>>(),
-                "cost": sample.cost,
-                "sample_file": sample.file,
-                "sample_start_line": sample.start_line,
-                "sample_end_line": sample.end_line,
-            }))
-        })
-        .collect::<Vec<_>>();
-
-    groups.sort_by(|left, right| {
-        let left_cost = left.get("cost").and_then(Value::as_u64).unwrap_or(0);
-        let right_cost = right.get("cost").and_then(Value::as_u64).unwrap_or(0);
-        right_cost
-            .cmp(&left_cost)
-            .then_with(|| {
-                left.get("sample_file")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .cmp(
-                        right
-                            .get("sample_file")
-                            .and_then(Value::as_str)
-                            .unwrap_or(""),
-                    )
-            })
-            .then_with(|| {
-                left.get("sample_start_line")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .cmp(
-                        &right
-                            .get("sample_start_line")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    )
-            })
-    });
-
-    let groups_count = groups.len();
-    let drill_down_capped = groups_count > MAX_DRILL_DOWN_ITEMS;
-    let items = groups
-        .into_iter()
-        .take(MAX_DRILL_DOWN_ITEMS)
-        .collect::<Vec<_>>();
-
-    json!({
-        "groups_count": groups_count,
-        "items": items,
-        "drill_down_capped": drill_down_capped,
-        "scanned_files": parsed.len(),
-        "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::Duplicates),
-    })
+    super::scanners::duplicates::aggregate_duplicate_contributions(
+        contributions,
+        skipped_languages(&job.scope_files, LanguageSkipMode::Duplicates),
+    )
 }
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
 #[derive(Debug, Clone, Deserialize)]
-struct DeadCodeContribution {
-    file: String,
-    exports: Vec<ExportContribution>,
-    internal_calls: Vec<InternalCallContribution>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct ExportContribution {
     symbol: String,
     kind: String,
     line: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct InternalCallContribution {
-    symbol: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -966,28 +793,6 @@ struct UnusedExportsContribution {
 struct ImportContribution {
     resolved_file: Option<String>,
     named: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DuplicateContribution {
-    file: String,
-    fragments: Vec<DuplicateFragmentContribution>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DuplicateFragmentContribution {
-    hash: String,
-    start_line: u32,
-    end_line: u32,
-    cost: u32,
-}
-
-#[derive(Debug, Clone)]
-struct DuplicateOccurrence {
-    file: String,
-    start_line: u32,
-    end_line: u32,
-    cost: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1076,126 +881,6 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Lua => "lua",
         crate::parser::LangId::Perl => "perl",
     }
-}
-
-fn collect_dead_code_public_api_files(project_root: &Path) -> BTreeSet<String> {
-    let mut files = BTreeSet::new();
-    collect_package_public_api(project_root, project_root, &mut files);
-
-    let package_json = project_root.join("package.json");
-    let Ok(bytes) = std::fs::read(&package_json) else {
-        return files;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return files;
-    };
-
-    for workspace in workspace_dirs(project_root, &package) {
-        collect_package_public_api(project_root, &workspace, &mut files);
-    }
-
-    files
-}
-
-fn collect_package_public_api(
-    project_root: &Path,
-    package_dir: &Path,
-    files: &mut BTreeSet<String>,
-) {
-    let package_json = package_dir.join("package.json");
-    let Ok(bytes) = std::fs::read(package_json) else {
-        return;
-    };
-    let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-
-    if let Some(main) = package.get("main").and_then(Value::as_str) {
-        insert_public_api_path(project_root, package_dir, main, files);
-    }
-    if let Some(exports) = package.get("exports") {
-        collect_export_values(project_root, package_dir, exports, files);
-    }
-}
-
-fn collect_export_values(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &Value,
-    files: &mut BTreeSet<String>,
-) {
-    match value {
-        Value::String(path) => insert_public_api_path(project_root, package_dir, path, files),
-        Value::Array(values) => {
-            for value in values {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values() {
-                collect_export_values(project_root, package_dir, value, files);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn insert_public_api_path(
-    project_root: &Path,
-    package_dir: &Path,
-    value: &str,
-    files: &mut BTreeSet<String>,
-) {
-    if value.starts_with('#') || value.contains('*') {
-        return;
-    }
-
-    let trimmed = value.trim_start_matches("./");
-    if trimmed.is_empty() {
-        return;
-    }
-
-    let path = package_dir.join(trimmed);
-    files.insert(relative_display_path(project_root, &path));
-}
-
-fn workspace_dirs(project_root: &Path, package: &Value) -> Vec<PathBuf> {
-    let Some(workspaces) = package.get("workspaces") else {
-        return Vec::new();
-    };
-
-    let patterns = match workspaces {
-        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
-        Value::Object(map) => map
-            .get("packages")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-
-    let mut dirs = Vec::new();
-    for pattern in patterns {
-        let pattern = pattern.trim_end_matches('/');
-        if let Some(prefix) = pattern.strip_suffix("/*") {
-            let parent = project_root.join(prefix);
-            let Ok(entries) = std::fs::read_dir(parent) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.join("package.json").is_file() {
-                    dirs.push(path);
-                }
-            }
-        } else {
-            let path = project_root.join(pattern);
-            if path.join("package.json").is_file() {
-                dirs.push(path);
-            }
-        }
-    }
-    dirs
 }
 
 fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<String>) {
@@ -1350,6 +1035,12 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         let count = items.len();
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
+            if object.contains_key("total_groups") {
+                object.insert("total_groups".to_string(), serde_json::json!(count));
+            }
+            if object.contains_key("groups_count") {
+                object.insert("groups_count".to_string(), serde_json::json!(count));
+            }
         }
     }
 
@@ -1376,9 +1067,25 @@ fn value_matches_scope(value: &serde_json::Value, scope: &JobScope) -> bool {
         return files
             .iter()
             .filter_map(|file| file.as_str())
-            .any(|file| scope.contains_display_path(file));
+            .any(|file| scope.contains_display_path(display_file_from_occurrence(file)));
     }
     true
+}
+
+fn display_file_from_occurrence(value: &str) -> &str {
+    let Some((file, range)) = value.rsplit_once(':') else {
+        return value;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return value;
+    };
+    if start.chars().all(|char| char.is_ascii_digit())
+        && end.chars().all(|char| char.is_ascii_digit())
+    {
+        file
+    } else {
+        value
+    }
 }
 
 #[allow(dead_code)]
