@@ -79,8 +79,24 @@ fn install_lexical_index(ctx: &AppContext, source_file: &Path, source: &str) {
 }
 
 fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
+    start_mock_embedding_server_with_response(
+        "200 OK",
+        r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#,
+    )
+}
+
+fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
+    start_mock_embedding_server_with_response("400 Bad Request", r#"{"error":"embedding boom"}"#)
+}
+
+fn start_mock_embedding_server_with_response(
+    status: &str,
+    body: &str,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
     let addr = listener.local_addr().expect("embedding server addr");
+    let status = status.to_string();
+    let body = body.to_string();
     let handle = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept embedding request");
         let mut buf = Vec::new();
@@ -114,9 +130,8 @@ fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
             }
         }
 
-        let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -156,6 +171,47 @@ fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
     );
 }
 
+fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
+    assert_eq!(
+        response["success"], true,
+        "response should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["semantic_unavailable"], true);
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert_eq!(response["semantic_status"], semantic_status);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["status"], "ready");
+    assert_eq!(response["fully_degraded"], true);
+    assert_eq!(response["engine_capped"], false);
+
+    let results = response["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|result| result["kind"] == "GrepLine"
+            && result["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("src/lib.rs"))
+            && result["line_text"]
+                .as_str()
+                .is_some_and(|line| line.contains("needle_symbol"))),
+        "expected degraded grep fallback result, got {results:?}"
+    );
+
+    let warnings = response["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("lexical-only fallback"))),
+        "expected lexical fallback warning, got {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("degraded full-file-scan"))),
+        "expected degraded full-file-scan warning, got {warnings:?}"
+    );
+}
+
 #[test]
 fn blank_queries_are_rejected_before_routing() {
     let project = tempfile::tempdir().expect("create project dir");
@@ -192,6 +248,46 @@ fn hybrid_failed_semantic_uses_lexical_only_fallback() {
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
     assert_lexical_fallback(&response, "unavailable");
+}
+
+#[test]
+fn auto_mode_falls_back_to_grep_when_trigram_unavailable_and_semantic_disabled() {
+    let (project, _source_file, _source) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
+
+    assert_degraded_grep_fallback(&response, "disabled");
+}
+
+#[test]
+fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
+    let (project, _source_file, _source) = project_with_needle();
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context(project.path(), base_url);
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+    *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+    let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
+
+    assert_degraded_grep_fallback(&response, "unavailable");
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
+fn explicit_hint_semantic_still_fails_cleanly_when_no_fallback_available() {
+    let (project, _source_file, _source) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with("needle_symbol", Some("semantic")),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "semantic_unavailable");
 }
 
 #[test]
