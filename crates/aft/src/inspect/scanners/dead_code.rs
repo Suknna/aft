@@ -24,15 +24,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         let success = InspectScanSuccess {
             scanned_files: job.scope_files.clone(),
             contributions: Vec::new(),
-            aggregate: json!({
-                "count": 0,
-                "items": [],
-                "by_language": {},
-                "drill_down_capped": false,
-                "callgraph_available": false,
-                "scanned_files": job.scope_files.len(),
-                "notes": ["callgraph_unavailable"],
-            }),
+            aggregate: callgraph_unavailable_aggregate(job.scope_files.len()),
         };
         return InspectResult::success(job, success, started.elapsed());
     };
@@ -61,7 +53,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         .collect::<Vec<_>>();
 
     let public_api_files = collect_public_api_files(&job.project_root);
-    let aggregate = roll_up_dead_code(&contributions, &public_api_files);
+    let aggregate = aggregate_dead_code_contributions(&contributions, &public_api_files);
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
         contributions,
@@ -163,7 +155,19 @@ fn gather_file_contribution(
     )
 }
 
-fn roll_up_dead_code(
+pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
+    json!({
+        "count": 0,
+        "items": [],
+        "by_language": {},
+        "drill_down_capped": false,
+        "callgraph_available": false,
+        "scanned_files": scanned_files,
+        "notes": ["callgraph_unavailable"],
+    })
+}
+
+pub(crate) fn aggregate_dead_code_contributions(
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
 ) -> serde_json::Value {
@@ -402,7 +406,7 @@ fn clean_symbol(symbol: &str) -> Option<String> {
     }
 }
 
-fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> {
+pub(crate) fn collect_public_api_files(project_root: &Path) -> BTreeSet<String> {
     let mut files = BTreeSet::new();
     collect_package_public_api(project_root, project_root, &mut files);
 
@@ -436,6 +440,9 @@ fn collect_package_public_api(
 
     if let Some(main) = package.get("main").and_then(Value::as_str) {
         insert_public_api_path(project_root, package_dir, main, files);
+    }
+    if let Some(module) = package.get("module").and_then(Value::as_str) {
+        insert_public_api_path(project_root, package_dir, module, files);
     }
     if let Some(exports) = package.get("exports") {
         collect_export_values(project_root, package_dir, exports, files);

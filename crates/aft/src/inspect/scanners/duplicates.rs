@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -21,7 +21,7 @@ const MAX_GROUP_ITEMS: usize = 100;
 const VARIABLE_SENTINEL: &str = "_var";
 const FIELD_SENTINEL: &str = "_field";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct DuplicateFragment {
     hash: String,
     start_line: u32,
@@ -55,6 +55,12 @@ struct DuplicateGroup {
     sample_end_line: u32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DuplicateContribution {
+    file: String,
+    fragments: Vec<DuplicateFragment>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NodeDigest {
     hash: blake3::Hash,
@@ -74,11 +80,14 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
         Err(message) => return InspectResult::failed(job, message, started.elapsed()),
     };
 
-    let aggregate = build_aggregate(&file_scans);
     let contributions = file_scans
         .iter()
         .map(file_scan_to_contribution)
         .collect::<Vec<_>>();
+    let aggregate = aggregate_duplicate_contributions(
+        &contributions,
+        skipped_languages_from_file_scans(&file_scans),
+    );
     let scanned_files = file_scans
         .iter()
         .map(|scan| scan.path.clone())
@@ -300,20 +309,25 @@ fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
     )
 }
 
-fn build_aggregate(file_scans: &[FileScan]) -> serde_json::Value {
+pub(crate) fn aggregate_duplicate_contributions(
+    contributions: &[FileContribution],
+    languages_skipped: Vec<String>,
+) -> serde_json::Value {
+    let parsed = contributions
+        .iter()
+        .filter_map(|contribution| {
+            serde_json::from_value::<DuplicateContribution>(contribution.contribution.clone()).ok()
+        })
+        .collect::<Vec<_>>();
     let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
-    let mut languages_skipped = BTreeSet::<String>::new();
 
-    for scan in file_scans {
-        if let Some(language) = scan.language_skipped {
-            languages_skipped.insert(language.to_string());
-        }
+    for scan in &parsed {
         for fragment in &scan.fragments {
             by_hash
                 .entry(fragment.hash.clone())
                 .or_default()
                 .push(FragmentOccurrence {
-                    file: scan.display_path.clone(),
+                    file: scan.file.clone(),
                     start_line: fragment.start_line,
                     end_line: fragment.end_line,
                     cost: fragment.cost,
@@ -355,9 +369,19 @@ fn build_aggregate(file_scans: &[FileScan]) -> serde_json::Value {
         "groups_count": groups_count,
         "items": items,
         "drill_down_capped": drill_down_capped,
-        "scanned_files": file_scans.len(),
-        "languages_skipped": languages_skipped.into_iter().collect::<Vec<_>>(),
+        "scanned_files": parsed.len(),
+        "languages_skipped": languages_skipped,
     })
+}
+
+fn skipped_languages_from_file_scans(file_scans: &[FileScan]) -> Vec<String> {
+    file_scans
+        .iter()
+        .filter_map(|scan| scan.language_skipped)
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn occurrences_to_group(occurrences: &[FragmentOccurrence]) -> DuplicateGroup {
