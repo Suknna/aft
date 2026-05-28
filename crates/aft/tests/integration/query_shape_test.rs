@@ -69,6 +69,9 @@ fn classifies_path_queries_before_error_or_identifier_patterns() {
         "/tmp/E1234.log",
         "./foo/bar.json",
         "foo.bar",
+        "a.b.c",
+        "https://example.com",
+        "react?.js",
     ] {
         assert_shape(query, QueryKind::Path, expected);
     }
@@ -137,6 +140,10 @@ fn classifies_regex_queries() {
         "[a-z]+",
         "foo|bar",
         "(?:foo)",
+        "foo*",
+        "foo+",
+        "colou?r",
+        "foo*bar",
     ] {
         assert_shape(query, QueryKind::Regex, expected);
     }

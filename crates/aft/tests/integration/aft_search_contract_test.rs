@@ -232,6 +232,61 @@ fn regex_grep_success_reports_ready_status_not_semantic_backend_status() {
 }
 
 #[test]
+fn auto_bare_quantifier_queries_route_to_regex_grep() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(&source_file, "foo foobar color colour fooooooobar\n")
+        .expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    for query in ["foo*", "foo+", "colou?r", "foo*bar"] {
+        let response = response_value(handle_semantic_search(&request(query), &ctx));
+
+        assert_eq!(
+            response["success"], true,
+            "auto regex query should succeed for {query:?}: {response:?}"
+        );
+        assert_eq!(response["interpreted_as"], "regex", "query: {query:?}");
+        assert_eq!(response["query_kind"], "Regex", "query: {query:?}");
+        assert_eq!(response["semantic_status"], "disabled", "query: {query:?}");
+    }
+}
+
+#[test]
+fn auto_short_identifier_tokens_use_literal_scan() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(&source_file, "let id = 1;\nlet ab = id;\n").expect("write source file");
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Disabled;
+
+    for query in ["id", "ab"] {
+        let response = response_value(handle_semantic_search(&request(query), &ctx));
+
+        assert_eq!(
+            response["success"], true,
+            "auto short-token query should succeed for {query:?}: {response:?}"
+        );
+        assert_ne!(response["interpreted_as"], "semantic", "query: {query:?}");
+        assert_eq!(response["interpreted_as"], "literal", "query: {query:?}");
+        assert_eq!(response["query_kind"], "Identifier", "query: {query:?}");
+        assert!(
+            response["results"]
+                .as_array()
+                .expect("results array")
+                .iter()
+                .any(|result| result["kind"] == "GrepLine" && result["match_text"] == query),
+            "expected exact grep-line match for {query:?}: {response:?}"
+        );
+    }
+}
+
+#[test]
 fn hybrid_ready_semantic_reports_complete_success() {
     let (project, source_file, source) = project_with_needle();
     let (base_url, handle) = start_mock_embedding_server();

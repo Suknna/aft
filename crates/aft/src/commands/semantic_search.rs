@@ -183,9 +183,9 @@ fn choose_mode(
             if shape.kind != QueryKind::NaturalLanguage && extracted_tokens_all_short(query, shape)
             {
                 warnings.push(
-                    "Auto mode treats all-short exact tokens as semantic search; pass hint:'literal' for exact matching.".to_string(),
+                    "Auto mode is using literal full-file scan for all-short exact tokens because the trigram index cannot rank tokens shorter than 3 chars.".to_string(),
                 );
-                return SearchMode::Semantic;
+                return SearchMode::Literal;
             }
             if shape.kind == QueryKind::NaturalLanguage {
                 return SearchMode::Semantic;

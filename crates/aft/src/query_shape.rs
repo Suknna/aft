@@ -375,13 +375,59 @@ fn multi_char_non_identifier_class(content: &str) -> bool {
 }
 
 fn tier_c_adjacent_meta(query: &str) -> bool {
-    has_dot_quantifier(query) || has_regex_pipe(query) || escaped_paren_count(query) >= 2
+    has_dot_quantifier(query)
+        || has_literal_atom_quantifier(query)
+        || has_regex_pipe(query)
+        || escaped_paren_count(query) >= 2
 }
 
 fn has_dot_quantifier(query: &str) -> bool {
     [".*", ".+", ".?"]
         .iter()
         .any(|signal| query.contains(signal) && query.trim().len() > signal.len())
+}
+
+fn has_literal_atom_quantifier(query: &str) -> bool {
+    let chars = query.char_indices().collect::<Vec<_>>();
+    for (index, (byte_index, ch)) in chars.iter().copied().enumerate() {
+        if !is_bare_quantifier(ch) || is_escaped_at(query, byte_index) {
+            continue;
+        }
+        if chars
+            .get(index + 1)
+            .is_some_and(|(_, next)| is_bare_quantifier(*next))
+        {
+            continue;
+        }
+        if previous_is_literal_atom(&chars, index) {
+            return true;
+        }
+    }
+    false
+}
+
+fn previous_is_literal_atom(chars: &[(usize, char)], quantifier_index: usize) -> bool {
+    let Some((_, previous)) = quantifier_index
+        .checked_sub(1)
+        .and_then(|previous_index| chars.get(previous_index))
+    else {
+        return false;
+    };
+
+    previous.is_ascii_alphanumeric() || *previous == '_' || *previous == ')' || *previous == ']'
+}
+
+fn is_bare_quantifier(ch: char) -> bool {
+    matches!(ch, '*' | '+' | '?')
+}
+
+fn is_escaped_at(query: &str, byte_index: usize) -> bool {
+    let backslash_count = query[..byte_index]
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\\')
+        .count();
+    backslash_count % 2 == 1
 }
 
 fn has_regex_pipe(query: &str) -> bool {
