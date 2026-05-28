@@ -1420,7 +1420,9 @@ impl SemanticIndex {
                 }),
                 _ => None,
             };
-            match cached.map(|freshness| cache_freshness::verify_file(indexed_path, &freshness)) {
+            match cached
+                .map(|freshness| cache_freshness::verify_file_strict(indexed_path, &freshness))
+            {
                 Some(FreshnessVerdict::HotFresh) => {}
                 Some(FreshnessVerdict::ContentFresh {
                     new_mtime,
@@ -1876,7 +1878,7 @@ impl SemanticIndex {
             size: *stored_size,
             content_hash: *stored_hash,
         };
-        match cache_freshness::verify_file(file, &cached) {
+        match cache_freshness::verify_file_strict(file, &cached) {
             FreshnessVerdict::HotFresh => false,
             FreshnessVerdict::ContentFresh { .. } => false,
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
@@ -1903,10 +1905,17 @@ impl SemanticIndex {
     }
 
     pub fn invalidate_file(&mut self, file: &Path) {
-        self.entries.retain(|e| e.chunk.file != file);
+        let canonical_file = canonicalize_existing_or_deleted_path(file);
+        self.entries
+            .retain(|e| e.chunk.file != file && e.chunk.file != canonical_file);
         self.file_mtimes.remove(file);
         self.file_sizes.remove(file);
         self.file_hashes.remove(file);
+        if canonical_file.as_path() != file {
+            self.file_mtimes.remove(&canonical_file);
+            self.file_sizes.remove(&canonical_file);
+            self.file_hashes.remove(&canonical_file);
+        }
     }
 
     /// Get the embedding dimension
@@ -2609,6 +2618,23 @@ fn collect_file_metadata(file: &Path) -> Result<IndexedFileMetadata, String> {
         size: metadata.len(),
         content_hash,
     })
+}
+
+fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    fs::canonicalize(parent)
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn collect_file_chunks(

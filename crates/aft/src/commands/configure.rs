@@ -2118,7 +2118,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Spawn file watcher for live invalidation off the configure foreground.
     // FSEvents startup can synchronously wait for seconds on very large roots;
     // configure should return while the watcher attaches in the background.
-    install_project_watcher(ctx, &root_path);
+    install_project_watcher(ctx, &canonical_cache_root);
 
     slog_info!("project root set: {}", root_path.display());
 

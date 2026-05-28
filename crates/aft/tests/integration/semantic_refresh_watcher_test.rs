@@ -9,6 +9,8 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use aft::search_index::SearchIndex;
+use aft::semantic_index::SemanticIndex;
 use serde_json::{json, Value};
 
 use crate::helpers::AftProcess;
@@ -150,6 +152,16 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
         fs::write(path, content).expect("write fixture");
     }
     temp_dir
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
@@ -303,4 +315,70 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let real_root = temp_dir.path().join("real-project");
+    let source_file = real_root.join("src/lib.rs");
+    fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
+    fs::write(
+        &source_file,
+        "pub fn alias_delete_anchor() -> usize {
+    42
+}
+",
+    )
+    .expect("write indexed source");
+
+    let alias_root = temp_dir.path().join("alias-project");
+    if let Err(error) = create_dir_symlink(&real_root, &alias_root) {
+        eprintln!("skipping symlink canonicalization test: {error}");
+        return;
+    }
+
+    let canonical_root = fs::canonicalize(&real_root).expect("canonicalize real root");
+    let canonical_file = fs::canonicalize(&source_file).expect("canonicalize source file");
+    let alias_file = alias_root.join("src/lib.rs");
+
+    let mut search_index = SearchIndex::build(&canonical_root);
+    assert!(
+        search_index.path_to_id.contains_key(&canonical_file),
+        "search index should store the canonical file key"
+    );
+
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(texts.into_iter().map(|text| embedding_for(&text)).collect())
+    };
+    let mut semantic_index = SemanticIndex::build(
+        &canonical_root,
+        std::slice::from_ref(&canonical_file),
+        &mut embed,
+        64,
+    )
+    .expect("build semantic index");
+    assert!(
+        semantic_index.len() > 0,
+        "semantic index should contain the canonical file entry"
+    );
+
+    fs::remove_file(&canonical_file).expect("delete canonical source file");
+    assert!(
+        !alias_file.exists(),
+        "alias path should be missing after canonical delete"
+    );
+
+    search_index.remove_file(&alias_file);
+    semantic_index.invalidate_file(&alias_file);
+
+    assert!(
+        !search_index.path_to_id.contains_key(&canonical_file),
+        "deleted alias path should invalidate the canonical search-index key"
+    );
+    assert_eq!(
+        semantic_index.len(),
+        0,
+        "deleted alias path should invalidate canonical semantic entries"
+    );
 }

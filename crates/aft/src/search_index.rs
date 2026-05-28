@@ -345,7 +345,15 @@ impl SearchIndex {
     }
 
     pub fn remove_file(&mut self, path: &Path) {
-        let Some(file_id) = self.path_to_id.remove(path) else {
+        let canonical_path = canonicalize_existing_or_deleted_path(path);
+        let file_id = if let Some(file_id) = self.path_to_id.remove(path) {
+            file_id
+        } else if canonical_path.as_path() != path {
+            let Some(file_id) = self.path_to_id.remove(&canonical_path) else {
+                return;
+            };
+            file_id
+        } else {
             return;
         };
 
@@ -1733,6 +1741,23 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    fs::canonicalize(parent)
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
