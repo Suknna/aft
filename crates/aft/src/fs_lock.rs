@@ -296,6 +296,17 @@ fn run_heartbeat(
     shutdown: Arc<AtomicBool>,
     config: LockConfig,
 ) {
+    // Number of consecutive heartbeat intervals that can be missed before the
+    // same-host stale window elapses and another process may reclaim the lock.
+    // Beyond this point a sustained failure is genuinely dangerous, so we
+    // escalate the log from warn to error — but we still keep retrying.
+    let stale_intervals = config
+        .stale_heartbeat_ms
+        .checked_div(config.heartbeat_interval_ms.max(1))
+        .unwrap_or(3)
+        .max(1);
+    let mut consecutive_transient_failures: u64 = 0;
+
     loop {
         thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
         if shutdown.load(Ordering::Acquire) {
@@ -303,38 +314,114 @@ fn run_heartbeat(
         }
 
         match heartbeat_once(&path, &owner) {
-            Ok(()) => {}
-            Err(HeartbeatError::LockGone) => {
+            Ok(()) => {
+                if consecutive_transient_failures > 0 {
+                    slog_info!(
+                        "filesystem lock at {} heartbeat recovered after {} transient failure(s)",
+                        path.display(),
+                        consecutive_transient_failures
+                    );
+                    consecutive_transient_failures = 0;
+                }
+            }
+            Err(error) if heartbeat_error_is_terminal(&error) => {
+                // Terminal states: the lock is provably gone or owned by
+                // someone else. Continuing to write would clobber a new owner's
+                // metadata (the exact race documented in LockGuard::drop), so
+                // stop heartbeating.
                 slog_error!(
-                    "filesystem lock at {} disappeared; stopping heartbeat",
-                    path.display()
+                    "{}; stopping heartbeat",
+                    terminal_heartbeat_message(&path, &error)
                 );
                 return;
             }
-            Err(HeartbeatError::NotOwner) => {
-                slog_error!(
-                    "filesystem lock at {} is no longer owned by this guard; stopping heartbeat",
-                    path.display()
+            Err(error) => {
+                // Transient states: a temporary I/O hiccup (disk/NFS blip,
+                // quota) or a read that raced a concurrent writer mid-write
+                // (momentarily unparseable file). A single such error must NOT
+                // permanently kill the heartbeat — that would silently stop
+                // refreshing heartbeat_at_ms while the guard holder keeps
+                // running its critical section, letting another process reclaim
+                // the lock after the stale window and produce concurrent
+                // writers. Log and retry on the next interval; a later success
+                // resumes heartbeating automatically.
+                consecutive_transient_failures += 1;
+                log_transient_heartbeat_failure(
+                    &path,
+                    &transient_heartbeat_reason(&error),
+                    consecutive_transient_failures,
+                    stale_intervals,
                 );
-                return;
-            }
-            Err(HeartbeatError::Malformed(error)) => {
-                slog_error!(
-                    "filesystem lock at {} became malformed: {}; stopping heartbeat",
-                    path.display(),
-                    error
-                );
-                return;
-            }
-            Err(HeartbeatError::Io(error)) => {
-                slog_error!(
-                    "failed to heartbeat filesystem lock at {}: {}; stopping heartbeat",
-                    path.display(),
-                    error
-                );
-                return;
             }
         }
+    }
+}
+
+/// A heartbeat failure is terminal when the lock is provably no longer ours to
+/// refresh: it was removed (`LockGone`) or a different owner now holds it
+/// (`NotOwner`). I/O and malformed-read failures are treated as transient —
+/// they are typically temporary disk/NFS hiccups or a read that raced a
+/// concurrent writer — so the heartbeat retries rather than dying.
+fn heartbeat_error_is_terminal(error: &HeartbeatError) -> bool {
+    matches!(error, HeartbeatError::LockGone | HeartbeatError::NotOwner)
+}
+
+fn terminal_heartbeat_message(path: &Path, error: &HeartbeatError) -> String {
+    match error {
+        HeartbeatError::LockGone => {
+            format!("filesystem lock at {} disappeared", path.display())
+        }
+        HeartbeatError::NotOwner => format!(
+            "filesystem lock at {} is no longer owned by this guard",
+            path.display()
+        ),
+        // Not reachable for non-terminal errors, but keep a sensible string.
+        HeartbeatError::Io(error) => {
+            format!("filesystem lock at {} I/O error: {error}", path.display())
+        }
+        HeartbeatError::Malformed(error) => {
+            format!(
+                "filesystem lock at {} became malformed: {error}",
+                path.display()
+            )
+        }
+    }
+}
+
+fn transient_heartbeat_reason(error: &HeartbeatError) -> String {
+    match error {
+        HeartbeatError::Io(error) => format!("I/O error: {error}"),
+        HeartbeatError::Malformed(error) => format!("became malformed: {error}"),
+        HeartbeatError::LockGone => "lock disappeared".to_string(),
+        HeartbeatError::NotOwner => "lock no longer owned".to_string(),
+    }
+}
+
+/// Log a transient heartbeat failure, escalating to error exactly once when the
+/// failures have lasted long enough that the lock is now reclaimable by another
+/// owner. Beyond that point we stay quiet to avoid log spam while still
+/// retrying — the holder has already been warned the lock is at risk.
+fn log_transient_heartbeat_failure(
+    path: &Path,
+    reason: &str,
+    consecutive_failures: u64,
+    stale_intervals: u64,
+) {
+    if consecutive_failures < stale_intervals {
+        slog_warn!(
+            "transient failure to heartbeat filesystem lock at {}: {}; retrying (attempt {})",
+            path.display(),
+            reason,
+            consecutive_failures
+        );
+    } else if consecutive_failures == stale_intervals {
+        slog_error!(
+            "filesystem lock at {} has failed {} consecutive heartbeats: {}; \
+             the lock may now be reclaimed by another owner — continuing to retry",
+            path.display(),
+            consecutive_failures,
+            reason
+        );
     }
 }
 
@@ -888,5 +975,80 @@ mod tests {
             !path.exists(),
             "heartbeat recreated or kept updating lockfile"
         );
+    }
+
+    #[test]
+    fn heartbeat_error_classification_terminal_vs_transient() {
+        // Terminal: the lock is provably no longer ours to refresh.
+        assert!(heartbeat_error_is_terminal(&HeartbeatError::LockGone));
+        assert!(heartbeat_error_is_terminal(&HeartbeatError::NotOwner));
+        // Transient: a temporary I/O hiccup or a read that raced a concurrent
+        // writer. These must NOT kill the heartbeat — it retries instead.
+        assert!(!heartbeat_error_is_terminal(&HeartbeatError::Io(
+            io::Error::new(io::ErrorKind::Other, "disk blip")
+        )));
+        let malformed: serde_json::Error =
+            serde_json::from_str::<LockMetadata>("not json").unwrap_err();
+        assert!(!heartbeat_error_is_terminal(&HeartbeatError::Malformed(
+            malformed
+        )));
+    }
+
+    #[test]
+    fn heartbeat_survives_transient_malformed_and_recovers() {
+        // Regression: a single transient failure (e.g. a read that races a
+        // concurrent writer and sees a momentarily-unparseable file) used to
+        // permanently kill the heartbeat thread. The guard holder would then
+        // run its critical section with a stale heartbeat_at_ms, letting
+        // another process reclaim the lock after the stale window — concurrent
+        // writers / split-brain. The heartbeat must instead retry and resume
+        // refreshing once the file is readable again.
+        let (_dir, path) = test_lock_path();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        let owner = guard.metadata.clone();
+
+        // Corrupt the lockfile out from under the heartbeat (simulates a
+        // concurrent-writer race producing a momentarily-unparseable read).
+        // The heartbeat reads-then-writes, so it observes Malformed and, with
+        // the fix, retries instead of dying.
+        fs::write(&path, b"{ not valid json").expect("corrupt lockfile");
+
+        // Give the heartbeat several intervals to observe the malformed file.
+        // Pre-fix, the thread is dead by now.
+        thread::sleep(Duration::from_millis(
+            test_config().heartbeat_interval_ms * 4,
+        ));
+
+        // Restore valid owner metadata with a clearly-stale heartbeat sentinel.
+        // Ownership fields must match `owner` exactly so heartbeat_once passes
+        // its ownership check and writes a fresh timestamp.
+        let sentinel = now_ms().saturating_sub(1_000_000);
+        let mut restored = owner.clone();
+        restored.heartbeat_at_ms = sentinel;
+        let _ = remove_lock_file(&path);
+        write_synthetic_lock(&path, &restored);
+
+        // If the heartbeat thread is still alive (the fix), it will overwrite
+        // heartbeat_at_ms with a current value. Poll for that recovery.
+        let deadline = std::time::Instant::now() + Duration::from_millis(3_000);
+        let mut recovered = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            match read_lock_metadata(&path) {
+                Ok(meta)
+                    if meta.created_at_ms == owner.created_at_ms
+                        && meta.heartbeat_at_ms > sentinel =>
+                {
+                    recovered = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            recovered,
+            "heartbeat did not recover after a transient malformed read — thread likely died"
+        );
+        drop(guard);
     }
 }
