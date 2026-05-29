@@ -1307,6 +1307,12 @@ fn build_add_moved_import_edit(
     Some((insert_offset..insert_offset, insert_text))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentifierNamespace {
+    Value,
+    Type,
+}
+
 fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
     let grammar = grammar_for(lang);
     let mut parser = tree_sitter::Parser::new();
@@ -1316,16 +1322,23 @@ fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str)
     let Some(tree) = parser.parse(content.as_bytes(), None) else {
         return false;
     };
-    node_references_identifier(&tree.root_node(), content, symbol_name)
+
+    let root = tree.root_node();
+    if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        node_references_identifier(&root, content, symbol_name)
+    } else {
+        node_references_identifier_naive(&root, content, symbol_name)
+    }
 }
 
 fn node_references_identifier(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
-    if matches!(
-        node.kind(),
-        "identifier" | "type_identifier" | "jsx_identifier"
-    ) && node_text_matches(content, node, symbol_name)
-    {
-        return true;
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        let namespace = reference_namespace(node);
+        if !identifier_is_binding_position(node, content, symbol_name, namespace)
+            && !identifier_is_shadowed_by_enclosing_scope(node, content, symbol_name, namespace)
+        {
+            return true;
+        }
     }
 
     let child_count = node.child_count();
@@ -1338,6 +1351,548 @@ fn node_references_identifier(node: &tree_sitter::Node, content: &str, symbol_na
     }
 
     false
+}
+
+fn node_references_identifier_naive(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier_naive(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_reference_identifier_node(kind: &str) -> bool {
+    matches!(kind, "identifier" | "type_identifier" | "jsx_identifier")
+}
+
+fn reference_namespace(node: &tree_sitter::Node) -> IdentifierNamespace {
+    if node.kind() == "type_identifier" {
+        IdentifierNamespace::Type
+    } else {
+        IdentifierNamespace::Value
+    }
+}
+
+fn identifier_is_binding_position(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "import_statement" {
+            return true;
+        }
+
+        if declaration_name_matches_target(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+
+        match parent.kind() {
+            "variable_declarator" if namespace == IdentifierNamespace::Value => {
+                if parent.child_by_field_name("name").is_some_and(|name| {
+                    pattern_contains_binding_node(&name, node, content, symbol_name)
+                }) {
+                    return true;
+                }
+            }
+            "formal_parameters" | "required_parameter" | "optional_parameter" | "rest_pattern"
+            | "assignment_pattern" | "object_pattern" | "array_pattern" | "pair_pattern"
+                if namespace == IdentifierNamespace::Value =>
+            {
+                if pattern_contains_binding_node(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            "catch_clause" if namespace == IdentifierNamespace::Value => {
+                if parent
+                    .child_by_field_name("parameter")
+                    .is_some_and(|param| {
+                        pattern_contains_binding_node(&param, node, content, symbol_name)
+                    })
+                {
+                    return true;
+                }
+            }
+            "type_parameter" if namespace == IdentifierNamespace::Type => {
+                if type_parameter_name_matches_target(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+fn identifier_is_shadowed_by_enclosing_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if scope_introduces_shadowing_binding(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+        current = parent;
+    }
+
+    false
+}
+
+fn scope_introduces_shadowing_binding(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match scope.kind() {
+        kind if is_function_like_scope(kind) => {
+            function_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        "statement_block" | "switch_body" => {
+            block_scope_binds_name(scope, content, symbol_name, namespace)
+        }
+        "catch_clause" => catch_scope_binds_name(scope, reference, content, symbol_name, namespace),
+        "for_statement" | "for_in_statement" | "for_of_statement" => {
+            loop_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        _ => false,
+    }
+}
+
+fn is_function_like_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn function_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    match namespace {
+        IdentifierNamespace::Value => {
+            function_inner_name_binds_name(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("parameters")
+                    .is_some_and(|params| pattern_binds_name(&params, content, symbol_name))
+                || function_var_declarations_bind_name(scope, content, symbol_name)
+        }
+        IdentifierNamespace::Type => {
+            class_declaration_name_matches(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("type_parameters")
+                    .is_some_and(|params| type_parameters_bind_name(&params, content, symbol_name))
+        }
+    }
+}
+
+fn function_inner_name_binds_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if scope.kind() == "method_definition" {
+        return false;
+    }
+    name_field_matches(scope, content, symbol_name)
+}
+
+fn class_declaration_name_matches(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    ) && name_field_matches(node, content, symbol_name)
+}
+
+fn function_var_declarations_bind_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    scope
+        .child_by_field_name("body")
+        .is_some_and(|body| var_declarations_bind_name_in_scope(&body, content, symbol_name))
+}
+
+fn var_declarations_bind_name_in_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if is_function_like_scope(child.kind()) {
+            continue;
+        }
+        if child.kind() == "variable_declaration"
+            && declaration_binds_name(&child, content, symbol_name, IdentifierNamespace::Value)
+        {
+            return true;
+        }
+        if var_declarations_bind_name_in_scope(&child, content, symbol_name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn block_scope_binds_name(
+    block: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = block.child_count();
+    for i in 0..child_count {
+        let Some(child) = block.child(i as u32) else {
+            continue;
+        };
+        if direct_scope_child_binds_name(&child, content, symbol_name, namespace) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn direct_scope_child_binds_name(
+    child: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if declaration_binds_name(child, content, symbol_name, namespace) {
+        return true;
+    }
+
+    if child.kind() == "export_statement" {
+        let child_count = child.child_count();
+        for i in 0..child_count {
+            if let Some(export_child) = child.child(i as u32) {
+                if declaration_binds_name(&export_child, content, symbol_name, namespace) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn catch_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value {
+        return false;
+    }
+
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    scope
+        .child_by_field_name("parameter")
+        .is_some_and(|param| pattern_binds_name(&param, content, symbol_name))
+}
+
+fn loop_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value
+        || !reference_is_in_loop_bound_scope(scope, reference)
+    {
+        return false;
+    }
+
+    ["initializer", "left"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| loop_header_declares_name(&node, content, symbol_name))
+    })
+}
+
+fn reference_is_in_loop_bound_scope(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+) -> bool {
+    ["condition", "increment", "body"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| node_contains(&node, reference))
+    })
+}
+
+fn loop_header_declares_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    matches!(
+        node.kind(),
+        "lexical_declaration" | "variable_declaration" | "variable_declarator"
+    ) && declaration_binds_name(node, content, symbol_name, IdentifierNamespace::Value)
+}
+
+fn declaration_binds_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match node.kind() {
+        "variable_declarator" if namespace == IdentifierNamespace::Value => node
+            .child_by_field_name("name")
+            .is_some_and(|name| pattern_binds_name(&name, content, symbol_name)),
+        "lexical_declaration" | "variable_declaration"
+            if namespace == IdentifierNamespace::Value =>
+        {
+            node_children_bind_name(node, content, symbol_name, namespace)
+        }
+        "function_declaration" | "generator_function_declaration" => {
+            namespace == IdentifierNamespace::Value
+                && name_field_matches(node, content, symbol_name)
+        }
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => {
+            name_field_matches(node, content, symbol_name)
+        }
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type && name_field_matches(node, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if declaration_binds_name(&child, content, symbol_name, namespace) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn declaration_name_matches_target(
+    declaration: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let name_binds_namespace = match declaration.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function" => namespace == IdentifierNamespace::Value,
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => true,
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type
+        }
+        _ => false,
+    };
+
+    name_binds_namespace
+        && declaration.child_by_field_name("name").is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameter_name_matches_target(
+    type_parameter: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    type_parameter
+        .child_by_field_name("name")
+        .is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameters_bind_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if node.kind() == "type_parameter" && name_field_matches(node, content, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if type_parameters_bind_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_binds_name(pattern: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            node_text_matches(content, pattern, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => pattern
+            .child_by_field_name("pattern")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "assignment_pattern" => pattern
+            .child_by_field_name("left")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_binds_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_contains_binding_node(
+    pattern: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if !node_contains(pattern, target) {
+        return false;
+    }
+
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            same_node(pattern, target) && node_text_matches(content, target, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => {
+            pattern.child_by_field_name("pattern").is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            })
+        }
+        "assignment_pattern" => pattern.child_by_field_name("left").is_some_and(|child| {
+            pattern_contains_binding_node(&child, target, content, symbol_name)
+        }),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            }),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_contain_binding_node(
+    node: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_contains_binding_node(&child, target, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn name_field_matches(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    node.child_by_field_name("name")
+        .is_some_and(|name| node_text_matches(content, &name, symbol_name))
+}
+
+fn same_node(a: &tree_sitter::Node, b: &tree_sitter::Node) -> bool {
+    a.kind() == b.kind() && a.start_byte() == b.start_byte() && a.end_byte() == b.end_byte()
+}
+
+fn node_contains(container: &tree_sitter::Node, node: &tree_sitter::Node) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
 }
 
 fn node_text_matches(content: &str, node: &tree_sitter::Node, expected: &str) -> bool {

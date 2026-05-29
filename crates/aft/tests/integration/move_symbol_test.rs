@@ -404,6 +404,168 @@ export function useHelper(): string {
 }
 
 #[test]
+fn move_symbol_does_not_reimport_shadowed_source_references() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+    let consumer = tmp.path().join("consumer.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+function logData(logger: unknown): unknown {
+  return logger;
+}
+
+export function f(): number {
+  const logger = 1;
+  return logger;
+}
+
+export function destructured(input: { logger: number }): number {
+  const { logger } = input;
+  return logger;
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+    write_file(
+        &consumer,
+        r#"import { logger } from './source';
+
+export const value = logger();
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"shadowed-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        !source_content.contains("from './dest'") && !source_content.contains("from \"./dest\""),
+        "shadowed source references should not add an import from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("function logData(logger: unknown)")
+            && source_content.contains("const logger = 1")
+            && source_content.contains("const { logger } = input"),
+        "shadowing declarations should remain in source:\n{source_content}"
+    );
+
+    let consumer_content = std::fs::read_to_string(&consumer).expect("read consumer");
+    assert!(
+        consumer_content.contains("import { logger } from './dest';"),
+        "other-file consumer should import logger from dest:\n{consumer_content}"
+    );
+    assert!(
+        !consumer_content.contains("from './source'")
+            && !consumer_content.contains("from \"./source\""),
+        "other-file consumer should no longer import logger from source:\n{consumer_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_reimports_unshadowed_source_references() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+export function useLogger(): string {
+  return logger();
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"unshadowed-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        source_content.contains("import { logger } from './dest';"),
+        "unshadowed source reference should import logger from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("return logger();"),
+        "remaining source code should still call logger:\n{source_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_does_not_reimport_object_keys_or_member_access() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+export const config = { logger: 1 };
+
+export function read(obj: { logger: number }): number {
+  return obj.logger;
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"object-member-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        !source_content.contains("from './dest'") && !source_content.contains("from \"./dest\""),
+        "object keys/member access alone should not add an import from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("{ logger: 1 }") && source_content.contains("obj.logger"),
+        "object key and member access should remain in source:\n{source_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
 fn move_symbol_preserves_default_import_shape_and_alias() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().display().to_string();
