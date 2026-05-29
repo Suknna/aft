@@ -1,15 +1,25 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+#[cfg(debug_assertions)]
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
 
+use crate::cache_freshness::{self, FileFreshness};
+use crate::inspect::cache::Tier1FileMemo;
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 
 const MAX_LINES_PER_FILE: usize = 100_000;
 const MAX_ITEMS: usize = 100;
 const MAX_TEXT_CHARS: usize = 200;
 const MARKERS: [&str; 5] = ["TODO", "FIXME", "HACK", "XXX", "BUG"];
+
+static TODOS_MEMO: OnceLock<Tier1FileMemo<FileScan>> = OnceLock::new();
+
+#[cfg(debug_assertions)]
+static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct TodoItem {
@@ -20,7 +30,7 @@ struct TodoItem {
     text: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FileScan {
     scanned_file: Option<PathBuf>,
     items: Vec<TodoItem>,
@@ -31,7 +41,9 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
     let per_file: Vec<FileScan> = job
         .scope_files
         .par_iter()
-        .map(|path| scan_file(path, &job.project_root))
+        .map(|path| {
+            todos_memo().get_or_insert_with(path, |path| scan_file(path, &job.project_root))
+        })
         .collect();
 
     let mut scanned_files = Vec::new();
@@ -83,12 +95,20 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
     InspectResult::success(job, success, started.elapsed())
 }
 
-fn scan_file(path: &Path, project_root: &Path) -> FileScan {
-    let Some(source) = read_text_file(path) else {
-        return FileScan {
-            scanned_file: None,
-            items: Vec::new(),
-        };
+fn todos_memo() -> &'static Tier1FileMemo<FileScan> {
+    TODOS_MEMO.get_or_init(Tier1FileMemo::default)
+}
+
+fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileScan) {
+    let (freshness, source) = read_text_file(path);
+    let Some(source) = source else {
+        return (
+            freshness,
+            FileScan {
+                scanned_file: None,
+                items: Vec::new(),
+            },
+        );
     };
 
     let file = display_file_path(project_root, path);
@@ -100,18 +120,48 @@ fn scan_file(path: &Path, project_root: &Path) -> FileScan {
         }
     }
 
-    FileScan {
-        scanned_file: Some(path.to_path_buf()),
-        items,
-    }
+    (
+        freshness,
+        FileScan {
+            scanned_file: Some(path.to_path_buf()),
+            items,
+        },
+    )
 }
 
-fn read_text_file(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>) {
+    let metadata = std::fs::metadata(path).ok();
+    #[cfg(debug_assertions)]
+    bump_file_read_count(path);
+    let bytes = std::fs::read(path).ok();
+    let freshness = metadata
+        .as_ref()
+        .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
+
+    let Some(bytes) = bytes else {
+        return (freshness, None);
+    };
     if bytes.contains(&0) {
-        return None;
+        return (freshness, None);
     }
-    String::from_utf8(bytes).ok()
+    (freshness, String::from_utf8(bytes).ok())
+}
+
+fn freshness_from_metadata(metadata: &std::fs::Metadata, bytes: Option<&[u8]>) -> FileFreshness {
+    let size = metadata.len();
+    let content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
+        bytes
+            .map(cache_freshness::hash_bytes)
+            .unwrap_or_else(cache_freshness::zero_hash)
+    } else {
+        cache_freshness::zero_hash()
+    };
+
+    FileFreshness {
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        size,
+        content_hash,
+    }
 }
 
 fn display_file_path(project_root: &Path, path: &Path) -> String {
@@ -285,4 +335,42 @@ fn strip_comment_closer(text: &str) -> &str {
 
 fn truncate_text(text: &str) -> String {
     text.chars().take(MAX_TEXT_CHARS).collect()
+}
+#[cfg(debug_assertions)]
+fn debug_file_reads() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
+    FILE_READS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(debug_assertions)]
+fn bump_file_read_count(path: &Path) {
+    if let Ok(mut reads) = debug_file_reads().lock() {
+        *reads.entry(path.to_path_buf()).or_default() += 1;
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_file_read_count_for_debug(project_root: &Path) {
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    if let Ok(mut reads) = debug_file_reads().lock() {
+        reads.retain(|path, _| !path.starts_with(&project_root));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn file_read_count_for_debug(project_root: &Path) -> usize {
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    debug_file_reads()
+        .lock()
+        .map(|reads| {
+            reads
+                .iter()
+                .filter(|(path, _)| path.starts_with(&project_root))
+                .map(|(_, count)| *count)
+                .sum()
+        })
+        .unwrap_or_default()
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cache_freshness::FileFreshness;
+use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 
 use super::job::{FileContribution, InspectCategory, JobKey};
 
@@ -78,6 +78,83 @@ pub struct ContributionRecord {
 struct MemoryAggregate {
     payload: serde_json::Value,
     generated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct Tier1MemoEntry<T> {
+    freshness: FileFreshness,
+    value: T,
+}
+
+#[derive(Debug)]
+pub(crate) struct Tier1FileMemo<T> {
+    entries: Mutex<HashMap<PathBuf, Tier1MemoEntry<T>>>,
+}
+
+impl<T> Default for Tier1FileMemo<T> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T: Clone> Tier1FileMemo<T> {
+    pub(crate) fn get_or_insert_with<F>(&self, path: &Path, scan: F) -> T
+    where
+        F: FnOnce(&Path) -> (Option<FileFreshness>, T),
+    {
+        if let Some(cached) = self.cached_value(path) {
+            return cached;
+        }
+
+        let (freshness, value) = scan(path);
+        if let Ok(mut entries) = self.entries.lock() {
+            if let Some(freshness) = freshness {
+                entries.insert(
+                    path.to_path_buf(),
+                    Tier1MemoEntry {
+                        freshness,
+                        value: value.clone(),
+                    },
+                );
+            } else {
+                entries.remove(path);
+            }
+        }
+        value
+    }
+
+    fn cached_value(&self, path: &Path) -> Option<T> {
+        let mut cached = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(path).cloned())?;
+
+        match crate::cache_freshness::verify_file(path, &cached.freshness) {
+            FreshnessVerdict::HotFresh => Some(cached.value),
+            FreshnessVerdict::ContentFresh {
+                new_mtime,
+                new_size,
+            } => {
+                cached.freshness.mtime = new_mtime;
+                cached.freshness.size = new_size;
+                let value = cached.value.clone();
+                if let Ok(mut entries) = self.entries.lock() {
+                    entries.insert(path.to_path_buf(), cached);
+                }
+                Some(value)
+            }
+            FreshnessVerdict::Stale => None,
+            FreshnessVerdict::Deleted => {
+                if let Ok(mut entries) = self.entries.lock() {
+                    entries.remove(path);
+                }
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

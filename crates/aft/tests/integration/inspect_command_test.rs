@@ -198,6 +198,113 @@ fn inspect_command_metrics_summary_uses_production_dispatch() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn inspect_command_tier1_reuses_file_memo_for_unchanged_files() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/app.ts",
+        "// TODO: keep cached\nexport function app() { return 1; }\n",
+    );
+    write_file(&root, "src/lib.ts", "export function lib() { return 2; }\n");
+    let ctx = configured_context(&root);
+
+    let first = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-tier1-cold",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(first["success"], true, "inspect failed: {first:#}");
+
+    aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
+    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
+
+    let second = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-tier1-warm",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(second["success"], true, "inspect failed: {second:#}");
+    assert_eq!(
+        aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
+        0,
+        "warm metrics scan should reuse unchanged per-file memo entries: {second:#}"
+    );
+    assert_eq!(
+        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
+        0,
+        "warm todos scan should reuse unchanged per-file memo entries: {second:#}"
+    );
+    assert_eq!(first["summary"]["metrics"], second["summary"]["metrics"]);
+    assert_eq!(first["summary"]["todos"], second["summary"]["todos"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/unchanged.ts",
+        "// TODO: already counted\nexport function unchanged() { return 1; }\n",
+    );
+    write_file(
+        &root,
+        "src/changed.ts",
+        "export function changed() { return 2; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    let first = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-tier1-before-change",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(first["success"], true, "inspect failed: {first:#}");
+    assert_eq!(first["summary"]["todos"]["count"], 1);
+
+    aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
+    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
+
+    write_file(
+        &root,
+        "src/changed.ts",
+        "// TODO: newly counted after memo invalidation\nexport function changed() { return 2; }\n",
+    );
+
+    let second = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-tier1-after-change",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(second["success"], true, "inspect failed: {second:#}");
+    assert_eq!(
+        second["summary"]["todos"]["count"], 2,
+        "changed file's TODO should update the Tier 1 summary: {second:#}"
+    );
+    assert_eq!(
+        aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
+        1,
+        "metrics should rescan only the changed file: {second:#}"
+    );
+    assert_eq!(
+        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
+        1,
+        "todos should rescan only the changed file: {second:#}"
+    );
+}
+
 #[test]
 fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
     let (_temp_dir, root) = fixture_project();
