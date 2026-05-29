@@ -3,6 +3,8 @@ services:
     build:
       context: ../..
       dockerfile: benchmarks/codegraph-vs-aft-agent/Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       AGENT_ARMS: ${AGENT_ARMS:-aft,codegraph}
       AGENT_MODEL: ${AGENT_MODEL:-opencode-go/deepseek-v4-flash-free}
@@ -13,6 +15,11 @@ services:
       OPENCODE_AUTH_JSON: /mnt/opencode-auth/auth.json
       OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Optional custom LLM provider (e.g. local DS4). When set, replaces the
+      # default opencode-go/zen provider. The model name goes in AGENT_MODEL.
+      AGENT_PROVIDER_BASE_URL: ${AGENT_PROVIDER_BASE_URL:-}
+      AGENT_PROVIDER_NAME: ${AGENT_PROVIDER_NAME:-}
+      AGENT_PROVIDER_API_KEY: ${AGENT_PROVIDER_API_KEY:-}
     volumes:
       - ./results:/workspace/benchmarks/codegraph-vs-aft-agent/results
       - ./.bench:/workspace/benchmarks/codegraph-vs-aft-agent/.bench
