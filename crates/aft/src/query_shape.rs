@@ -12,6 +12,8 @@ static FILE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[/\\].*\.\w
 static HEX_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"0x[A-Fa-f0-9]+").unwrap());
 static ERROR_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bERR_\w+").unwrap());
 static NUMERIC_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bE\d{4,}").unwrap());
+static TYPESCRIPT_ERROR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bTS\d{4,}\b").unwrap());
 static HTTP_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[1-5]\d{2}\b").unwrap());
 static IDENTIFIER_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\b").unwrap()
@@ -84,12 +86,16 @@ pub fn classify(query: &str) -> QueryShape {
         return shape(QueryKind::Path);
     }
 
-    let has_http_status = word_count <= 3 && HTTP_STATUS_RE.is_match(trimmed);
-    if HEX_CODE_RE.is_match(trimmed)
-        || ERROR_PREFIX_RE.is_match(trimmed)
-        || NUMERIC_ERROR_RE.is_match(trimmed)
-        || has_http_status
-    {
+    let has_question_word = QUESTION_WORDS.contains(&first_word_lower.as_str());
+    let is_long_phrase = word_count > 2;
+    let has_natural_language_signals = has_question_word || is_long_phrase;
+    let has_error_code = contains_error_code(trimmed, word_count);
+
+    if has_error_code && has_natural_language_signals {
+        return shape(QueryKind::Mixed);
+    }
+
+    if has_error_code {
         return shape(QueryKind::ErrorCode);
     }
 
@@ -98,9 +104,6 @@ pub fn classify(query: &str) -> QueryShape {
         || PASCAL_CASE_RE.is_match(trimmed)
         || ACRONYM_PASCAL_RE.is_match(trimmed)
         || DOT_PATH_RE.is_match(trimmed);
-    let has_question_word = QUESTION_WORDS.contains(&first_word_lower.as_str());
-    let is_long_phrase = word_count > 2;
-    let has_natural_language_signals = has_question_word || is_long_phrase;
 
     if has_code_identifier && has_natural_language_signals {
         return shape(QueryKind::Mixed);
@@ -168,6 +171,19 @@ fn check_path_exemption(query: &str) -> Option<&'static str> {
         return None;
     }
     Some(kind)
+}
+
+fn contains_error_code(query: &str, word_count: usize) -> bool {
+    HEX_CODE_RE.is_match(query)
+        || ERROR_PREFIX_RE.is_match(query)
+        || NUMERIC_ERROR_RE.is_match(query)
+        || TYPESCRIPT_ERROR_RE.is_match(query)
+        || has_http_status(query, word_count)
+}
+
+fn has_http_status(query: &str, word_count: usize) -> bool {
+    HTTP_STATUS_RE.is_match(query)
+        && (word_count <= 3 || query.to_ascii_lowercase().contains("http"))
 }
 
 fn has_regex_meta_sequences(query: &str) -> bool {
@@ -399,11 +415,19 @@ fn has_literal_atom_quantifier(query: &str) -> bool {
         {
             continue;
         }
+        if ch == '?' && sentence_final_question_mark_in_phrase(query, byte_index) {
+            continue;
+        }
         if previous_is_literal_atom(&chars, index) {
             return true;
         }
     }
     false
+}
+
+fn sentence_final_question_mark_in_phrase(query: &str, byte_index: usize) -> bool {
+    query[byte_index + '?'.len_utf8()..].trim().is_empty()
+        && query[..byte_index].split_whitespace().count() > 1
 }
 
 fn previous_is_literal_atom(chars: &[(usize, char)], quantifier_index: usize) -> bool {
@@ -482,6 +506,7 @@ fn extract_error_code_tokens(query: &str) -> Vec<String> {
         &*HEX_CODE_RE,
         &*ERROR_PREFIX_RE,
         &*NUMERIC_ERROR_RE,
+        &*TYPESCRIPT_ERROR_RE,
         &*HTTP_STATUS_RE,
     ] {
         for mat in regex.find_iter(query) {
@@ -513,6 +538,8 @@ fn is_code_identifier_token(token: &str) -> bool {
         || ACRONYM_PASCAL_RE.is_match(token)
         || DOT_PATH_RE.is_match(token)
         || ERROR_PREFIX_RE.is_match(token)
+        || NUMERIC_ERROR_RE.is_match(token)
+        || TYPESCRIPT_ERROR_RE.is_match(token)
 }
 
 fn push_unique(tokens: &mut Vec<String>, token: &str) {

@@ -83,9 +83,12 @@ fn classifies_error_code_queries_before_identifier_patterns() {
     for query in [
         "ERR_TIMEOUT",
         "E1234",
+        "E0502",
         "0xCAFE",
         "404",
+        "HTTP 404",
         "HTTP 500",
+        "error TS2304",
         "ERR_CONNECTION_RESET",
         "0xdeadbeef panic",
         "E10000 failed",
@@ -101,7 +104,9 @@ fn classifies_natural_language_queries() {
         "",
         "   ",
         "how does auth work",
+        "how does auth work?",
         "what handles background task completion",
+        "what handles background task completion?",
         "where is rate limiting handled",
         "why does indexing rebuild repeatedly",
         "when should semantic search run",
@@ -125,6 +130,9 @@ fn classifies_mixed_queries() {
         "does SearchIndex refresh stale files",
         "useState hook examples",
         "useState hook examples for cleanup",
+        "why do I get E0502 when borrowing",
+        "why do I get error TS2304 when compiling",
+        "why do I get HTTP 404 when fetching",
     ] {
         assert_shape(query, QueryKind::Mixed, expected);
     }
@@ -142,6 +150,8 @@ fn classifies_regex_queries() {
         "(?:foo)",
         "foo*",
         "foo+",
+        "foo.*bar",
+        "get.+",
         "colou?r",
         "foo*bar",
     ] {
