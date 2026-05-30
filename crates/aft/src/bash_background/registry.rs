@@ -1878,6 +1878,9 @@ impl BgTaskRegistry {
                 state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
             }
 
+            #[cfg(windows)]
+            let mut pty_forced_terminal_status: Option<BgTaskStatus> = None;
+
             match &mut state.runtime {
                 TaskRuntime::Piped(child_slot) => {
                     #[cfg(unix)]
@@ -1931,8 +1934,51 @@ impl BgTaskRegistry {
                         terminate_pid(pid);
                     }
                     drop(pty.master.take());
+
+                    #[cfg(windows)]
+                    {
+                        let default_status = if terminal_status == BgTaskStatus::TimedOut {
+                            BgTaskStatus::TimedOut
+                        } else {
+                            BgTaskStatus::Killed
+                        };
+                        pty_forced_terminal_status = Some(
+                            state
+                                .pending_terminal_override
+                                .take()
+                                .unwrap_or(default_status),
+                        );
+                    }
                 }
                 TaskRuntime::Pty(None) => {}
+            }
+
+            #[cfg(windows)]
+            if let Some(target_status) = pty_forced_terminal_status {
+                if !task.paths.exit.exists() {
+                    write_kill_marker_if_absent(&task.paths.exit)
+                        .map_err(|e| format!("failed to write kill marker: {e}"))?;
+                }
+
+                let exit_code = if target_status == BgTaskStatus::TimedOut {
+                    Some(124)
+                } else {
+                    None
+                };
+                state.metadata.mark_terminal(target_status, exit_code, None);
+                if self.task_has_watch_control(&task.task_id) {
+                    state.metadata.completion_delivered = true;
+                }
+                state.pending_terminal_override = None;
+                task.mark_terminal_now();
+                if let TaskRuntime::Pty(runtime) = &mut state.runtime {
+                    *runtime = None;
+                }
+                state.detached = true;
+                self.persist_task(&task.paths, &state.metadata)
+                    .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+                state.buffer.enforce_terminal_cap();
+                self.enqueue_completion_locked(&state.metadata, Some(&state.buffer), true);
             }
         }
 

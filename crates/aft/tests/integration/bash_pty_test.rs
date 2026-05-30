@@ -724,16 +724,6 @@ fn pty_kill_terminates_sighup_ignoring_cat() {
 }
 
 #[cfg(windows)]
-// KNOWN WINDOWS PTY-KILL DEFECT (pre-existing since v0.30 PTY landing; surfaced
-// when 5a5d9ba made the full Windows integration suite a blocking gate).
-// kill_with_status's `TaskRuntime::Pty(Some(_))` arm signals the ChildKiller +
-// `taskkill /T /F` and returns WITHOUT marking the task terminal — it relies on
-// the PTY waiter thread's `child.wait()` returning to write the exit marker. On
-// Windows ConPTY that wait can fail to return after kill, so the task stays in
-// `Killing` forever and this test (and production `bash_kill` of a PTY task)
-// hangs. Un-ignore once the Windows PTY kill/finalize path has a liveness
-// fallback. Tracked for v0.33.x.
-#[ignore = "Windows PTY kill can hang (kill_with_status Pty arm has no wait() fallback); tracked for v0.33.x"]
 #[test]
 fn pty_kill_terminates_pwsh_infinite_loop() {
     let project = tempfile::tempdir().unwrap();
@@ -749,6 +739,29 @@ fn pty_kill_terminates_pwsh_infinite_loop() {
 
     registry.kill(&task_id, SESSION).unwrap();
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[cfg(windows)]
+#[test]
+fn pty_kill_terminates_pwsh_infinite_loop_within_bounded_time() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = spawn_pty_task(
+        &registry,
+        storage.path(),
+        project.path(),
+        "pwsh -NoProfile -Command while($true){Start-Sleep -Milliseconds 100}",
+        Duration::from_secs(30),
+    );
+
+    let started = Instant::now();
+    registry.kill(&task_id, SESSION).unwrap();
+    wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Windows PTY kill did not reach terminal status within bounded time"
+    );
 }
 
 // POSIX-only harness: spawns `cat`, which is not a Windows PowerShell command.
@@ -804,14 +817,6 @@ fn pty_kill_with_clones_outstanding_still_terminates() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-// Dual-platform (`sleep` aliases to Start-Sleep under pwsh), but the Windows
-// timeout-kill path goes through the same kill_with_status Pty arm that can
-// hang on ConPTY (see pty_kill_terminates_pwsh_infinite_loop). Keep Unix
-// coverage; skip on Windows until the kill/finalize path is fixed. v0.33.x.
-#[cfg_attr(
-    windows,
-    ignore = "Windows PTY timeout-kill can hang (same kill_with_status Pty arm); tracked for v0.33.x"
-)]
 #[test]
 fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
     let project = tempfile::tempdir().unwrap();
