@@ -57,6 +57,19 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .describe(
             'Whole-module alias. Solidity: `import "./X.sol" as X` (module=path, alias=X).',
           ),
+        modifiers: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Statement-level modifier tokens, language-validated: Java/C# 'static'; C# 'global'/'unsafe'; " +
+              "Java/Kotlin/Scala 'wildcard'; Swift '@testable'. Unsupported tokens for the file's language return a clear error.",
+          ),
+        importKind: z
+          .string()
+          .optional()
+          .describe(
+            "Symbol-kind-specific import: PHP 'function'/'const'; Swift 'struct'/'class'/'enum'/'protocol'/'func'; Scala 'given'.",
+          ),
         typeOnly: z.boolean().optional().describe("Type-only import (TS only, default: false)"),
         removeName: z
           .string()
@@ -102,6 +115,8 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         if (args.defaultImport !== undefined) params.default_import = args.defaultImport;
         if (args.namespace !== undefined) params.namespace = args.namespace;
         if (args.alias !== undefined) params.alias = args.alias;
+        if (args.modifiers !== undefined) params.modifiers = args.modifiers;
+        if (args.importKind !== undefined) params.import_kind = args.importKind;
         if (args.typeOnly !== undefined) params.type_only = args.typeOnly;
         if (args.removeName !== undefined) params.name = args.removeName;
         if (args.validate !== undefined) params.validate = args.validate;

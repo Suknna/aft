@@ -45,6 +45,18 @@ const ImportParams = Type.Object({
   alias: Type.Optional(
     Type.String({ description: 'Whole-module alias. Solidity: `import "./X.sol" as X`' }),
   ),
+  modifiers: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Statement-level modifiers, language-validated: Java/C# 'static', C# 'global'/'unsafe', Java/Kotlin/Scala 'wildcard', Swift '@testable'",
+    }),
+  ),
+  importKind: Type.Optional(
+    Type.String({
+      description:
+        "Symbol-kind import: PHP 'function'/'const', Swift 'struct'/'class'/'enum', Scala 'given'",
+    }),
+  ),
   removeName: Type.Optional(
     Type.String({ description: "Named import to remove; omit to remove entire import" }),
   ),
@@ -164,6 +176,8 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if (params.defaultImport !== undefined) req.default_import = params.defaultImport;
       if (params.namespace !== undefined) req.namespace = params.namespace;
       if (params.alias !== undefined) req.alias = params.alias;
+      if (params.modifiers !== undefined) req.modifiers = params.modifiers;
+      if (params.importKind !== undefined) req.import_kind = params.importKind;
       if (params.removeName !== undefined) req.name = params.removeName;
       if (params.typeOnly !== undefined) req.type_only = params.typeOnly;
       if (params.validate !== undefined) req.validate = params.validate;

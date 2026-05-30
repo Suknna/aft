@@ -115,6 +115,18 @@ pub enum ImportForm {
         namespace: Option<String>,
         alias: Option<String>,
     },
+    /// Generic structured form shared by the Phase-1 engines (Java, C#, PHP,
+    /// Kotlin, Scala, Swift, …). Carries the full schema field set so a new
+    /// engine does not need its own enum variant; `module_path` (on the parent
+    /// `ImportStatement`) holds the path/FQN. `named` uses the verbatim
+    /// specifier convention.
+    Structured {
+        named: Vec<String>,
+        namespace: Option<String>,
+        alias: Option<String>,
+        modifiers: Vec<String>,
+        import_kind: Option<String>,
+    },
 }
 
 /// Structured request to generate a single import line. Superset of the fields
@@ -131,11 +143,21 @@ pub struct ImportRequest<'a> {
     /// Whole-module local alias (Solidity `import "x" as A`).
     pub alias: Option<&'a str>,
     pub type_only: bool,
+    /// Statement-level modifier tokens (Java/C# `static`, C# `global`/`unsafe`,
+    /// `wildcard`, Swift `@testable`, …). Empty for the legacy engines.
+    pub modifiers: &'a [String],
+    /// Symbol-kind-specific import (PHP `function`/`const`, Swift `struct`/…,
+    /// Scala `given`). Absent for the legacy engines.
+    pub import_kind: Option<&'a str>,
 }
 
+/// Empty default for the `modifiers` slice so legacy callers need not allocate.
+const NO_MODIFIERS: &[String] = &[];
+
 impl<'a> ImportRequest<'a> {
-    /// Construct a request carrying only the legacy positional fields; new
-    /// fields default to absent. Used by the back-compat free-function wrappers.
+    /// Construct a request carrying only the legacy positional fields; the
+    /// structured fields (alias/modifiers/import_kind) default to absent. Used
+    /// by the back-compat free-function wrappers.
     pub fn legacy(
         module_path: &'a str,
         names: &'a [String],
@@ -150,6 +172,8 @@ impl<'a> ImportRequest<'a> {
             namespace,
             alias: None,
             type_only,
+            modifiers: NO_MODIFIERS,
+            import_kind: None,
         }
     }
 }
@@ -198,7 +222,7 @@ impl ImportBlock {
     }
 }
 
-fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usize>> {
+pub(crate) fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usize>> {
     imports.first().zip(imports.last()).map(|(first, last)| {
         let start = first.byte_range.start;
         let end = last.byte_range.end;
@@ -2829,6 +2853,8 @@ import { c } from 'charlie';
                     namespace: None,
                     alias: Some("B"),
                     type_only: false,
+                    modifiers: &[],
+                    import_kind: None,
                 }
             ),
             "import \"./B.sol\" as B;"
@@ -2862,6 +2888,8 @@ import { c } from 'charlie';
                     namespace,
                     alias,
                     type_only: false,
+                    modifiers: &[],
+                    import_kind: None,
                 },
             );
             assert_eq!(regenerated, src, "round-trip mismatch for {src:?}");

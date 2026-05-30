@@ -84,6 +84,23 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let modifiers: Vec<String> = req
+        .params
+        .get("modifiers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let import_kind = req
+        .params
+        .get("import_kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // --- Validate ---
     let path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
@@ -232,6 +249,8 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                     namespace: namespace.as_deref(),
                     alias: alias.as_deref(),
                     type_only,
+                    modifiers: &modifiers,
+                    import_kind: import_kind.as_deref(),
                 },
             )
         };
