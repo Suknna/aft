@@ -30,7 +30,8 @@
     "bench:aft-search:docker": "docker compose -f benchmarks/aft-search/docker-compose.yml run --rm aft-search",
     "bench:codegraph-replication:docker": "docker compose -f benchmarks/codegraph-replication/docker-compose.yml run --rm codegraph-replication",
     "bench:codegraph-vs-aft-retrieval": "sh -c 'docker compose -f benchmarks/codegraph-vs-aft-retrieval/docker-compose.yml run --rm aft && docker compose -f benchmarks/codegraph-vs-aft-retrieval/docker-compose.yml run --rm codegraph'",
-    "bench:codegraph-vs-aft-agent": "docker compose -f benchmarks/codegraph-vs-aft-agent/docker-compose.yml run --rm agent"
+    "bench:codegraph-vs-aft-agent": "docker compose -f benchmarks/codegraph-vs-aft-agent/docker-compose.yml run --rm agent",
+    "test:unit": "bun run --filter './packages/*' test:unit"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.7",

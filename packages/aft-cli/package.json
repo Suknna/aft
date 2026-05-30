@@ -19,7 +19,8 @@
     "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "test:unit": "bun test"
   },
   "dependencies": {
     "@clack/prompts": "^1.2.0",

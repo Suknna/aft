@@ -19,7 +19,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__/",
     "lint": "biome check src",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
   },
   "dependencies": {
     "@cortexkit/aft-bridge": "0.33.0",

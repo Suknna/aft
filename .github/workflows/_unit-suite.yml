@@ -83,7 +83,7 @@ jobs:
         run: bun run --filter '*' build
 
       - name: Bun test (all packages)
-        run: bun run test
+        run: bun run test:unit
         env:
           # Tests don't need real cache locations — keep them out of the runner's
           # ~/.cache to avoid cross-test pollution.
@@ -144,7 +144,7 @@ jobs:
         run: bun run typecheck
 
       - name: Bun test (all packages)
-        run: bun run test
+        run: bun run test:unit
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
 
