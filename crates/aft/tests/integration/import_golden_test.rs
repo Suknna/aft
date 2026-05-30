@@ -492,6 +492,59 @@ fn scenarios() -> Vec<Scenario> {
                 name: None,
             }],
         },
+        // ---- Kotlin (structured alias + wildcard imports) ----
+        Scenario {
+            name: "kt_add_plain_sorted",
+            ext: "kt",
+            input: "package com.example\n\nimport com.zeta.Z\n\nfun main() {}\n",
+            ops: &[Op::Add {
+                module: "com.alpha.A",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "kt_add_wildcard",
+            ext: "kt",
+            input: "package com.example\n\nimport kotlin.collections.List\n\nfun main() {}\n",
+            ops: &[Op::AddForm {
+                module: "kotlin.math",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["wildcard"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "kt_add_alias",
+            ext: "kt",
+            input: "package com.example\n\nimport com.example.Existing\n\nfun main() {}\n",
+            ops: &[Op::AddForm {
+                module: "com.example.Original",
+                names: &[],
+                namespace: None,
+                alias: Some("Renamed"),
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "kt_remove_import",
+            ext: "kt",
+            input: "package com.example\n\nimport com.example.Keep\nimport com.example.Unused\n\nfun main() {}\n",
+            ops: &[Op::Remove {
+                module: "com.example.Unused",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "kt_organize_mixed",
+            ext: "kt",
+            input: "package com.example\n\nimport com.zeta.Z as Last\nimport kotlin.math.*\nimport com.alpha.A\n\nfun main() {}\n",
+            ops: &[Op::Organize],
+        },
         Scenario {
             name: "csharp_add_plain_using",
             ext: "cs",
