@@ -1,6 +1,16 @@
 <h1 align="center">AFT</h1>
 
 <p align="center">
+  <strong>Give your agent a proper IDE and OS.</strong><br>
+  The sensorimotor cortex for coding agents. <br>
+</p>
+
+<!-- BANNER: replace with the new cortex/family banner (see banner prompts). Path is repo-relative for the final location. -->
+<p align="center">
+  <img src="assets/aft_banner.jpg" alt="AFT, the sensorimotor cortex for coding agents" width="80%">
+</p>
+
+<p align="center">
   <a href="https://crates.io/crates/agent-file-tools"><img src="https://img.shields.io/crates/v/agent-file-tools?label=crate&color=blue&style=flat-square" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@cortexkit/aft"><img src="https://img.shields.io/npm/v/@cortexkit/aft?label=cli&color=blue&style=flat-square" alt="npm @cortexkit/aft"></a>
   <a href="https://www.npmjs.com/package/@cortexkit/aft-opencode"><img src="https://img.shields.io/npm/v/@cortexkit/aft-opencode?label=opencode&color=blue&style=flat-square" alt="npm @cortexkit/aft-opencode"></a>
@@ -12,11 +22,11 @@
 <p align="center">
   <a href="#what-is-aft">What is AFT?</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#key-capabilities">Key Capabilities</a> ·
+  <a href="#part-of-cortexkit">CortexKit</a> ·
+  <a href="#-sensory-cortex-perceive">Sensory</a> ·
+  <a href="#-motor-cortex-act">Motor</a> ·
+  <a href="#-brainstem-keep-it-alive">Brainstem</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#development">Development</a> ·
-  <a href="#tool-reference">Tool Reference</a> ·
-  <a href="#configuration">Configuration</a> ·
   <a href="https://discord.gg/DSa65w8wuf">💬 Discord</a>
 </p>
 
@@ -24,80 +34,127 @@
 
 ## What is AFT?
 
-AI coding agents are fast at reasoning but clumsy at interacting with code. The typical pattern — read an entire file to find one function, construct a diff from memory, apply it by line number, hope nothing shifted — burns tokens on context noise and breaks when the file changes.
+You give yourself the best tools for the job: an IDE that shows you the whole codebase at a glance, the fastest terminal you can find, an operating system that runs a dozen things at once so you never wait on a single task to finish.
 
-AFT is the tooling layer that fixes this. Part of the CortexKit family, it acts as the **motor cortex and sensory cortex** for coding agents — giving them precise, low-level control over code files and a proper operating system to run in.
+Then you hand your agent `read`, `edit`, and raw `bash`, and wonder why it burns tokens on whole-file reads and breaks edits the moment a line moves.
 
-Concretely:
+AFT gives it the real thing. It sits between an agent's reasoning and your codebase as a **sensorimotor cortex**, the part of the brain wired to perception and action:
 
-- **Sensory cortex** — structural code understanding. Agents can outline a file in one call, zoom into a specific function by name, and search code by meaning instead of guessing keywords.
-- **Motor cortex** — precise code manipulation. Edit functions by name instead of line number. Refactor across the whole workspace with one command. The binary handles parsing, formatting, backup, and type-checking.
-- **Agent OS** — background bash tasks, PTY sessions, output compression. Agents can spawn long-running work, inspect it later, and get compressed output instead of raw firehose.
+- **Sensory cortex: perceive.** Outline a file, zoom into one symbol, search by meaning, follow a call graph. The agent sees *structure* instead of scrolling text.
+- **Motor cortex: act.** Edit a function by name, refactor across the workspace, organize imports. Every change is parsed, validated, formatted, and backed up by the binary.
+- **Brainstem: stay alive.** Background bash tasks, PTY sessions, compressed output, and an undo stack keep the agent's environment running without it having to think about it.
 
-The result is less token waste. Instead of reading 500 lines to find one function, the agent calls `aft_outline` then `aft_zoom` — ~40 tokens instead of ~375. Instead of guessing where a concept lives, `aft_search` finds the exact location by meaning. Bash output is compressed per-command. Refactoring that would need manual grep+read+edit across 10 files becomes one `aft_refactor move` call.
+Sensory and motor make the **IDE**; the brainstem is the **OS**. Your agent gets both.
 
-AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai) and [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent). It hoists itself into the host harness's built-in tool slots — agents keep calling the same tool names (`read`, `write`, `edit`, `bash`, `grep`), but now backed by tree-sitter parsing, indexed search, output compression, and symbol-aware operations.
+**Increase productivity. Decrease token usage.**
+
+AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai) and [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent). It **hoists the host's built-in tool slots** (the agent keeps calling `read`, `write`, `edit`, `bash`, `grep`, but now they're backed by tree-sitter parsing, indexed search, output compression, and symbol-aware operations) and adds an `aft_` family on top.
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
 npx @cortexkit/aft setup
 ```
 
-This auto-detects which harnesses you have installed and configures each one. On the next session start, the `aft` binary downloads if needed and all tools become available.
+Auto-detects which harnesses you have installed and configures each one. On the next session start, the `aft` binary downloads if needed and all tools come online. Target a specific harness with `--harness opencode` or `--harness pi`.
 
-Add `--harness opencode` or `--harness pi` to target a specific harness.
+**What setup does to each host:**
 
-**What AFT does to each harness:**
-- **OpenCode** — replaces built-in `read`, `write`, `edit`, `apply_patch`, `ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with AFT-powered versions and adds the `aft_` family on top.
-- **Pi** — replaces built-in `read`, `write`, `edit`, and `grep` and adds the `aft_` family on top.
+- **OpenCode**: replaces built-in `read`, `write`, `edit`, and `apply_patch` with AFT-backed versions, and adds the `aft_` family on top.
+- **Pi**: replaces built-in `read`, `write`, `edit`, and `grep`, and adds the `aft_` family on top.
 
-See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`, and cache management commands.
-
----
-
-## Key Capabilities
-
-### Structural code understanding
-
-- **`aft_outline`** — list every symbol in a file (or directory, or remote URL) with kind, name, line range, and visibility. One call instead of reading the whole file.
-- **`aft_zoom`** — inspect a specific function, class, or type with call-graph annotations (what it calls, what calls it). ~40 tokens instead of ~375.
-- **`aft_search`** — find code by meaning when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase. Requires ONNX Runtime for the local embedding backend.
-- **`aft_callgraph`** — follow callers, callees, data flow, impact analysis, and shortest call paths between two symbols across the workspace.
-- **`aft_inspect`** — codebase-health snapshot: TODOs, file/symbol metrics, dead code, unused exports, and duplicate detection in one call.
-- **`grep` / `glob`** — trigram-indexed regex search and file discovery. Background index building with disk persistence.
-
-### Precise manipulation
-
-- **`edit`** — find/replace with fuzzy matching, or replace a named symbol directly. Batch edits, multi-file transactions, glob replace across matching files.
-- **`write`** — write a file with auto-directory creation, backup, formatting, and inline LSP diagnostics.
-- **`apply_patch`** — multi-file `*** Begin Patch` format with atomic rollback.
-- **`aft_refactor`** — workspace-wide symbol move (updates all imports), function extraction, function inlining.
-- **`aft_import`** — language-aware import add, remove, and organize (TS/JS/TSX/Python/Rust/Go).
-- **`aft_transform`** — structural transforms: add class members, Rust derives, Python decorators, Go struct tags, try/catch wrapping.
-- **`ast_grep_search` / `ast_grep_replace`** — structural code search and replace using AST patterns with meta-variables.
-- **`lsp_diagnostics`** — on-demand errors and warnings from language servers. Not a full type checker, but fast feedback during edits.
-
-### Agent OS
-
-- **`bash`** — unified shell execution with command rewriting (cat→read, grep→grep tool, etc.), per-command output compression, background task spawning, and tree-sitter permission scanning (OpenCode).
-- **Background bash** — spawn detached tasks with `background: true`, inspect with `bash_status`, kill with `bash_kill`. Output is buffered and compressed. Long foreground commands auto-promote to background.
-- **Bash compression** — three-tier output compression: built-in Rust compressors for git/cargo/npm/bun/pnpm/pytest/tsc/biome, declarative TOML filters for the long tail (make/ls/find/du/docker/kubectl/gh/etc.), and generic ANSI-strip + dedup fallback.
-- **PTY** — interactive terminal sessions for REPLs and terminal apps (python, node, vim, even a nested agent). Drive with `bash_write`, inspect rendered screen state via `bash_status`.
-- **`bash_watch`** — block on or asynchronously watch a background/PTY task for an output pattern or exit.
-
-### Safety and recovery
-
-- **`aft_safety`** — per-file undo stack, named checkpoints, restore to any checkpoint. Every edit is backed up.
-- **Auto-backup** — every write and edit saves a snapshot before mutating.
-- **Auto-format** — edits run the project formatter (biome, rustfmt, prettier, etc.) automatically.
-- **On-demand diagnostics** — pass `diagnostics: true` on a write/edit to get LSP errors inline, or call `aft_inspect` / `lsp_diagnostics` at a verification checkpoint.
+See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`, and cache-management commands.
 
 ---
 
-## Supported Languages
+## Before / after
+
+**Without AFT**, to change one function:
+
+```text
+read src/server.ts          → the whole file lands in context
+(reconstruct the edit from memory)
+edit by line 247            → breaks the moment the file shifted
+```
+
+**With AFT:**
+
+```text
+aft_outline src/server.ts   → every symbol, about one screen
+aft_zoom handleRequest      → just that function + who calls it
+edit symbol: handleRequest  → replaced by name, auto-formatted, backed up
+```
+
+Read one function, not the whole file. Edit by name, not by line number. Tens of tokens where the old loop spent hundreds, and the edit doesn't rot when the file moves.
+
+---
+
+## Part of CortexKit
+
+A brain isn't one organ. Neither is a capable coding agent.
+
+**CortexKit** is a family of plugins, each modeled on a different region of the brain. Install one and your agent gets sharper. Install all three and it has a brain.
+
+| Plugin | Region | What it does |
+|---|---|---|
+| **[Magic Context](https://github.com/cortexkit/magic-context)** | Hippocampus & medial temporal lobe | Long-term project memory. Compresses episodes into compartments, promotes stable facts, recalls prior context, tracks how knowledge changes over time. |
+| **AFT** *(you are here)* | Sensorimotor cortex | Perceives code structure and acts on it precisely. |
+| **Alfonso** *(coming soon)* | Prefrontal cortex | Executive control. Plans, decomposes work, chooses agents and models, delegates, monitors progress, and decides when to ask, verify, and commit. |
+
+AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Context remembers; Alfonso decides.
+
+---
+
+## 🧠 Sensory cortex: perceive
+
+*The IDE's eyes.* How the agent *sees* your codebase: structure, meaning, and relationships instead of a wall of text.
+
+- **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members. One call instead of reading the whole file.
+- **`aft_zoom`**: inspect a specific function, class, or type with call-graph annotations for what it calls and what calls it.
+- **`aft_search`**: find code by *meaning* when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase, with local, OpenAI-compatible, or Ollama embedding backends.
+- **`aft_callgraph`**: follow callers, callees, data flow, impact analysis, and the shortest call path between two symbols across the workspace.
+- **`aft_inspect`**: a one-call codebase-health report covering LSP errors and warnings, TODOs, metrics, dead code, unused exports, and duplicates. The Problems and inspections panels an IDE keeps open, on demand.
+- **`grep` / `glob`**: trigram-indexed regex search and file discovery, built in the background, persisted to disk, and kept fresh by a file watcher.
+
+---
+
+## ✋ Motor cortex: act
+
+*The IDE's hands.* How the agent *changes* your codebase: at the level of symbols, not line numbers. Every mutation is parsed, formatted, and backed up before it touches disk.
+
+- **`edit`**: find/replace with fuzzy matching, or replace a named symbol directly. Batch edits, multi-file transactions, and glob replace across matching files.
+- **`write`**: write a file with auto-created directories, backup, formatting, and optional inline diagnostics.
+- **`apply_patch`**: multi-file `*** Begin Patch` format with atomic rollback.
+- **`aft_refactor`**: workspace-wide symbol move (updates every import), function extraction, and inlining.
+- **`aft_import`**: language-aware import add, remove, and organize.
+- **`aft_transform`**: structural transforms such as adding class members, Rust derives, Python decorators, Go struct tags, or wrapping a body in try/catch.
+- **`ast_grep_search` / `ast_grep_replace`**: structural search and replace using AST patterns with meta-variables.
+
+---
+
+## ⚙️ Brainstem: keep it alive
+
+*The OS.* The autonomic layer. Long-running work, noisy output, and recovery, handled without the agent's attention.
+
+- **`bash`**: unified shell execution with command rewriting (`cat`→`read`, `grep`→grep tool), per-command output compression, and tree-sitter permission scanning (OpenCode).
+- **Background tasks**: spawn detached work with `background: true`, inspect with `bash_status`, kill with `bash_kill`, and block or watch for output with `bash_watch`. Tasks and their completions survive restarts.
+- **Output compression**: multi-tier compression turns firehose CLI output (test runners, installers, `docker ps`, `kubectl`) into the few lines that actually matter, keeping errors and summaries while dropping the noise.
+- **PTY**: real interactive terminal sessions for REPLs and terminal apps (python, node, vim, even a nested agent). Drive them with `bash_write`, inspect rendered screen state with `bash_status`.
+- **`aft_safety`**: per-file undo stack, named checkpoints, and restore. Every edit is backed up to disk and survives bridge and host restarts.
+
+---
+
+## Benchmarks
+
+A full, reproducible benchmark suite is in progress: search latency, retrieval quality, bash-output token reduction, and end-to-end agent task success against other code-context plugins. We'll publish numbers here once the methodology is locked and the harnesses are reproducible from a clean checkout.
+
+_Coming soon._
+
+---
+
+## Supported languages
 
 | Language | Outline | Edit | Imports | Refactor |
 |----------|---------|------|---------|---------|
@@ -106,25 +163,25 @@ See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`,
 | Python | ✓ | ✓ | ✓ | ✓ |
 | Rust | ✓ | ✓ | ✓ | partial |
 | Go | ✓ | ✓ | ✓ | partial |
-| C / C++ / C# | ✓ | ✓ | — | — |
-| Java / Kotlin / Scala | ✓ | ✓ | — | — |
-| Swift | ✓ | ✓ | — | — |
-| Ruby | ✓ | ✓ | — | — |
-| PHP | ✓ | ✓ | — | — |
-| Lua / Perl | ✓ | ✓ | — | — |
-| Zig | ✓ | ✓ | — | — |
-| Bash | ✓ | ✓ | — | — |
-| HTML / Markdown / JSON | ✓ | ✓ | — | — |
-| Solidity | ✓ | ✓ | — | — |
-| Vue | ✓ | ✓ | — | — |
+| C / C++ / C# | ✓ | ✓ | | |
+| Java / Kotlin / Scala | ✓ | ✓ | | |
+| Swift | ✓ | ✓ | | |
+| Ruby | ✓ | ✓ | | |
+| PHP | ✓ | ✓ | | |
+| Lua / Perl | ✓ | ✓ | | |
+| Zig | ✓ | ✓ | | |
+| Bash | ✓ | ✓ | | |
+| HTML / Markdown / JSON | ✓ | ✓ | | |
+| Solidity | ✓ | ✓ | | |
+| Vue | ✓ | ✓ | | |
 
-Every listed language works with `aft_outline`, `aft_zoom`, `read`/`edit`/`write`, and the structural tool surface. AST search and replace covers TS/JS/TSX, Python, Rust, Go, C, C++, C#, Zig, Solidity, and Vue. Import management covers TS/JS/TSX, Python, Rust, and Go.
+Every listed language works with `aft_outline`, `aft_zoom`, `read`/`edit`/`write`, and the structural tool surface. AST search and replace covers TS/JS/TSX, Python, Rust, Go, C, C++, C#, Java, Kotlin, Swift, Ruby, PHP, Lua, Perl, Zig, Solidity, Vue, and JSON. Import management covers TS/JS/TSX, Python, Rust, and Go.
 
 ---
 
 ## Architecture
 
-AFT is a Rust binary driven by thin adapter packages per harness. The binary speaks a simple JSON-over-stdio request/response protocol — one process per session stays alive for the session lifetime.
+AFT is a Rust binary driven by thin adapter packages per harness. The binary speaks a simple JSON-over-stdio request/response protocol. One process per project root stays alive for the project's lifetime, shared across sessions on that root, keeping parse trees warm while each session keeps its own isolated undo history.
 
 ```
    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
@@ -146,7 +203,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (17 lang)│
+                   │ • tree-sitter (24 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │
@@ -155,42 +212,38 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    └────────────────────────┘
 ```
 
-Per-harness adapter responsibilities:
-- **Hoist** the harness's built-in tool slots and register AFT-only tools.
-- **Manage a BridgePool** — one persistent `aft` process per session for warm parse trees and isolated undo history.
-- **Resolve the binary** — cache → npm platform package → PATH → cargo install → GitHub release download.
-- **Translate** between the harness's plugin API and AFT's request/response protocol.
+Per-harness adapters **hoist** the host's built-in tool slots and register AFT-only tools, **manage a BridgePool** (one persistent `aft` process per project root, shared across sessions), **resolve the binary** (cache → npm platform package → PATH → cargo install → GitHub release), and **translate** between the host's plugin API and AFT's protocol.
 
 AFT data lives under a shared CortexKit storage root (`~/.local/share/cortexkit/aft/`). Backups, search indexes, and downloaded LSP servers persist there across sessions.
 
-See the [tool reference](docs/tools.md) for complete documentation of every tool.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full layer map and the [tool reference](docs/tools.md) for every tool.
+
+---
+
+## Configuration
+
+AFT works out of the box; everything below is optional. Configure it via `aft.jsonc` at the user or project level: tool surface, semantic-search backend, LSP servers, bash compression, and more.
+
+See the [configuration reference](docs/config.md) for the full schema, and the [CLI reference](docs/cli.md) for `setup`, `doctor`, and cache commands.
 
 ---
 
 ## Development
 
-AFT is a monorepo: bun workspaces for TypeScript, cargo workspace for Rust.
+AFT is a monorepo: Bun workspaces for TypeScript, a cargo workspace for Rust.
 
-**Requirements:** Bun ≥ 1.0, Rust stable toolchain (1.80+).
+**Requirements:** Bun ≥ 1.0, Rust stable toolchain (1.82+).
 
 ```sh
-# Install JS dependencies
-bun install
+bun install            # JS dependencies
+cargo build --release  # Rust binary
+bun run build          # TypeScript plugins
 
-# Build the Rust binary
-cargo build --release
+bun run test           # TypeScript tests
+cargo test             # Rust tests
 
-# Build the TypeScript plugin
-bun run build
-
-# Run all tests
-bun run test        # TypeScript tests
-cargo test          # Rust tests
-
-# Lint and format
-bun run lint        # biome check
-bun run lint:fix    # biome check --write
-bun run format      # biome format + cargo fmt
+bun run lint           # biome check
+bun run format         # biome format + cargo fmt
 ```
 
 **Project layout:**
@@ -198,31 +251,22 @@ bun run format      # biome format + cargo fmt
 ```
 opencode-aft/
 ├── crates/
-│   └── aft/              # Rust binary — shared core (tree-sitter, search, LSP, etc.)
-│       └── src/
+│   └── aft/              # Rust binary, shared core (tree-sitter, search, LSP, etc.)
 ├── packages/
-│   ├── aft-cli/          # Unified CLI (@cortexkit/aft) — setup/doctor across all harnesses
+│   ├── aft-cli/          # Unified CLI (@cortexkit/aft), setup/doctor across all harnesses
 │   ├── opencode-plugin/  # OpenCode adapter (@cortexkit/aft-opencode)
-│   │   └── src/
-│   │       ├── tools/    # One file per tool group
-│   │       ├── config.ts # Config loading and schema
-│   │       └── downloader.ts
 │   ├── pi-plugin/        # Pi adapter (@cortexkit/aft-pi)
-│   │   └── src/
 │   └── npm/              # Platform-specific binary packages
-└── scripts/
-    └── version-sync.mjs  # Keeps npm and cargo versions in sync
+└── scripts/              # Release + version-sync tooling
 ```
 
 ---
 
 ## Contributing
 
-Pull requests for bugs are welcome. For features, broader fixes that requires architectural changes, please open an issue first to discuss the approach.
+Pull requests for bugs are welcome. For features or broader fixes that need architectural changes, please open an issue first to discuss the approach.
 
-The binary protocol is documented in `crates/aft/src/main.rs`. Adding a new command means implementing it in Rust and adding a corresponding tool definition (or extending an existing one) in each harness adapter (`packages/opencode-plugin/src/tools/` and `packages/pi-plugin/src/tools/`).
-
-Run `bun run format` and `cargo fmt` before submitting. The CI will reject unformatted code.
+Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and adding a tool definition in each harness adapter (`packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`). Run `bun run format` and `cargo fmt` before submitting; CI rejects unformatted code.
 
 ---
 
@@ -232,9 +276,9 @@ Run `bun run format` and `cargo fmt` before submitting. The CI will reject unfor
 
 ---
 
-## Separate documentation
+## Documentation
 
-- [Tool reference](docs/tools.md) — complete documentation for every tool
-- [Configuration](docs/config.md) — config schema, LSP, auto-install
-- [CLI commands](docs/cli.md) — setup, doctor, and cache management
-- [Search benchmarks](docs/benchmarks.md) — trigram index vs ripgrep comparison
+- [Tool reference](docs/tools.md): complete documentation for every tool
+- [Configuration](docs/config.md): config schema, LSP, auto-install
+- [CLI commands](docs/cli.md): setup, doctor, and cache management
+- [Benchmarks](docs/benchmarks.md): search-index methodology *(numbers being finalized)*

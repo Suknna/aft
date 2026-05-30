@@ -199,7 +199,7 @@ const ANNOUNCEMENT_FEATURES: string[] = [
  *
  * Leave empty (`""`) to suppress.
  */
-const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/F2uWxjGnU";
+const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 
 const ALL_ONLY_TOOLS = new Set([
   "aft_callgraph",
