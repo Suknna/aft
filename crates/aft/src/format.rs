@@ -348,9 +348,10 @@ pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) 
     }
 
     // 2. Try PATH lookup first. This is the fast common path: spawning the
-    // tool with `--version` and waiting briefly for it to exit. When the
-    // editor (OpenCode, Pi, etc.) is launched from a login shell the PATH
-    // is usually complete, so this finds Homebrew/cargo/etc. binaries.
+    // tool with command-specific availability arguments and waiting briefly
+    // for it to exit. When the editor (OpenCode, Pi, etc.) is launched from a
+    // login shell the PATH is usually complete, so this finds Homebrew/cargo/etc.
+    // binaries.
     if let Some(path) = try_path_lookup(command) {
         return Some(path);
     }
@@ -415,8 +416,9 @@ fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<S
 /// name on success (downstream `Command::new` re-resolves through PATH),
 /// or None if the spawn fails or the tool exits with non-zero status.
 fn try_path_lookup(command: &str) -> Option<PathBuf> {
+    let probe_args = path_lookup_probe_args(command);
     let mut child = Command::new(command)
-        .arg("--version")
+        .args(probe_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -441,6 +443,17 @@ fn try_path_lookup(command: &str) -> Option<PathBuf> {
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(_) => return None,
         }
+    }
+}
+
+fn path_lookup_probe_args(command: &str) -> &'static [&'static str] {
+    match command {
+        // Go uses `go version` rather than a POSIX-style `--version` flag.
+        "go" => &["version"],
+        // `gofmt` has no version flag. It exits successfully with empty stdin,
+        // which is sufficient for PATH availability probing.
+        "gofmt" => &[],
+        _ => &["--version"],
     }
 }
 
@@ -2354,6 +2367,13 @@ mod tests {
     }
 
     #[test]
+    fn path_lookup_probe_args_match_go_tool_conventions() {
+        assert_eq!(path_lookup_probe_args("go"), &["version"]);
+        assert!(path_lookup_probe_args("gofmt").is_empty());
+        assert_eq!(path_lookup_probe_args("rustfmt"), &["--version"]);
+    }
+
+    #[test]
     fn auto_format_unsupported_language() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
@@ -3247,10 +3267,11 @@ C:\repo\other.go:1:1: other file
 
         fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
         fs::write(dir.path().join("go.mod"), "module test\ngo 1.21\n").unwrap();
-        let go_config = Config {
+        let mut go_config = Config {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
         };
+        go_config.checker.insert("go".to_string(), "go".to_string());
         let (go_cmd, _) =
             detect_type_checker(&dir.path().join("main.go"), LangId::Go, &go_config).unwrap();
         assert_eq!(go_cmd, bin_dir.join("go").to_string_lossy());

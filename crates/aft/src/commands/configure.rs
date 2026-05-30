@@ -857,49 +857,13 @@ fn resolve_tool_uncached(tool: &str, project_root: Option<&Path>) -> bool {
         return ruff_format_available(project_root);
     }
 
-    if let Some(root) = project_root {
-        if root.join("node_modules").join(".bin").join(tool).exists() {
-            return true;
-        }
-    }
-
-    let mut child = match std::process::Command::new(tool)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => return false,
-        }
-    }
+    crate::format::resolve_tool_uncached(tool, project_root).is_some()
 }
 
 fn ruff_format_available(project_root: Option<&Path>) -> bool {
-    let command = if let Some(root) = project_root {
-        let local = root.join("node_modules").join(".bin").join("ruff");
-        if local.exists() {
-            local
-        } else {
-            PathBuf::from("ruff")
-        }
-    } else {
-        PathBuf::from("ruff")
+    let command = match crate::format::resolve_tool_uncached("ruff", project_root) {
+        Some(command) => command,
+        None => return false,
     };
 
     let output = match std::process::Command::new(command)
@@ -2362,6 +2326,45 @@ mod tests {
         assert_eq!(warning.kind, "formatter_not_installed");
         assert_eq!(warning.language, "typescript");
         assert_eq!(warning.tool, "oxfmt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_missing_tools_uses_shared_go_tool_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("go.mod"), "module example.test\ngo 1.21\n").unwrap();
+        let bin_dir = temp.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let go = bin_dir.join("go");
+        std::fs::write(
+            &go,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then exit 0; fi\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let gofmt = bin_dir.join("gofmt");
+        std::fs::write(
+            &gofmt,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\ncat >/dev/null\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gofmt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut languages = std::collections::HashSet::new();
+        languages.insert(crate::parser::LangId::Go);
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+
+        assert!(
+            warnings.is_empty(),
+            "expected shared Go resolver to avoid false missing-tool warnings, got {warnings:?}"
+        );
     }
 
     /// Shared mutex serializing the home-root tests below. Both tests

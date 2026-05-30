@@ -88,7 +88,10 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
     std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
 
     let path = empty_path();
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
 
     let configure = aft.send(
         &json!({
