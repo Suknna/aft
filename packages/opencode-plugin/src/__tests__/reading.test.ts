@@ -4,7 +4,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -24,7 +24,7 @@ type AskCall = {
 const tempRoots: string[] = [];
 
 async function tempProject(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "aft-opencode-reading-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "aft-opencode-reading-")));
   tempRoots.push(root);
   return root;
 }
@@ -144,12 +144,12 @@ describe("reading tool adapters", () => {
 
     const externalAsks = askCalls.filter((call) => call.permission === "external_directory");
     expect(externalAsks).toHaveLength(1);
-    expect(externalAsks[0]?.patterns).toEqual([join(tmpRoot, "*").replaceAll("\\", "/")]);
+    expect(externalAsks[0]?.patterns).toEqual([join(external, "*").replaceAll("\\", "/")]);
     expect(externalAsks[0]?.metadata?.filepath).toBe(external);
     expect(sendCalls[0]?.params).toMatchObject({ directory: external, files: true });
   });
 
-  test("aft_outline files:true target arrays ask once per unique external parent", async () => {
+  test("aft_outline files:true target arrays ask once per unique external target", async () => {
     const tmpRoot = await tempProject();
     const project = join(tmpRoot, "project");
     const externalRoot = join(tmpRoot, "external");
@@ -170,8 +170,11 @@ describe("reading tool adapters", () => {
     );
 
     const externalAsks = askCalls.filter((call) => call.permission === "external_directory");
-    expect(externalAsks).toHaveLength(1);
-    expect(externalAsks[0]?.patterns).toEqual([join(externalRoot, "*").replaceAll("\\", "/")]);
+    expect(externalAsks).toHaveLength(2);
+    expect(externalAsks.map((call) => call.patterns?.[0])).toEqual([
+      join(first, "*").replaceAll("\\", "/"),
+      join(second, "*").replaceAll("\\", "/"),
+    ]);
     expect(sendCalls[0]?.params).toMatchObject({ target: [first, second], files: true });
   });
 
@@ -201,9 +204,9 @@ describe("reading tool adapters", () => {
 
     expect(sendCalls).toHaveLength(2);
     expect(sendCalls[0]?.command).toBe("zoom");
-    expect(sendCalls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(sendCalls[0]?.params).toMatchObject({ file: join(root, "src/a.ts"), symbol: "foo" });
     expect(sendCalls[1]?.command).toBe("zoom");
-    expect(sendCalls[1]?.params).toMatchObject({ file: "src/b.ts", symbol: "bar" });
+    expect(sendCalls[1]?.params).toMatchObject({ file: join(root, "src/b.ts"), symbol: "bar" });
     // Each section uses its OWN filePath as the header label, not a shared one.
     expect(result).toContain("src/a.ts:10-20 [function foo]");
     expect(result).toContain("src/b.ts:10-20 [function bar]");
@@ -342,9 +345,9 @@ describe("reading tool adapters", () => {
     );
 
     expect(sendCalls.map((call) => call.params)).toEqual([
-      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
-      expect.objectContaining({ file: "src/a.ts", symbol: "foo", callgraph: true }),
-      expect.objectContaining({ file: "src/a.ts", callgraph: true }),
+      expect.objectContaining({ file: join(root, "src/a.ts"), symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: join(root, "src/a.ts"), symbol: "foo", callgraph: true }),
+      expect.objectContaining({ file: join(root, "src/a.ts"), callgraph: true }),
     ]);
 
     sendCalls.length = 0;
@@ -352,7 +355,7 @@ describe("reading tool adapters", () => {
       { filePath: "src/a.ts", symbols: "foo" },
       createMockSdkContext(root),
     );
-    expect(sendCalls[0]?.params).toMatchObject({ file: "src/a.ts", symbol: "foo" });
+    expect(sendCalls[0]?.params).toMatchObject({ file: join(root, "src/a.ts"), symbol: "foo" });
     expect(sendCalls[0]?.params).not.toHaveProperty("callgraph");
   });
 });

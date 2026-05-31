@@ -2,12 +2,11 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePattern,
   resolveRelativePatterns,
   workspacePattern,
@@ -89,23 +88,25 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           throw new Error("'callSiteLine' is required for 'inline' op");
         }
 
-        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
+        const destination =
+          op === "move"
+            ? await resolvePathArg(ctx, context, args.destination as string)
+            : undefined;
         const patterns =
           op === "move"
             ? resolveRelativePatterns(context, [
                 workspacePattern(context),
-                args.filePath as string,
-                ...(typeof args.destination === "string" ? [args.destination] : []),
+                filePath,
+                ...(destination !== undefined ? [destination] : []),
               ])
-            : [resolveRelativePattern(context, args.filePath as string)];
+            : [resolveRelativePattern(context, filePath)];
         const metadata = patterns.length === 1 ? { filepath: filePath } : {};
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
           const affectedPaths =
-            op === "move" && typeof args.destination === "string"
-              ? [filePath, resolveAbsolutePath(context, args.destination)]
-              : [filePath];
+            op === "move" && destination !== undefined ? [filePath, destination] : [filePath];
           const asked = new Set<string>();
           for (const affectedPath of affectedPaths) {
             if (asked.has(affectedPath)) continue;
@@ -123,12 +124,12 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           extract: "extract_function",
           inline: "inline_symbol",
         };
-        const params: Record<string, unknown> = { file: args.filePath };
+        const params: Record<string, unknown> = { file: filePath };
 
         switch (op) {
           case "move":
             params.symbol = args.symbol;
-            params.destination = args.destination;
+            params.destination = destination;
             if (args.scope !== undefined) params.scope = args.scope;
             break;
           case "extract":

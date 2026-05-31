@@ -300,6 +300,36 @@ export function projectRootFor(runtime: ToolRuntime): string {
 }
 
 /**
+ * Warm the session-directory cache, then return the same project root that
+ * callBridge()/bridgeFor() will use for this tool call. Permission checks must
+ * resolve paths through this helper before dispatch so the path the user
+ * approves is byte-for-byte the path the Rust bridge acts on.
+ */
+export async function resolveProjectRoot(
+  ctx: PluginContext,
+  runtime: ToolRuntime,
+): Promise<string> {
+  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
+    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
+  }
+  return projectRootFor(runtime);
+}
+
+/** Resolve a user path exactly as a bridge request will: absolute paths are
+ * preserved; relative paths are rooted at the session/project root. */
+export function resolvePathFromProjectRoot(projectRoot: string, target: string): string {
+  return path.isAbsolute(target) ? target : path.resolve(projectRoot, target);
+}
+
+export async function resolvePathArg(
+  ctx: PluginContext,
+  runtime: ToolRuntime,
+  target: string,
+): Promise<string> {
+  return resolvePathFromProjectRoot(await resolveProjectRoot(ctx, runtime), target);
+}
+
+/**
  * Get the BinaryBridge for the runtime's project root.
  *
  * Prefer `callBridge()` unless you need to send multiple requests yourself.

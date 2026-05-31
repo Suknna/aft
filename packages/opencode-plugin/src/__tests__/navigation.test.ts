@@ -84,7 +84,7 @@ describe("aft_callgraph OpenCode adapter", () => {
     expect(calls[0]).toEqual({
       command: "impact",
       params: {
-        file: "src/app.ts",
+        file: "/repo/src/app.ts",
         symbol: "run",
         depth: 4,
       },

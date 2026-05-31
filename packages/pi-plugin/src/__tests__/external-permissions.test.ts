@@ -12,6 +12,9 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerAstTools } from "../tools/ast.js";
 import { registerFsTools } from "../tools/fs.js";
 import { registerImportTools } from "../tools/imports.js";
+import { registerInspectTool } from "../tools/inspect.js";
+import { registerNavigateTool } from "../tools/navigate.js";
+import { registerReadingTools } from "../tools/reading.js";
 import { registerRefactorTool } from "../tools/refactor.js";
 import { registerSafetyTool } from "../tools/safety.js";
 import { registerStructureTool } from "../tools/structure.js";
@@ -108,6 +111,34 @@ describe("AFT external-directory permissions", () => {
         action: "modify",
       },
       {
+        label: "aft_outline",
+        toolName: "aft_outline",
+        params: { target: "/outside/outline.ts" },
+        command: "outline",
+        action: "read",
+      },
+      {
+        label: "aft_zoom",
+        toolName: "aft_zoom",
+        params: { filePath: "/outside/zoom.ts" },
+        command: "zoom",
+        action: "read",
+      },
+      {
+        label: "aft_callgraph",
+        toolName: "aft_callgraph",
+        params: { op: "callers", filePath: "/outside/nav.ts", symbol: "run" },
+        command: "callers",
+        action: "read",
+      },
+      {
+        label: "aft_inspect",
+        toolName: "aft_inspect",
+        params: { scope: "/outside/scope" },
+        command: "inspect",
+        action: "read",
+      },
+      {
         label: "aft_delete",
         toolName: "aft_delete",
         params: { files: ["/outside/delete.ts"] },
@@ -143,6 +174,14 @@ describe("AFT external-directory permissions", () => {
       if (entry.label === "ast_grep_replace") {
         registerAstTools(api, restrictedContext(bridge), { astSearch: false, astReplace: true });
       }
+      if (entry.label === "aft_outline") {
+        registerReadingTools(api, restrictedContext(bridge), { outline: true, zoom: false });
+      }
+      if (entry.label === "aft_zoom") {
+        registerReadingTools(api, restrictedContext(bridge), { outline: false, zoom: true });
+      }
+      if (entry.label === "aft_callgraph") registerNavigateTool(api, restrictedContext(bridge));
+      if (entry.label === "aft_inspect") registerInspectTool(api, restrictedContext(bridge));
       if (entry.label === "aft_delete") {
         registerFsTools(api, restrictedContext(bridge), { delete: true, move: false });
       }

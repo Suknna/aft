@@ -1,10 +1,9 @@
-import { dirname, resolve } from "node:path";
 import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { storeToolMetadata } from "../metadata-store.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -97,10 +96,20 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             if (target.length === 0) {
               throw new Error("'target' must be a non-empty string or array of strings");
             }
-            const permissionDenied = await assertOutlineFilesExternalPermissions(context, target);
+            const resolvedTargets = await Promise.all(
+              target.map((entry) => resolvePathArg(ctx, context, entry)),
+            );
+            const permissionDenied = await assertPathExternalPermissions(
+              context,
+              resolvedTargets,
+              "directory",
+            );
             if (permissionDenied) return permissionDeniedResponse(permissionDenied);
 
-            const response = await callBridge(ctx, context, "outline", { target, files: true });
+            const response = await callBridge(ctx, context, "outline", {
+              target: resolvedTargets,
+              files: true,
+            });
             if (response.success === false) {
               throw new Error((response.message as string) || "outline failed");
             }
@@ -111,12 +120,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             throw new Error("'target' must be a non-empty string or array of strings");
           }
 
-          const resolvedPath = resolve(context.directory, target);
-          const permissionDenied = await assertOutlineFilesExternalPermissions(
-            context,
-            resolvedPath,
-          );
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+          const resolvedPath = await resolvePathArg(ctx, context, target);
 
           let isDirectory = false;
           try {
@@ -127,9 +131,16 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             // Let Rust report missing paths with its structured error shape.
           }
 
+          const permissionDenied = await assertPathExternalPermissions(
+            context,
+            resolvedPath,
+            isDirectory ? "directory" : "file",
+          );
+          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+
           const params = isDirectory
             ? { directory: resolvedPath, files: true }
-            : { file: target, files: true };
+            : { file: resolvedPath, files: true };
           const response = await callBridge(ctx, context, "outline", params);
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
@@ -148,8 +159,14 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
         // Multi-file mode
         if (isArray) {
+          const resolvedTargets = await Promise.all(
+            (target as string[]).map((entry) => resolvePathArg(ctx, context, entry)),
+          );
+          const permissionDenied = await assertPathExternalPermissions(context, resolvedTargets);
+          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+
           const response = await callBridge(ctx, context, "outline", {
-            files: target as string[],
+            files: resolvedTargets,
           });
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
@@ -162,27 +179,33 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           throw new Error("'target' must be a non-empty string or array of strings");
         }
 
+        const resolvedTarget = await resolvePathArg(ctx, context, target);
         let isDirectory = false;
         try {
           const { stat } = await import("node:fs/promises");
-          const resolved = resolve(context.directory, target);
-          const st = await stat(resolved);
+          const st = await stat(resolvedTarget);
           isDirectory = st.isDirectory();
         } catch {
           // Path doesn't exist locally — fall through to single-file mode and
           // let Rust report the real error with its preferred shape.
         }
 
+        const permissionDenied = await assertPathExternalPermissions(
+          context,
+          resolvedTarget,
+          isDirectory ? "directory" : "file",
+        );
+        if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+
         if (isDirectory) {
-          const dirPath = resolve(context.directory, target);
-          const response = await callBridge(ctx, context, "outline", { directory: dirPath });
+          const response = await callBridge(ctx, context, "outline", { directory: resolvedTarget });
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
           }
           return JSON.stringify(response, null, 2);
         }
 
-        const response = await callBridge(ctx, context, "outline", { file: target });
+        const response = await callBridge(ctx, context, "outline", { file: resolvedTarget });
         if (response.success === false) {
           throw new Error((response.message as string) || "outline failed");
         }
@@ -312,9 +335,18 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               throw new Error(`targets[${i}].symbol must be a non-empty string`);
             }
           }
+          const resolvedTargets = await Promise.all(
+            targets.map((t) => resolvePathArg(ctx, context, t.filePath)),
+          );
+          const permissionDenied = await assertPathExternalPermissions(context, resolvedTargets);
+          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+
           const responses = await Promise.all(
-            targets.map((t) => {
-              const params: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
+            targets.map((t, index) => {
+              const params: Record<string, unknown> = {
+                file: resolvedTargets[index],
+                symbol: t.symbol,
+              };
               if (args.contextLines !== undefined) params.context_lines = args.contextLines;
               if (wantCallgraph) params.callgraph = true;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
@@ -339,7 +371,13 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         }
 
         // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        const file = hasUrl ? (args.url as string) : (args.filePath as string);
+        const file = hasUrl
+          ? (args.url as string)
+          : await resolvePathArg(ctx, context, args.filePath as string);
+        if (!hasUrl) {
+          const permissionDenied = await assertPathExternalPermissions(context, file);
+          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+        }
 
         // Header label — what the agent typed, not the on-disk cache path.
         const targetLabel = (hasUrl ? (args.url as string) : (args.filePath as string)) ?? file;
@@ -444,21 +482,21 @@ interface SkippedOutlineFile {
 
 const MAX_UNCHECKED_FILES_IN_FOOTER = 10;
 
-async function assertOutlineFilesExternalPermissions(
+async function assertPathExternalPermissions(
   context: ToolContext,
   target: string | string[],
+  kind: "file" | "directory" = "file",
 ): Promise<string | undefined> {
   const targets = Array.isArray(target) ? target : [target];
-  const checkedParents = new Set<string>();
+  const checked = new Set<string>();
 
-  for (const rawTarget of targets) {
-    if (typeof rawTarget !== "string" || rawTarget.length === 0) continue;
-    const resolvedPath = resolve(context.directory, rawTarget);
-    const parentDir = dirname(resolvedPath);
-    if (checkedParents.has(parentDir)) continue;
-    checkedParents.add(parentDir);
+  for (const resolvedPath of targets) {
+    if (typeof resolvedPath !== "string" || resolvedPath.length === 0) continue;
+    const key = `${kind}:${resolvedPath}`;
+    if (checked.has(key)) continue;
+    checked.add(key);
 
-    const denial = await assertExternalDirectoryPermission(context, resolvedPath);
+    const denial = await assertExternalDirectoryPermission(context, resolvedPath, { kind });
     if (denial) return denial;
   }
 

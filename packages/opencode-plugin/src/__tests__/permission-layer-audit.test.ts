@@ -1,12 +1,14 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { astTools } from "../tools/ast.js";
 import { hoistedTools } from "../tools/hoisted.js";
+import { importTools } from "../tools/imports.js";
 import {
   _permissionsInternalsForTest,
   assertExternalDirectoryPermission,
@@ -32,6 +34,7 @@ afterEach(async () => {
     await rm(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
   }
+  _resetSessionDirectoryCacheForTest();
 });
 
 function createMockClient(): any {
@@ -41,8 +44,8 @@ function createMockClient(): any {
   };
 }
 
-function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
+function createPluginContext(pool: BridgePool, client: any = createMockClient()): PluginContext {
+  return { pool, client, config: {} as any, storageDir: "/tmp/aft-test" };
 }
 
 function createHarness(
@@ -105,6 +108,65 @@ function parsePermissionDenied(raw: string): Record<string, unknown> {
 }
 
 describe("permission audit regressions", () => {
+  test("aft_import rejects empty module sentinels before bridge dispatch", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const { calls, tools } = createHarness(importTools);
+
+    await expect(
+      tools.aft_import.execute(
+        { op: "add", filePath: "src/app.ts", module: "" },
+        createSdkContext(project, recordingAsk([])),
+      ),
+    ).rejects.toThrow("'module' is required for 'add' op");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("relative import paths use the session project root for both approval and bridge dispatch", async () => {
+    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-path-parity-")));
+    const project = path.join(tmpRoot, "project");
+    const launchCwd = path.join(tmpRoot, "launch-cwd");
+    await mkdir(path.join(project, "src"), { recursive: true });
+    await mkdir(launchCwd, { recursive: true });
+
+    const askCalls: AskCall[] = [];
+    const calls: SendCall[] = [];
+    const bridgeRoots: string[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        calls.push({ command, params });
+        return { success: true };
+      },
+    };
+    const pool = {
+      getBridge: (cwd: string) => {
+        bridgeRoots.push(cwd);
+        return bridge;
+      },
+    } as unknown as BridgePool;
+    const client = {
+      ...createMockClient(),
+      session: {
+        get: async () => ({ data: { directory: project } }),
+      },
+    };
+    const sdkCtx = {
+      ...createSdkContext(launchCwd, recordingAsk(askCalls)),
+      sessionID: "resume-session-path-parity",
+      worktree: launchCwd,
+    } as ToolContext;
+    const tools = importTools(createPluginContext(pool, client));
+
+    await tools.aft_import.execute({ op: "organize", filePath: "src/app.ts" }, sdkCtx);
+
+    const expectedFile = path.join(project, "src/app.ts");
+    const editAsk = askCalls.find((call) => call.permission === "edit");
+    expect(editAsk?.metadata?.filepath).toBe(expectedFile);
+    expect(calls[0]).toMatchObject({
+      command: "organize_imports",
+      params: { file: expectedFile },
+    });
+    expect(bridgeRoots[0]).toBe(project);
+  });
   windowsTest("containsPath rejects Windows cross-drive targets as external", async () => {
     const askCalls: AskCall[] = [];
     const ctx = createSdkContext("C:\\repo", recordingAsk(askCalls));

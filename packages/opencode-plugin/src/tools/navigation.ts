@@ -1,7 +1,14 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, formatBridgeErrorMessage, optionalInt } from "./_shared.js";
+import {
+  callBridge,
+  formatBridgeErrorMessage,
+  isEmptyParam,
+  optionalInt,
+  resolvePathArg,
+} from "./_shared.js";
+import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
 
@@ -54,20 +61,40 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           ),
       },
       execute: async (args, context): Promise<string> => {
+        if (isEmptyParam(args.filePath)) {
+          throw new Error("'filePath' is required");
+        }
+        if (isEmptyParam(args.symbol)) {
+          throw new Error("'symbol' is required");
+        }
+        if (args.op === "trace_data" && isEmptyParam(args.expression)) {
+          throw new Error("'expression' is required for 'trace_data' op");
+        }
+        if (args.op === "trace_to_symbol" && isEmptyParam(args.toSymbol)) {
+          throw new Error("'toSymbol' is required for 'trace_to_symbol' op");
+        }
+
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
+        const toFile = !isEmptyParam(args.toFile)
+          ? await resolvePathArg(ctx, context, args.toFile as string)
+          : undefined;
+
+        const checked = new Set<string>();
+        for (const target of [filePath, ...(toFile !== undefined ? [toFile] : [])]) {
+          if (checked.has(target)) continue;
+          checked.add(target);
+          const denial = await assertExternalDirectoryPermission(context, target);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+
         const params: Record<string, unknown> = {
-          file: args.filePath,
+          file: filePath,
           symbol: args.symbol,
         };
         if (args.depth !== undefined) params.depth = Number(args.depth);
-        if (args.expression !== undefined) params.expression = args.expression;
-        if (args.toSymbol !== undefined) params.toSymbol = args.toSymbol;
-        if (args.toFile !== undefined) params.toFile = args.toFile;
-        if (args.op === "trace_data" && typeof args.expression !== "string") {
-          throw new Error("'expression' is required for 'trace_data' op");
-        }
-        if (args.op === "trace_to_symbol" && typeof args.toSymbol !== "string") {
-          throw new Error("'toSymbol' is required for 'trace_to_symbol' op");
-        }
+        if (!isEmptyParam(args.expression)) params.expression = args.expression;
+        if (!isEmptyParam(args.toSymbol)) params.toSymbol = args.toSymbol;
+        if (toFile !== undefined) params.toFile = toFile;
         const response = await callBridge(ctx, context, args.op as string, params);
         if (response.success === false) {
           throw new Error(formatBridgeErrorMessage(args.op as string, response, params));

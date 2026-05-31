@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { projectRootFor } from "./_shared.js";
 
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
@@ -22,11 +23,18 @@ export async function runAsk(maybe: Promise<void>): Promise<void> {
 }
 
 export function resolveAbsolutePath(context: ToolContext, target: string): string {
-  return path.isAbsolute(target) ? target : path.resolve(context.directory, target);
+  return path.isAbsolute(target) ? target : path.resolve(projectRootFor(context), target);
 }
 
 export function resolveRelativePattern(context: ToolContext, target: string): string {
-  return path.relative(context.worktree, resolveAbsolutePath(context, target)) || ".";
+  return path.relative(projectRootFor(context), resolveAbsolutePath(context, target)) || ".";
+}
+
+export function resolveRelativePatternFromAbsolute(
+  context: ToolContext,
+  absolutePath: string,
+): string {
+  return path.relative(projectRootFor(context), absolutePath) || ".";
 }
 
 export function resolveRelativePatterns(context: ToolContext, targets: string[]): string[] {
@@ -177,13 +185,14 @@ export async function assertExternalDirectoryPermission(
   if (!target) return undefined;
   if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
 
-  const resolved = path.isAbsolute(target) ? target : path.resolve(context.directory, target);
+  const resolved = resolveAbsolutePath(context, target);
   // Windows: realpath + drive-case normalize so containsPath comparisons line
   // up regardless of how the agent typed the path (`C:/...` vs `/c/...` vs
   // `/cygdrive/c/...`). No-op on macOS/Linux.
   const absoluteTarget = normalizePath(resolved);
 
-  const directory = context.directory ? normalizePath(context.directory) : context.directory;
+  const root = projectRootFor(context);
+  const directory = root ? normalizePath(root) : root;
   const rawWorktree = (context as { worktree?: string }).worktree;
   const worktree = rawWorktree && rawWorktree !== "/" ? normalizePath(rawWorktree) : rawWorktree;
 

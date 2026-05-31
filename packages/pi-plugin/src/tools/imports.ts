@@ -7,7 +7,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -162,7 +162,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       _onUpdate,
       extCtx,
     ) {
-      if ((params.op === "add" || params.op === "remove") && !params.module) {
+      if ((params.op === "add" || params.op === "remove") && isEmptyParam(params.module)) {
         throw new Error(`op='${params.op}' requires 'module'`);
       }
       const filePath = await resolvePathArg(extCtx.cwd, params.filePath);

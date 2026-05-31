@@ -74,4 +74,29 @@ describe("aft_refactor adapter", () => {
       scope: "exports",
     });
   });
+
+  test("extract and inline reject missing required numeric params before bridge dispatch", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    registerRefactorTool(api, makePluginContext(bridge));
+
+    await expect(
+      executeTool(tools.get("aft_refactor")!, {
+        op: "extract",
+        filePath: "src/app.ts",
+        name: "computeTotal",
+        endLine: 12,
+      }),
+    ).rejects.toThrow("'startLine' is required for 'extract' op");
+
+    await expect(
+      executeTool(tools.get("aft_refactor")!, {
+        op: "inline",
+        filePath: "src/app.ts",
+        symbol: "helper",
+      }),
+    ).rejects.toThrow("'callSiteLine' is required for 'inline' op");
+
+    expect(calls).toHaveLength(0);
+  });
 });

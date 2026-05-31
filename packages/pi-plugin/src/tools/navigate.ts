@@ -7,7 +7,15 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  textResult,
+} from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asBoolean,
@@ -256,23 +264,42 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
-      if (params.op === "trace_data" && !params.expression) {
+      if (isEmptyParam(params.filePath)) {
+        throw new Error(`op='${params.op}' requires a \`filePath\``);
+      }
+      if (isEmptyParam(params.symbol)) {
+        throw new Error(`op='${params.op}' requires a \`symbol\``);
+      }
+      if (params.op === "trace_data" && isEmptyParam(params.expression)) {
         throw new Error("op='trace_data' requires an `expression`");
       }
-      if (params.op === "trace_to_symbol" && !params.toSymbol) {
+      if (params.op === "trace_to_symbol" && isEmptyParam(params.toSymbol)) {
         throw new Error("op='trace_to_symbol' requires a `toSymbol`");
       }
+      const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+      const toFile = !isEmptyParam(params.toFile)
+        ? await resolvePathArg(extCtx.cwd, params.toFile as string)
+        : undefined;
+      const checked = new Set<string>();
+      for (const target of [filePath, ...(toFile !== undefined ? [toFile] : [])]) {
+        if (checked.has(target)) continue;
+        checked.add(target);
+        await assertExternalDirectoryPermission(extCtx, target, "read", {
+          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+        });
+      }
+
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = {
         op: params.op,
-        file: params.filePath,
+        file: filePath,
         symbol: params.symbol,
       };
       const depth = coerceOptionalInt(params.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
       if (depth !== undefined) req.depth = depth;
-      if (params.expression !== undefined) req.expression = params.expression;
-      if (params.toSymbol !== undefined) req.toSymbol = params.toSymbol;
-      if (params.toFile !== undefined) req.toFile = params.toFile;
+      if (!isEmptyParam(params.expression)) req.expression = params.expression;
+      if (!isEmptyParam(params.toSymbol)) req.toSymbol = params.toSymbol;
+      if (toFile !== undefined) req.toFile = toFile;
       const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

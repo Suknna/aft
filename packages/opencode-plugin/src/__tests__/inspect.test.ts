@@ -104,7 +104,7 @@ describe("aft_inspect tool", () => {
         command: "inspect",
         params: {
           sections: ["todos", "dead_code"],
-          scope: "src",
+          scope: "/repo/src",
           topK: 7,
           session_id: "inspect-session",
         },

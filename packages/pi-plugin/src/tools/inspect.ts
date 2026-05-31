@@ -11,6 +11,7 @@ import type {
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -58,6 +59,29 @@ const lastTier2TriggerAtByBridge = new WeakMap<object, Map<string, number>>();
 
 function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined {
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
+}
+
+async function resolveAndGateScope(
+  extCtx: ExtensionContext,
+  ctx: PluginContext,
+  scope: StringOrStringArray | undefined,
+): Promise<StringOrStringArray | undefined> {
+  if (scope === undefined) return undefined;
+  const values = Array.isArray(scope) ? scope : [scope];
+  const resolved = await Promise.all(
+    values
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .map((value) => resolvePathArg(extCtx.cwd, value)),
+  );
+  const checked = new Set<string>();
+  for (const target of resolved) {
+    if (checked.has(target)) continue;
+    checked.add(target);
+    await assertExternalDirectoryPermission(extCtx, target, "read", {
+      restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
+    });
+  }
+  return Array.isArray(scope) ? resolved : resolved[0];
 }
 
 function validateOptionalTopK(value: unknown): number | undefined {
@@ -317,7 +341,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const sections = normalizeStringOrArray(params.sections);
-      const scope = normalizeStringOrArray(params.scope);
+      const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
       const topK = validateOptionalTopK(params.topK);
       const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx);
       runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);

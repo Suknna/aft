@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import { z } from "zod";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, resolvePathFromProjectRoot, resolveProjectRoot } from "./_shared.js";
 import {
   askGlobPermission,
   askGrepPermission,
@@ -83,22 +83,24 @@ function normalizeGlob(pattern: string): string {
   return pattern;
 }
 
-function absoluteSearchPath(context: ToolContext, target: string): string {
-  const expanded = expandTilde(target);
-  return path.isAbsolute(expanded) ? expanded : path.resolve(context.directory, expanded);
+function absoluteSearchPath(projectRoot: string, target: string): string {
+  return resolvePathFromProjectRoot(projectRoot, expandTilde(target));
 }
 
-function searchPathExists(context: ToolContext, target: string): boolean {
-  return fs.existsSync(absoluteSearchPath(context, target));
+function searchPathExists(projectRoot: string, target: string): boolean {
+  return fs.existsSync(absoluteSearchPath(projectRoot, target));
 }
 
-function splitSearchPathArg(context: ToolContext, raw: string): string[] {
-  if (searchPathExists(context, raw) || !/\s/.test(raw)) {
+function splitSearchPathArg(projectRoot: string, raw: string): string[] {
+  if (searchPathExists(projectRoot, raw) || !/\s/.test(raw)) {
     return [raw];
   }
 
   const fragments = raw.trim().split(/\s+/).filter(Boolean);
-  if (fragments.length < 2 || !fragments.every((fragment) => searchPathExists(context, fragment))) {
+  if (
+    fragments.length < 2 ||
+    !fragments.every((fragment) => searchPathExists(projectRoot, fragment))
+  ) {
     return [raw];
   }
 
@@ -106,12 +108,12 @@ function splitSearchPathArg(context: ToolContext, raw: string): string[] {
 }
 
 function searchPathKind(
-  context: ToolContext,
+  projectRoot: string,
   target: string,
   defaultKind: SearchPathKind,
 ): SearchPathKind {
   try {
-    const stat = fs.lstatSync(absoluteSearchPath(context, target));
+    const stat = fs.lstatSync(absoluteSearchPath(projectRoot, target));
     if (defaultKind === "file") {
       return stat.isDirectory() ? "directory" : "file";
     }
@@ -122,14 +124,17 @@ function searchPathKind(
 }
 
 function searchPathTargets(
-  context: ToolContext,
+  projectRoot: string,
   raw: string,
   defaultKind: SearchPathKind,
 ): SearchPathTarget[] {
-  return splitSearchPathArg(context, raw).map((target) => ({
-    target,
-    kind: searchPathKind(context, target, defaultKind),
-  }));
+  return splitSearchPathArg(projectRoot, raw).map((target) => {
+    const absoluteTarget = absoluteSearchPath(projectRoot, target);
+    return {
+      target: absoluteTarget,
+      kind: searchPathKind(projectRoot, target, defaultKind),
+    };
+  });
 }
 
 /**
@@ -191,21 +196,23 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       ),
     },
     execute: async (args, context): Promise<string> => {
+      const projectRoot = await resolveProjectRoot(ctx, context);
       const pattern = String(args.pattern);
       const includeArg = args.include ? String(args.include) : undefined;
       const pathArg = args.path ? expandTilde(String(args.path)) : undefined;
+      const bridgePath = pathArg ? absoluteSearchPath(projectRoot, pathArg) : undefined;
 
       // Match OpenCode native ordering: grep permission first (on the raw
       // pattern + path the agent typed), then external_directory check on
       // the resolved search target if it points outside the project.
       const grepDenied = await askGrepPermission(context, pattern, {
-        path: pathArg,
+        path: bridgePath,
         include: includeArg,
       });
       if (grepDenied) return permissionDeniedResponse(grepDenied);
 
       if (pathArg) {
-        for (const target of searchPathTargets(context, pathArg, "file")) {
+        for (const target of searchPathTargets(projectRoot, pathArg, "file")) {
           const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
             kind: target.kind,
           });
@@ -219,7 +226,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         include: includeArg
           ? splitIncludeArg(includeArg).map(normalizeGlob).filter(Boolean)
           : undefined,
-        path: pathArg,
+        path: bridgePath,
         max_results: 100,
       });
 
@@ -246,6 +253,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       ),
     },
     execute: async (args, context): Promise<string> => {
+      const projectRoot = await resolveProjectRoot(ctx, context);
       // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")
       // Split into path (directory prefix) and pattern (glob suffix)
       let globPattern = expandTilde(String(args.pattern));
@@ -274,8 +282,10 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       const globDenied = await askGlobPermission(context, globPattern, { path: globPath });
       if (globDenied) return permissionDeniedResponse(globDenied);
 
+      const bridgePath = globPath ? absoluteSearchPath(projectRoot, globPath) : undefined;
+
       if (globPath) {
-        for (const target of searchPathTargets(context, globPath, "directory")) {
+        for (const target of searchPathTargets(projectRoot, globPath, "directory")) {
           const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
             kind: target.kind,
           });
@@ -285,7 +295,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
       const response = await callBridge(ctx, context, "glob", {
         pattern: globPattern,
-        path: globPath,
+        path: bridgePath,
       });
 
       if (response.success === false) {

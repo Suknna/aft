@@ -1,7 +1,8 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam } from "./_shared.js";
+import { callBridge, isEmptyParam, resolvePathArg } from "./_shared.js";
+import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
 
@@ -124,6 +125,28 @@ function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
 }
 
+async function resolveAndGateScope(
+  ctx: PluginContext,
+  context: Parameters<ToolDefinition["execute"]>[1],
+  scope: StringOrStringArray | undefined,
+): Promise<{ scope: StringOrStringArray | undefined; denial?: string }> {
+  if (scope === undefined) return { scope: undefined };
+  const values = Array.isArray(scope) ? scope : [scope];
+  const resolved = await Promise.all(
+    values
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .map((value) => resolvePathArg(ctx, context, value)),
+  );
+  const checked = new Set<string>();
+  for (const target of resolved) {
+    if (checked.has(target)) continue;
+    checked.add(target);
+    const denial = await assertExternalDirectoryPermission(context, target);
+    if (denial) return { scope: undefined, denial };
+  }
+  return { scope: Array.isArray(scope) ? resolved : resolved[0] };
+}
+
 export interface InspectToolConfig {
   tool_surface?: "minimal" | "recommended" | "all";
   disabled_tools?: string[];
@@ -228,7 +251,9 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
     execute: async (args, context): Promise<string> => {
       const sections = normalizeStringOrArray(args.sections);
-      const scope = normalizeStringOrArray(args.scope);
+      const scoped = await resolveAndGateScope(ctx, context, normalizeStringOrArray(args.scope));
+      if (scoped.denial) return permissionDeniedResponse(scoped.denial);
+      const scope = scoped.scope;
       const topK = args.topK === undefined || args.topK === null ? undefined : args.topK;
 
       const response = await callBridge(ctx, context, "inspect", { sections, scope, topK });

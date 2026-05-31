@@ -145,6 +145,26 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (params.op === "extract" && isEmptyParam(params.name)) {
         throw new Error("'name' is required for 'extract' op");
       }
+      const startLine = coerceOptionalInt(
+        params.startLine,
+        "startLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      const endLine = coerceOptionalInt(params.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+      const callSiteLine = coerceOptionalInt(
+        params.callSiteLine,
+        "callSiteLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (params.op === "extract") {
+        if (startLine === undefined) throw new Error("'startLine' is required for 'extract' op");
+        if (endLine === undefined) throw new Error("'endLine' is required for 'extract' op");
+      }
+      if (params.op === "inline" && callSiteLine === undefined) {
+        throw new Error("'callSiteLine' is required for 'inline' op");
+      }
 
       const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
       const destination = !isEmptyParam(params.destination)
@@ -169,19 +189,6 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (destination !== undefined) req.destination = destination;
       if (!isEmptyParam(params.scope)) req.scope = params.scope;
       if (!isEmptyParam(params.name)) req.name = params.name;
-      const startLine = coerceOptionalInt(
-        params.startLine,
-        "startLine",
-        1,
-        Number.MAX_SAFE_INTEGER,
-      );
-      const endLine = coerceOptionalInt(params.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
-      const callSiteLine = coerceOptionalInt(
-        params.callSiteLine,
-        "callSiteLine",
-        1,
-        Number.MAX_SAFE_INTEGER,
-      );
       if (startLine !== undefined) req.start_line = startLine;
       // Agent uses inclusive end_line; Rust extract_function expects exclusive.
       if (endLine !== undefined) {

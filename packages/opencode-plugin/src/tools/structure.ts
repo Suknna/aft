@@ -1,12 +1,11 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePattern,
 } from "./permissions.js";
 
@@ -90,10 +89,9 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         const op = args.op as string;
 
         if (op === "add_member") {
-          if (typeof args.container !== "string")
+          if (isEmptyParam(args.container))
             throw new Error("'container' is required for 'add_member' op");
-          if (typeof args.code !== "string")
-            throw new Error("'code' is required for 'add_member' op");
+          if (isEmptyParam(args.code)) throw new Error("'code' is required for 'add_member' op");
         }
         if (
           op === "add_derive" ||
@@ -101,25 +99,23 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           op === "add_decorator" ||
           op === "add_struct_tags"
         ) {
-          if (typeof args.target !== "string")
-            throw new Error(`'target' is required for '${op}' op`);
+          if (isEmptyParam(args.target)) throw new Error(`'target' is required for '${op}' op`);
         }
-        if (op === "add_derive" && !Array.isArray(args.derives)) {
+        if (op === "add_derive" && isEmptyParam(args.derives)) {
           throw new Error("'derives' array is required for 'add_derive' op");
         }
-        if (op === "add_decorator" && typeof args.decorator !== "string") {
+        if (op === "add_decorator" && isEmptyParam(args.decorator)) {
           throw new Error("'decorator' is required for 'add_decorator' op");
         }
         if (op === "add_struct_tags") {
-          if (typeof args.field !== "string")
+          if (isEmptyParam(args.field))
             throw new Error("'field' is required for 'add_struct_tags' op");
-          if (typeof args.tag !== "string")
-            throw new Error("'tag' is required for 'add_struct_tags' op");
-          if (typeof args.value !== "string")
+          if (isEmptyParam(args.tag)) throw new Error("'tag' is required for 'add_struct_tags' op");
+          if (isEmptyParam(args.value))
             throw new Error("'value' is required for 'add_struct_tags' op");
         }
 
-        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
@@ -129,12 +125,12 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
 
         const permissionError = await askEditPermission(
           context,
-          [resolveRelativePattern(context, args.filePath as string)],
+          [resolveRelativePattern(context, filePath)],
           { filepath: filePath },
         );
         if (permissionError) return permissionDeniedResponse(permissionError);
 
-        const params: Record<string, unknown> = { file: args.filePath };
+        const params: Record<string, unknown> = { file: filePath };
         if (args.validate !== undefined) params.validate = args.validate;
 
         switch (op) {

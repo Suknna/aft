@@ -10,12 +10,11 @@ const z = tool.schema;
 
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePatterns,
   workspacePattern,
 } from "./permissions.js";
@@ -42,14 +41,26 @@ function extractHint(response: Record<string, unknown>): string | null {
   return typeof hint === "string" && hint.length > 0 ? hint : null;
 }
 
-async function checkAstPathsPermission(
+async function resolveAstPaths(
+  ctx: PluginContext,
   context: Parameters<ToolDefinition["execute"]>[1],
   paths: unknown,
-): Promise<string | undefined> {
-  if (!Array.isArray(paths)) return undefined;
-  const uniquePaths = Array.from(
-    new Set(paths.filter((p): p is string => typeof p === "string" && p.length > 0)),
+): Promise<string[] | undefined> {
+  if (isEmptyParam(paths) || !Array.isArray(paths)) return undefined;
+  const resolved = await Promise.all(
+    paths
+      .filter((p): p is string => typeof p === "string" && p.length > 0)
+      .map((p) => resolvePathArg(ctx, context, p)),
   );
+  return resolved.length > 0 ? resolved : undefined;
+}
+
+async function checkAstPathsPermission(
+  context: Parameters<ToolDefinition["execute"]>[1],
+  paths: string[] | undefined,
+): Promise<string | undefined> {
+  if (paths === undefined) return undefined;
+  const uniquePaths = Array.from(new Set(paths));
   for (const p of uniquePaths) {
     const denial = await assertExternalDirectoryPermission(context, p, { kind: "directory" });
     if (denial) return denial;
@@ -79,7 +90,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       ),
     },
     execute: async (args, context): Promise<string> => {
-      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      const paths = await resolveAstPaths(ctx, context, args.paths);
+      const externalDenied = await checkAstPathsPermission(context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       const params: Record<string, unknown> = {
@@ -89,7 +101,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       // Use isEmptyParam so empty arrays ([]) sent by GPT-family models don't
       // get forwarded to Rust as "scope present" — let Rust default to whole
       // project_root instead of round-tripping a useless empty scope.
-      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(paths)) params.paths = paths;
       if (!isEmptyParam(args.globs)) params.globs = args.globs;
       if (args.contextLines !== undefined) params.context = Number(args.contextLines);
       const response = await callBridge(ctx, context, "ast_search", params);
@@ -186,36 +198,29 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
     execute: async (args, context): Promise<string> => {
       const isDryRun = args.dryRun === true;
+      const paths = await resolveAstPaths(ctx, context, args.paths);
 
-      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      const externalDenied = await checkAstPathsPermission(context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       if (!isDryRun) {
-        const paths = Array.isArray(args.paths) ? (args.paths as string[]) : ["."];
         // External-directory check first (mirrors opencode-native grep/glob directory checks).
         if (!Array.isArray(args.paths)) {
-          const asked = new Set<string>();
-          for (const targetPath of paths) {
-            const absPath = resolveAbsolutePath(context, targetPath);
-            if (asked.has(absPath)) continue;
-            asked.add(absPath);
-            const denial = await assertExternalDirectoryPermission(context, absPath, {
-              kind: "directory",
-            });
-            if (denial) return permissionDeniedResponse(denial);
-          }
+          const targetPath = await resolvePathArg(ctx, context, ".");
+          const denial = await assertExternalDirectoryPermission(context, targetPath, {
+            kind: "directory",
+          });
+          if (denial) return permissionDeniedResponse(denial);
         }
 
-        const explicitPaths = Array.isArray(args.paths)
-          ? resolveRelativePatterns(context, args.paths as string[])
-          : [];
+        const explicitPaths = paths !== undefined ? resolveRelativePatterns(context, paths) : [];
         const positiveGlobs = Array.isArray(args.globs)
           ? (args.globs as string[]).filter((glob) => !glob.startsWith("!"))
           : [];
         const patterns = [...explicitPaths, ...positiveGlobs];
         const metadata =
-          explicitPaths.length === 1 && positiveGlobs.length === 0 && Array.isArray(args.paths)
-            ? { filepath: resolveAbsolutePath(context, (args.paths as string[])[0] as string) }
+          explicitPaths.length === 1 && positiveGlobs.length === 0 && paths !== undefined
+            ? { filepath: paths[0] }
             : {};
         const permissionError = await askEditPermission(
           context,
@@ -233,7 +238,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         lang: args.lang,
       };
       // Use isEmptyParam — see ast_search above for rationale.
-      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(paths)) params.paths = paths;
       if (!isEmptyParam(args.globs)) params.globs = args.globs;
       params.dry_run = args.dryRun === true;
       const response = await callBridge(ctx, context, "ast_replace", params);

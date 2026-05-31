@@ -1,12 +1,11 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
-  resolveAbsolutePath,
   resolveRelativePattern,
 } from "./permissions.js";
 
@@ -85,11 +84,11 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
 
-        if ((op === "add" || op === "remove") && typeof args.module !== "string") {
+        if ((op === "add" || op === "remove") && isEmptyParam(args.module)) {
           throw new Error(`'module' is required for '${op}' op`);
         }
 
-        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const filePath = await resolvePathArg(ctx, context, args.filePath as string);
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
@@ -99,7 +98,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
         const permissionError = await askEditPermission(
           context,
-          [resolveRelativePattern(context, args.filePath as string)],
+          [resolveRelativePattern(context, filePath)],
           { filepath: filePath },
         );
         if (permissionError) return permissionDeniedResponse(permissionError);
@@ -109,7 +108,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
           remove: "remove_import",
           organize: "organize_imports",
         };
-        const params: Record<string, unknown> = { file: args.filePath };
+        const params: Record<string, unknown> = { file: filePath };
         if (args.module !== undefined) params.module = args.module;
         if (args.names !== undefined) params.names = args.names;
         if (args.defaultImport !== undefined) params.default_import = args.defaultImport;
