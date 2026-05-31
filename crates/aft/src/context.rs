@@ -236,8 +236,9 @@ pub enum SemanticIndexEvent {
 }
 
 #[derive(Debug, Clone)]
-pub struct SemanticRefreshRequest {
-    pub paths: Vec<PathBuf>,
+pub enum SemanticRefreshRequest {
+    Files { paths: Vec<PathBuf> },
+    Corpus { current_files: Vec<PathBuf> },
 }
 
 #[derive(Debug)]
@@ -250,8 +251,18 @@ pub enum SemanticRefreshEvent {
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: Vec<PathBuf>,
     },
+    CorpusCompleted {
+        index: SemanticIndex,
+        changed: usize,
+        added: usize,
+        deleted: usize,
+        total_processed: usize,
+    },
     Failed {
         paths: Vec<PathBuf>,
+        error: String,
+    },
+    CorpusFailed {
         error: String,
     },
 }
@@ -644,17 +655,16 @@ impl AppContext {
                 );
             }
         }
-        // Walk the project to pick up nested .gitignore files. Cap the walk
-        // at the same SOURCE_WALK_LIMIT used by other configure-time walks
-        // (currently 20000 files); gitignore lookup-cost stays bounded for
-        // huge monorepos. Skip the obvious infra dirs so we don't accidentally
-        // load a vendored repo's .gitignore that doesn't apply to ours.
+        // Walk the project to pick up nested .gitignore/.aftignore files at
+        // arbitrary depth. The main project walkers honor deeply nested ignore
+        // files, so the watcher matcher must do the same or live invalidation
+        // can disagree with startup indexing. Skip obvious infra dirs so we
+        // don't accidentally load a vendored repo's ignore file as ours.
         let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(true)
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.
             .hidden(false)
-            .max_depth(Some(8))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(

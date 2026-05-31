@@ -16,6 +16,7 @@ use super::job::{
     InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
     JobOutcome, JobScope, DISPATCHED_CALLEE_SEPARATOR,
 };
+use super::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::cache_freshness::FileFreshness;
 use crate::callgraph::{is_bare_callee, resolve_symbol_query_in_data, CallGraph, EdgeResolution};
 use crate::symbols::SymbolKind;
@@ -937,6 +938,16 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
                     .map(|metadata| symbol_kind_name(&metadata.kind))
                     .unwrap_or("unknown")
                     .to_string(),
+                line: metadata.map(|metadata| metadata.line).unwrap_or(1),
+            });
+        }
+
+        if let Some(default_symbol) = &file_data.default_export_symbol {
+            let metadata = file_data.symbol_metadata_for(default_symbol);
+            exported_symbols.push(CallgraphExport {
+                file: snapshot_file.clone(),
+                symbol: default_symbol.clone(),
+                kind: DEFAULT_EXPORT_MARKER_KIND.to_string(),
                 line: metadata.map(|metadata| metadata.line).unwrap_or(1),
             });
         }

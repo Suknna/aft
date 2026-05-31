@@ -1163,6 +1163,11 @@ impl SemanticIndex {
         self.entries.len()
     }
 
+    /// Number of files currently tracked by the semantic index.
+    pub fn indexed_file_count(&self) -> usize {
+        self.file_mtimes.len()
+    }
+
     /// Human-readable status label for the index.
     pub fn status_label(&self) -> &'static str {
         if self.entries.is_empty() {
@@ -1614,6 +1619,7 @@ impl SemanticIndex {
         paths: &[PathBuf],
         embed_fn: &mut F,
         max_batch_size: usize,
+        max_files: usize,
         progress: &mut P,
     ) -> Result<InvalidatedFilesRefresh, String>
     where
@@ -1672,7 +1678,49 @@ impl SemanticIndex {
             });
         }
 
-        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+        let (mut chunks, mut fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+
+        let retained_file_count = self.file_mtimes.len();
+        let changed_successful_count = existing_paths
+            .iter()
+            .filter(|path| {
+                previously_indexed.contains(path.as_path()) && fresh_metadata.contains_key(*path)
+            })
+            .count();
+        let available_new_files =
+            max_files.saturating_sub(retained_file_count.saturating_add(changed_successful_count));
+        let new_successful_files = existing_paths
+            .iter()
+            .filter(|path| {
+                !previously_indexed.contains(path.as_path()) && fresh_metadata.contains_key(*path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if new_successful_files.len() > available_new_files {
+            let allowed_new_files = new_successful_files
+                .iter()
+                .take(available_new_files)
+                .cloned()
+                .collect::<HashSet<_>>();
+            let deferred_new_files = new_successful_files
+                .into_iter()
+                .filter(|path| !allowed_new_files.contains(path))
+                .collect::<HashSet<_>>();
+
+            fresh_metadata.retain(|file, _| {
+                previously_indexed.contains(file.as_path()) || allowed_new_files.contains(file)
+            });
+            chunks.retain(|chunk| !deferred_new_files.contains(&chunk.file));
+
+            if !deferred_new_files.is_empty() {
+                slog_warn!(
+                    "semantic refresh deferred {} new file(s): indexed-file cap {} is reached",
+                    deferred_new_files.len(),
+                    max_files
+                );
+            }
+        }
+
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         let changed = successful_files
             .iter()

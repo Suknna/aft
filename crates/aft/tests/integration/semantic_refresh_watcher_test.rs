@@ -446,6 +446,55 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
 }
 
 #[test]
+fn semantic_refresh_defers_new_files_when_max_files_cap_is_reached() {
+    let project = setup_project(&[
+        (
+            "src/a.rs",
+            "pub fn alpha_anchor() -> &'static str {\n    \"alpha anchor\"\n}\n",
+        ),
+        (
+            "src/b.rs",
+            "pub fn edited_refresh_marker() -> &'static str {\n    \"edited refresh marker\"\n}\n",
+        ),
+    ]);
+    let a = fs::canonicalize(project.path().join("src/a.rs")).expect("canonicalize a");
+    let b = fs::canonicalize(project.path().join("src/b.rs")).expect("canonicalize b");
+    let root = fs::canonicalize(project.path()).expect("canonicalize project");
+
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(texts.into_iter().map(|text| embedding_for(&text)).collect())
+    };
+    let mut index = SemanticIndex::build(&root, std::slice::from_ref(&a), &mut embed, 64)
+        .expect("build initial semantic index");
+    assert_eq!(index.indexed_file_count(), 1);
+
+    let mut embed_refresh = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(texts.into_iter().map(|text| embedding_for(&text)).collect())
+    };
+    let mut progress = |_done: usize, _total: usize| {};
+    let update = index
+        .refresh_invalidated_files(
+            &root,
+            std::slice::from_ref(&b),
+            &mut embed_refresh,
+            64,
+            1,
+            &mut progress,
+        )
+        .expect("refresh should succeed while deferring the new file");
+
+    assert_eq!(update.summary.added, 0);
+    assert_eq!(index.indexed_file_count(), 1);
+    assert!(
+        index
+            .search(&[0.0, 1.0, 0.0], 10)
+            .iter()
+            .all(|result| result.file != b),
+        "deferred file should not be searchable"
+    );
+}
+
+#[test]
 fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let real_root = temp_dir.path().join("real-project");

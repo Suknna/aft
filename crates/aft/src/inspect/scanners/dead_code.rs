@@ -18,6 +18,8 @@ use crate::inspect::{
 };
 use crate::parser::{detect_language, grammar_for, LangId};
 
+use super::DEFAULT_EXPORT_MARKER_KIND;
+
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
 type ExportNode = (String, String);
@@ -40,7 +42,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
         .map(|file| relative_path(&job.project_root, file))
         .collect::<BTreeSet<_>>();
     let public_api_files = collect_public_api_files(&job.project_root);
-    let (exported_symbols_by_file, files_by_exported_symbol) =
+    let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes(job, snapshot);
 
     let contributions = job
@@ -53,6 +55,7 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
                 file,
                 &exported_symbols_by_file,
                 &files_by_exported_symbol,
+                &default_export_symbols_by_file,
                 &liveness_root_files,
                 &public_api_files,
             )
@@ -75,12 +78,19 @@ fn exported_symbol_indexes(
 ) -> (
     BTreeMap<String, BTreeSet<String>>,
     BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, String>,
 ) {
     let mut exported_symbols_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut files_by_exported_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut default_export_symbols_by_file: BTreeMap<String, String> = BTreeMap::new();
 
     for export in &snapshot.exported_symbols {
         let file = relative_path(&job.project_root, &export.file);
+        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
+            default_export_symbols_by_file.insert(file, export.symbol.clone());
+            continue;
+        }
+
         exported_symbols_by_file
             .entry(file.clone())
             .or_default()
@@ -91,7 +101,11 @@ fn exported_symbol_indexes(
             .insert(file);
     }
 
-    (exported_symbols_by_file, files_by_exported_symbol)
+    (
+        exported_symbols_by_file,
+        files_by_exported_symbol,
+        default_export_symbols_by_file,
+    )
 }
 
 fn gather_file_contribution(
@@ -100,6 +114,7 @@ fn gather_file_contribution(
     file: &Path,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
     liveness_root_files: &BTreeSet<String>,
     public_api_files: &BTreeSet<String>,
 ) -> FileContribution {
@@ -110,6 +125,7 @@ fn gather_file_contribution(
         .exported_symbols
         .iter()
         .filter(|export| same_file(&job.project_root, &export.file, file))
+        .filter(|export| export.kind != DEFAULT_EXPORT_MARKER_KIND)
         .map(|export| ExportContribution {
             symbol: export.symbol.clone(),
             kind: export.kind.clone(),
@@ -155,8 +171,12 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let imported_exports =
-        imported_export_liveness_roots(&job.project_root, file, exported_symbols_by_file);
+    let imported_exports = imported_export_liveness_roots(
+        &job.project_root,
+        file,
+        exported_symbols_by_file,
+        default_export_symbols_by_file,
+    );
     let type_ref_names = collect_type_ref_names(file);
 
     let liveness_roots = liveness_roots_for_file(
@@ -436,6 +456,7 @@ fn imported_export_liveness_roots(
     project_root: &Path,
     file: &Path,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
 ) -> Vec<ImportedExportContribution> {
     let Some(lang) = detect_language(file)
         .filter(|lang| matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript))
@@ -474,6 +495,7 @@ fn imported_export_liveness_roots(
                 &module_entry,
                 imported_name,
                 exported_symbols_by_file,
+                default_export_symbols_by_file,
             ) {
                 roots.insert(root);
             }
@@ -485,6 +507,7 @@ fn imported_export_liveness_roots(
                 &module_entry,
                 "default",
                 exported_symbols_by_file,
+                default_export_symbols_by_file,
             ) {
                 roots.insert(root);
             }
@@ -545,14 +568,20 @@ fn resolve_imported_export_liveness_root(
     module_entry: &Path,
     imported_symbol: &str,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
 ) -> Option<ExportNode> {
     let mut file_exports_symbol = |path: &Path, symbol_name: &str| {
         exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
             .is_some_and(|(_, symbols)| symbols.contains(symbol_name))
     };
     let mut file_default_export_symbol = |path: &Path| {
-        exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
-            .and_then(|(_, symbols)| symbols.contains("default").then(|| "default".to_string()))
+        default_export_symbol_for_resolved_file(project_root, path, default_export_symbols_by_file)
+            .or_else(|| {
+                exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
+                    .and_then(|(_, symbols)| {
+                        symbols.contains("default").then(|| "default".to_string())
+                    })
+            })
     };
 
     let (target_file, symbol) = resolve_reexported_symbol_target(
@@ -583,6 +612,22 @@ fn exported_symbols_for_resolved_file<'a>(
     exported_symbols_by_file
         .get(&relative)
         .map(|symbols| (relative, symbols))
+}
+
+fn default_export_symbol_for_resolved_file(
+    project_root: &Path,
+    file: &Path,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Option<String> {
+    let relative = relative_path(project_root, file);
+    if let Some(symbol) = default_export_symbols_by_file.get(&relative) {
+        return Some(symbol.clone());
+    }
+
+    let canonical_root = fs::canonicalize(project_root).ok()?;
+    let canonical_file = fs::canonicalize(file).ok()?;
+    let relative = relative_path(&canonical_root, &canonical_file);
+    default_export_symbols_by_file.get(&relative).cloned()
 }
 
 fn resolve_unqualified_target(

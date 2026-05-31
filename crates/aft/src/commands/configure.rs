@@ -24,8 +24,8 @@ use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
-    CacheLock, SearchIndex,
+    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir,
+    walk_project_files_bounded, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{SemanticIndex, SemanticIndexLock};
 use crate::{slog_info, slog_warn};
@@ -107,6 +107,7 @@ fn spawn_semantic_refresh_worker(
     mut index: SemanticIndex,
     mut model: crate::semantic_index::EmbeddingModel,
     max_batch_size: usize,
+    max_files: usize,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
     session_id: Option<String>,
@@ -114,22 +115,41 @@ fn spawn_semantic_refresh_worker(
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             while let Ok(first_request) = request_rx.recv() {
-                let mut paths = first_request.paths;
+                let mut paths = Vec::new();
+                let mut corpus_files = None;
+                match first_request {
+                    SemanticRefreshRequest::Files {
+                        paths: request_paths,
+                    } => {
+                        paths.extend(request_paths);
+                    }
+                    SemanticRefreshRequest::Corpus { current_files } => {
+                        corpus_files = Some(current_files);
+                    }
+                }
+
                 let mut disconnected = false;
                 let quiet_window = Duration::from_millis(SEMANTIC_REFRESH_QUIET_WINDOW_MS);
                 let mut deadline = Instant::now() + quiet_window;
 
-                while paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                while corpus_files.is_none() && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         break;
                     };
                     match request_rx.recv_timeout(remaining) {
-                        Ok(request) => {
-                            paths.extend(request.paths);
+                        Ok(SemanticRefreshRequest::Files {
+                            paths: request_paths,
+                        }) => {
+                            paths.extend(request_paths);
                             if paths.len() >= SEMANTIC_REFRESH_MAX_BATCH_PATHS {
                                 break;
                             }
                             deadline = Instant::now() + quiet_window;
+                        }
+                        Ok(SemanticRefreshRequest::Corpus { current_files }) => {
+                            paths.clear();
+                            corpus_files = Some(current_files);
+                            break;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -141,6 +161,63 @@ fn spawn_semantic_refresh_worker(
 
                 if disconnected {
                     break;
+                }
+
+                if let Some(mut current_files) = corpus_files {
+                    current_files.sort();
+                    current_files.dedup();
+                    if current_files.len() > max_files {
+                        let error = format!(
+                            "too many files (>{}) for semantic indexing (max {})",
+                            max_files, max_files
+                        );
+                        let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed { error });
+                        continue;
+                    }
+
+                    let mut embed = |texts: Vec<String>| model.embed(texts);
+                    let mut progress = |_done: usize, _total: usize| {};
+                    match index.refresh_stale_files(
+                        &project_root,
+                        &current_files,
+                        &mut embed,
+                        max_batch_size,
+                        &mut progress,
+                    ) {
+                        Ok(summary) => {
+                            if !summary.is_noop() {
+                                slog_info!(
+                                    "semantic corpus refresh: {} changed, {} new, {} deleted, {} total processed",
+                                    summary.changed,
+                                    summary.added,
+                                    summary.deleted,
+                                    summary.total_processed,
+                                );
+                            }
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusCompleted {
+                                    index: index.clone(),
+                                    changed: summary.changed,
+                                    added: summary.added,
+                                    deleted: summary.deleted,
+                                    total_processed: summary.total_processed,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            slog_warn!("semantic corpus refresh failed: {}", error);
+                            if event_tx
+                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
                 }
 
                 paths.sort();
@@ -165,6 +242,7 @@ fn spawn_semantic_refresh_worker(
                     &paths,
                     &mut embed,
                     max_batch_size,
+                    max_files,
                     &mut progress,
                 ) {
                     Ok(update) => {
@@ -351,8 +429,11 @@ fn parse_semantic_config(
             .map_err(|_| "configure: semantic.max_batch_size is too large".to_string())?;
     }
     if let Some(raw) = obj.get("max_files") {
-        let max_files = raw.as_u64().ok_or_else(|| {
-            "configure: semantic.max_files must be an unsigned integer".to_string()
+        let max_files = raw.as_u64().filter(|value| *value >= 1).ok_or_else(|| {
+            format!(
+                "configure: semantic.max_files must be a positive integer (>= 1); got {}",
+                raw
+            )
         })?;
         semantic.max_files = usize::try_from(max_files)
             .map_err(|_| "configure: semantic.max_files is too large".to_string())?;
@@ -1888,22 +1969,25 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 // handful of edits — avoids re-embedding 4000+ unchanged
                                 // files just to pick up 10 changes.
                                 let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                                let current_files = walk_project_files(&root_clone, &filters);
-
-                                // Cap before incremental too — same reason as full rebuild.
-                                if current_files.len() > max_semantic_files {
-                                    slog_warn!(
-                                        "skipping semantic index: {} files exceeds limit of {}. \
-                                         Raise semantic.max_files or open a specific project directory.",
-                                        current_files.len(),
-                                        max_semantic_files
-                                    );
-                                    return Err(format!(
-                                        "too many files ({}) for semantic indexing (max {})",
-                                        current_files.len(),
-                                        max_semantic_files
-                                    ));
-                                }
+                                let current_files = match walk_project_files_bounded(
+                                    &root_clone,
+                                    &filters,
+                                    max_semantic_files,
+                                ) {
+                                    Ok(files) => files,
+                                    Err(observed) => {
+                                        slog_warn!(
+                                            "skipping semantic index: more than {} files exceeds limit of {}. \
+                                             Raise semantic.max_files or open a specific project directory.",
+                                            observed.saturating_sub(1),
+                                            max_semantic_files
+                                        );
+                                        return Err(format!(
+                                            "too many files (>{}) for semantic indexing (max {})",
+                                            max_semantic_files, max_semantic_files
+                                        ));
+                                    }
+                                };
 
                                 let mut cached = cached;
                                 let mut embed = |texts: Vec<String>| model.embed(texts);
@@ -1973,27 +2057,39 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         }
 
                         let filters = build_path_filters(&[], &[]).unwrap_or_default();
-                        let files = walk_project_files(&root_clone, &filters);
-                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
-                            stage: "scanned_project_files".to_string(),
-                            files: Some(files.len()),
-                            entries_done: None,
-                            entries_total: None,
-                        });
-
-                        if files.len() > max_semantic_files {
-                            slog_warn!(
-                                "skipping semantic index: {} files exceeds limit of {}. \
-                             Raise semantic.max_files or open a specific project directory.",
-                                files.len(),
-                                max_semantic_files
-                            );
-                            return Err(format!(
-                                "too many files ({}) for semantic indexing (max {})",
-                                files.len(),
-                                max_semantic_files
-                            ));
-                        }
+                        let files = match walk_project_files_bounded(
+                            &root_clone,
+                            &filters,
+                            max_semantic_files,
+                        ) {
+                            Ok(files) => {
+                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                    stage: "scanned_project_files".to_string(),
+                                    files: Some(files.len()),
+                                    entries_done: None,
+                                    entries_total: None,
+                                });
+                                files
+                            }
+                            Err(observed) => {
+                                let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                    stage: "scanned_project_files".to_string(),
+                                    files: Some(observed),
+                                    entries_done: None,
+                                    entries_total: None,
+                                });
+                                slog_warn!(
+                                    "skipping semantic index: more than {} files exceeds limit of {}. \
+                                     Raise semantic.max_files or open a specific project directory.",
+                                    observed.saturating_sub(1),
+                                    max_semantic_files
+                                );
+                                return Err(format!(
+                                    "too many files (>{}) for semantic indexing (max {})",
+                                    max_semantic_files, max_semantic_files
+                                ));
+                            }
+                        };
 
                         let mut embed = |texts: Vec<String>| model.embed(texts);
 
@@ -2050,6 +2146,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             worker_index,
                             model,
                             semantic_config.max_batch_size.max(1),
+                            semantic_config.max_files,
                             refresh_rx,
                             refresh_event_tx,
                             log_ctx::current_session(),
