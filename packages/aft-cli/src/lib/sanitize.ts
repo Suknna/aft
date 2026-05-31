@@ -15,26 +15,63 @@ function safeRealpath(p: string): string | null {
 
 const SECRET_PLACEHOLDER = "<REDACTED_SECRET>";
 const URL_CREDENTIAL_PLACEHOLDER = "***";
+const KEY_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
+const SENSITIVE_KEY_WORD = /(?:token|password|secret|api[_-]?key|passwd|pwd|credential)/i;
+const SEGMENTED_KEY_WORD = /(?:^|[_.-])key(?:$|[_.-])/i;
+const CAMEL_CASE_KEY_WORD = /[a-z0-9]Key(?:$|[A-Z_.-])/;
+
+const quotedSensitiveKeyValuePattern = new RegExp(
+  String.raw`((['"])(${KEY_NAME})\2[^\S\r\n]*:[^\S\r\n]*)(['"])([^'"\r\n]+)\4`,
+  "gi",
+);
+const unquotedSensitiveKeyValuePattern = new RegExp(
+  String.raw`\b((${KEY_NAME})[^\S\r\n]*[=:][^\S\r\n]*)(['"])([^'"\r\n]+)\3`,
+  "gi",
+);
+const bareSensitiveKeyValuePattern = new RegExp(
+  String.raw`\b((${KEY_NAME})[^\S\r\n]*[=:][^\S\r\n]*)([^\s,;&'"]+)`,
+  "gi",
+);
+
+function isSensitiveKeyName(keyName: string): boolean {
+  return (
+    SENSITIVE_KEY_WORD.test(keyName) ||
+    SEGMENTED_KEY_WORD.test(keyName) ||
+    CAMEL_CASE_KEY_WORD.test(keyName)
+  );
+}
 
 function redactSecrets(content: string): string {
   let sanitized = content;
 
   sanitized = sanitized.replace(
-    /\b(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi,
+    /\b((?:Proxy-)?Authorization[^\S\r\n]*:[^\S\r\n]*(?:Bearer|Basic)[^\S\r\n]+)[A-Za-z0-9._~+/-]+=*/gi,
     `$1${SECRET_PLACEHOLDER}`,
   );
+  sanitized = sanitized.replace(/\bgithub_pat_[A-Za-z0-9_]+\b/g, SECRET_PLACEHOLDER);
   sanitized = sanitized.replace(/\bgh(?:p|o|s)_[A-Za-z0-9_]{16,}\b/g, SECRET_PLACEHOLDER);
   sanitized = sanitized.replace(
     /\bsk-(?:live-)?[A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g,
     SECRET_PLACEHOLDER,
   );
   sanitized = sanitized.replace(
-    /\b((?:api[_-]?key|token|secret|password)\s*[=:]\s*)(["'])([^"'\r\n]+)\2/gi,
-    `$1$2${SECRET_PLACEHOLDER}$2`,
+    quotedSensitiveKeyValuePattern,
+    (match: string, prefix: string, _keyQuote: string, keyName: string, valueQuote: string) =>
+      isSensitiveKeyName(keyName)
+        ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
+        : match,
   );
   sanitized = sanitized.replace(
-    /\b((?:api[_-]?key|token|secret|password)\s*[=:]\s*)([^\s,;&"']+)/gi,
-    `$1${SECRET_PLACEHOLDER}`,
+    unquotedSensitiveKeyValuePattern,
+    (match: string, prefix: string, keyName: string, valueQuote: string) =>
+      isSensitiveKeyName(keyName)
+        ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
+        : match,
+  );
+  sanitized = sanitized.replace(
+    bareSensitiveKeyValuePattern,
+    (match: string, prefix: string, keyName: string) =>
+      isSensitiveKeyName(keyName) ? `${prefix}${SECRET_PLACEHOLDER}` : match,
   );
   sanitized = sanitized.replace(
     /\b([a-z][a-z0-9+.-]*:\/\/)[^@\s/?#]+@/gi,

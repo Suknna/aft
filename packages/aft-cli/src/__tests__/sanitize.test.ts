@@ -57,15 +57,114 @@ describe("sanitizeContent", () => {
     expect(out).toContain("~/secret-project");
   });
 
-  test("redacts bearer and GitHub tokens", () => {
+  test("redacts bearer, basic auth, and GitHub tokens", () => {
     const bearer = "Authorization: Bearer abc.def_1234567890-secret";
+    const basic = "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==";
+    const proxyBasic = "Proxy-Authorization: Basic cHJveHk6c2VjcmV0";
     const github = "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const githubFineGrained = "github_pat_11AA22BB33CC_44dd55ee66";
 
-    const out = sanitizeContent([bearer, github].join("\n"));
+    const out = sanitizeContent([bearer, basic, proxyBasic, github, githubFineGrained].join("\n"));
 
     expect(out).toContain("Authorization: Bearer <REDACTED_SECRET>");
+    expect(out).toContain("Authorization: Basic <REDACTED_SECRET>");
+    expect(out).toContain("Proxy-Authorization: Basic <REDACTED_SECRET>");
     expect(out).not.toContain("abc.def_1234567890-secret");
+    expect(out).not.toContain("QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    expect(out).not.toContain("cHJveHk6c2VjcmV0");
     expect(out).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+    expect(out).not.toContain("github_pat_11AA22BB33CC_44dd55ee66");
+  });
+
+  test("redacts env-style sensitive keys", () => {
+    const input = [
+      "OPENCODE_SERVER_PASSWORD=swordfish",
+      "GITHUB_TOKEN: ghx_secret_value",
+      "OPENAI_API_KEY='sk-test-secret'",
+      'AFT_KEY="key-secret"',
+      "LEGACY_PASSWD=legacy-secret",
+      "SHORT_PWD=pwd-secret",
+      "DB_CREDENTIAL=credential-secret",
+    ].join("\n");
+
+    const out = sanitizeContent(input);
+
+    expect(out).toContain("OPENCODE_SERVER_PASSWORD=<REDACTED_SECRET>");
+    expect(out).toContain("GITHUB_TOKEN: <REDACTED_SECRET>");
+    expect(out).toContain("OPENAI_API_KEY='<REDACTED_SECRET>'");
+    expect(out).toContain('AFT_KEY="<REDACTED_SECRET>"');
+    expect(out).toContain("LEGACY_PASSWD=<REDACTED_SECRET>");
+    expect(out).toContain("SHORT_PWD=<REDACTED_SECRET>");
+    expect(out).toContain("DB_CREDENTIAL=<REDACTED_SECRET>");
+    expect(out).not.toContain("swordfish");
+    expect(out).not.toContain("ghx_secret_value");
+    expect(out).not.toContain("sk-test-secret");
+    expect(out).not.toContain("key-secret");
+    expect(out).not.toContain("legacy-secret");
+    expect(out).not.toContain("pwd-secret");
+    expect(out).not.toContain("credential-secret");
+  });
+
+  test("redacts quoted sensitive object keys", () => {
+    const input = [
+      '{"password":"hunter2"}',
+      '{"api_key": "json-secret"}',
+      '{"serviceToken":"token-secret"}',
+      "{'api-key': 'dash-secret'}",
+    ].join("\n");
+
+    const out = sanitizeContent(input);
+
+    expect(out).toContain('{"password":"<REDACTED_SECRET>"}');
+    expect(out).toContain('{"api_key": "<REDACTED_SECRET>"}');
+    expect(out).toContain('{"serviceToken":"<REDACTED_SECRET>"}');
+    expect(out).toContain("{'api-key': '<REDACTED_SECRET>'}");
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("json-secret");
+    expect(out).not.toContain("token-secret");
+    expect(out).not.toContain("dash-secret");
+  });
+
+  test("leaves normal prose and incomplete credential labels unchanged", () => {
+    const input = [
+      "Please enter your password before retrying.",
+      "The api_key setting name is documented here.",
+      "monkey=banana",
+      "keyboard_layout=us",
+      "Authorization: Bearer",
+      "Proxy-Authorization: Basic",
+      "github_pat_ appears only as a prefix in this help text.",
+    ].join("\n");
+
+    expect(sanitizeContent(input)).toBe(input);
+  });
+
+  test("redacts large log tails without pathological backtracking", () => {
+    const logTail = Array.from(
+      { length: 50 },
+      (_, index) =>
+        `INFO ${index} password mentioned without a value and token label only ${"x".repeat(1000)}`,
+    ).join("\n");
+    const input = [
+      logTail,
+      "OPENCODE_SERVER_PASSWORD=swordfish",
+      '{"password":"hunter2"}',
+      "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+      "Proxy-Authorization: Basic cHJveHk6c2VjcmV0",
+      "github_pat_11AA22BB33CC_44dd55ee66",
+      logTail,
+    ].join("\n");
+
+    const startedAt = Date.now();
+    const out = sanitizeContent(input);
+
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+    expect(input.length).toBeGreaterThan(50_000);
+    expect(out).not.toContain("swordfish");
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    expect(out).not.toContain("cHJveHk6c2VjcmV0");
+    expect(out).not.toContain("github_pat_11AA22BB33CC_44dd55ee66");
   });
 
   test("redacts common credentials, URL userinfo, and emails", () => {

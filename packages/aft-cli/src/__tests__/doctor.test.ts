@@ -331,6 +331,44 @@ describe("doctor --issue safety", () => {
     expect(title).not.toContain("sk-live-");
   });
 
+  test("redacts secrets from descriptions before deriving issue titles", () => {
+    const cases = [
+      {
+        line: "OPENCODE_SERVER_PASSWORD=swordfish",
+        redacted: "OPENCODE_SERVER_PASSWORD=<REDACTED_SECRET>",
+        secret: "swordfish",
+      },
+      {
+        line: '{"password":"hunter2"}',
+        redacted: '{"password":"<REDACTED_SECRET>"}',
+        secret: "hunter2",
+      },
+      {
+        line: "github_pat_11AA22BB33CC_44dd55ee66",
+        redacted: "<REDACTED_SECRET>",
+        secret: "github_pat_11AA22BB33CC_44dd55ee66",
+      },
+      {
+        line: "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        redacted: "Authorization: Basic <REDACTED_SECRET>",
+        secret: "QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+      },
+      {
+        line: "Proxy-Authorization: Basic cHJveHk6c2VjcmV0",
+        redacted: "Proxy-Authorization: Basic <REDACTED_SECRET>",
+        secret: "cHJveHk6c2VjcmV0",
+      },
+    ];
+
+    for (const { line, redacted, secret } of cases) {
+      const body = ["## Description", line].join("\n");
+      const title = deriveIssueTitleFromBody(body);
+
+      expect(title).toBe(`AFT issue: ${redacted}`);
+      expect(title).not.toContain(secret);
+    }
+  });
+
   test("exits cleanly before prompts in non-interactive terminals", async () => {
     await withTTY(false, false, async () => {
       const code = await runDoctor({
