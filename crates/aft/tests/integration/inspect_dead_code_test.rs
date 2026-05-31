@@ -550,6 +550,81 @@ fn inspect_dead_code_keeps_workspace_barrel_default_export_import_live() {
 }
 
 #[test]
+fn inspect_dead_code_keeps_namespace_imported_exports_live() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/mod.ts",
+            "export function thing() { return 1; }\nexport function helper() { return 2; }\n",
+        ),
+        (
+            "src/consumer.ts",
+            "import * as mod from \"./mod\";\nmod.thing();\n",
+        ),
+    ]);
+    let graph = snapshot(
+        paths.clone(),
+        vec![
+            export(&root, "src/mod.ts", "thing", "function", 1),
+            export(&root, "src/mod.ts", "helper", "function", 2),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, paths, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+    assert!(success.aggregate["items"]
+        .as_array()
+        .expect("items")
+        .is_empty());
+}
+
+#[test]
+fn inspect_dead_code_skips_malformed_child_package_json_when_resolving_package_name() {
+    let (_temp_dir, root, _paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        ),
+        (
+            "packages/bridge/package.json",
+            r#"{"name":"@scope/bridge","exports":"./src/index.ts"}"#,
+        ),
+        ("packages/bridge/src/package.json", "{ malformed json"),
+        (
+            "packages/bridge/src/index.ts",
+            "export function liveFunction() { return 1; }\n",
+        ),
+        ("packages/app/package.json", r#"{"name":"app"}"#),
+        (
+            "packages/app/src/consumer.ts",
+            "import { liveFunction } from \"@scope/bridge\";\nliveFunction();\n",
+        ),
+    ]);
+    let source_files = vec![
+        root.join("packages/bridge/src/index.ts"),
+        root.join("packages/app/src/consumer.ts"),
+    ];
+    let graph = snapshot(
+        source_files.clone(),
+        vec![export(
+            &root,
+            "packages/bridge/src/index.ts",
+            "liveFunction",
+            "function",
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let success = scan(job(&root, source_files, Some(graph)));
+
+    assert_eq!(success.aggregate["count"], 0, "{:#}", success.aggregate);
+}
+
+#[test]
 fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
     let source = (0..101)
         .map(|index| format!("export function unused_{index}() {{}}\n"))

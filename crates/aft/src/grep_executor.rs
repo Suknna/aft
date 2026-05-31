@@ -256,6 +256,7 @@ fn execute_root(
             if !root.use_index {
                 if let Some(result) = ripgrep_grep(
                     &root.search_root,
+                    project_root,
                     pattern,
                     &params.include,
                     &params.exclude,
@@ -584,6 +585,7 @@ fn should_stop_fallback_search(
 
 fn ripgrep_grep(
     search_root: &Path,
+    project_root: &Path,
     pattern: &CompiledPattern,
     include: &[String],
     exclude: &[String],
@@ -592,6 +594,9 @@ fn ripgrep_grep(
     let rg = which_rg()?;
     let mut cmd = Command::new(rg);
     cmd.args(["-nH", "--hidden", "--no-messages", "--json"]);
+    if let Some(ignore_file) = aftignore_file_for_ripgrep(search_root, project_root) {
+        cmd.arg("--ignore-file").arg(ignore_file);
+    }
     if pattern.case_insensitive() {
         cmd.arg("-i");
     }
@@ -675,6 +680,16 @@ fn ripgrep_grep(
         fully_degraded: true,
         engine_capped,
     })
+}
+
+fn aftignore_file_for_ripgrep(search_root: &Path, project_root: &Path) -> Option<PathBuf> {
+    let search_ignore = search_root.join(".aftignore");
+    if search_ignore.is_file() {
+        return Some(search_ignore);
+    }
+
+    let project_ignore = project_root.join(".aftignore");
+    project_ignore.is_file().then_some(project_ignore)
 }
 
 pub(crate) fn ripgrep_glob(

@@ -480,6 +480,17 @@ fn imported_export_liveness_roots(
     let mut roots: BTreeSet<ExportNode> = BTreeSet::new();
 
     for import in &import_block.imports {
+        if import.namespace_import.is_some() {
+            if let Some(module_entry) = resolve_module_path(from_dir, &import.module_path) {
+                roots.extend(resolve_namespace_import_liveness_roots(
+                    project_root,
+                    &module_entry,
+                    exported_symbols_by_file,
+                    default_export_symbols_by_file,
+                ));
+            }
+        }
+
         let Some(module_entry) = resolve_workspace_package_import(from_dir, &import.module_path)
         else {
             continue;
@@ -552,15 +563,63 @@ fn package_name_for_file(file: &Path) -> Option<String> {
     while let Some(dir) = current {
         let manifest = dir.join("package.json");
         if manifest.is_file() {
-            let source = fs::read_to_string(&manifest).ok()?;
-            let value = serde_json::from_str::<serde_json::Value>(&source).ok()?;
-            if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
-                return Some(name.to_string());
+            if let Ok(source) = fs::read_to_string(&manifest) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&source) {
+                    if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+                        return Some(name.to_string());
+                    }
+                }
             }
         }
         current = dir.parent();
     }
     None
+}
+
+fn resolve_namespace_import_liveness_roots(
+    project_root: &Path,
+    module_entry: &Path,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    default_export_symbols_by_file: &BTreeMap<String, String>,
+) -> Vec<ExportNode> {
+    let Some((_, symbols)) =
+        exported_symbols_for_resolved_file(project_root, module_entry, exported_symbols_by_file)
+    else {
+        return Vec::new();
+    };
+    let mut roots = BTreeSet::new();
+
+    for symbol in symbols {
+        if let Some(root) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            symbol,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            roots.insert(root);
+        }
+    }
+
+    if default_export_symbol_for_resolved_file(
+        project_root,
+        module_entry,
+        default_export_symbols_by_file,
+    )
+    .is_some()
+    {
+        if let Some(root) = resolve_imported_export_liveness_root(
+            project_root,
+            module_entry,
+            "default",
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ) {
+            roots.insert(root);
+        }
+    }
+
+    roots.into_iter().collect()
 }
 
 fn resolve_imported_export_liveness_root(

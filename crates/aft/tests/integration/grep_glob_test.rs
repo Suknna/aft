@@ -112,6 +112,13 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+fn rg_available() -> bool {
+    std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
 #[test]
 fn grep_fallback_returns_relative_paths_and_counts() {
     let project = setup_project(&[
@@ -575,6 +582,50 @@ fn grep_explicit_aftignored_file_is_searched() {
     assert_eq!(
         response["total_matches"], 1,
         "explicitly-named .aftignored file must be searched: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_external_ripgrep_fallback_respects_search_root_aftignore() {
+    if !rg_available() {
+        return;
+    }
+
+    let project = setup_project(&[]);
+    let external = setup_project(&[
+        ("keep.rs", "external-needle here\n"),
+        ("ignored/skip.rs", "external-needle ignored\n"),
+        (".aftignore", "ignored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-external-rg-aftignore",
+            "command": "grep",
+            "pattern": "external-needle",
+            "path": external.path(),
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["index_status"], "Fallback");
+    assert_eq!(
+        response["total_matches"], 1,
+        "external ripgrep fallback must honor search-root .aftignore: {response:?}"
+    );
+    assert_eq!(response["files_with_matches"], 1);
+    assert_eq!(
+        response["matches"][0]["file"],
+        canonical_path_string(&external.path().join("keep.rs"))
     );
 
     let status = aft.shutdown();
