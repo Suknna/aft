@@ -14,7 +14,7 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::parser::{grammar_for, LangId};
 
 mod c;
-pub(crate) use c::normalize_include_module;
+pub(crate) use c::{classify_group_c_import_kind, normalize_include_module};
 mod csharp;
 mod java;
 mod kotlin;

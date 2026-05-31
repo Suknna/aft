@@ -180,7 +180,15 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Determine group ---
-    let group = imports::classify_group(lang, module);
+    // C/C++ grouping depends on the include delimiter (system `<>` -> Stdlib,
+    // local `""` -> External), but the registry classifier only sees the bare
+    // header path and always returns Stdlib. Use the resolved include kind so a
+    // local include lands in its own group after system includes, matching
+    // organize's ordering instead of alphabetically colliding with system ones.
+    let group = match (lang, import_kind.as_deref()) {
+        (LangId::C | LangId::Cpp, Some(kind)) => imports::classify_group_c_import_kind(kind),
+        _ => imports::classify_group(lang, module),
+    };
 
     // --- Try to merge into an existing same-module, same-kind named import ---
     //
@@ -263,7 +271,17 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             at
         };
         let (insert_offset, needs_blank_before, needs_blank_after) = if !block.imports.is_empty() {
-            imports::find_insertion_point(&source, &block, group, module, type_only)
+            let (off, blank_before, blank_after) =
+                imports::find_insertion_point(&source, &block, group, module, type_only);
+            // C/C++ `#include`s form one contiguous block (system group then
+            // local group, no blank line between) — matching organize. Suppress
+            // the cross-group blank lines find_insertion_point inserts for
+            // languages like TS/Python/Rust where groups are blank-separated.
+            if matches!(lang, LangId::C | LangId::Cpp) {
+                (off, false, false)
+            } else {
+                (off, blank_before, blank_after)
+            }
         } else if lang == LangId::Vue {
             match imports::vue_script_content_range(&tree) {
                 Some((start, _end)) => (skip_one_newline(start), false, false),

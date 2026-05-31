@@ -1023,6 +1023,24 @@ fn scenarios() -> Vec<Scenario> {
                 import_kind: None,
             }],
         },
+        // A local include whose name sorts alphabetically BEFORE the existing
+        // system include must still land AFTER it (grouped by include kind, not
+        // alphabetically), contiguous with no blank line between — matching
+        // organize. This is the case the delimited test above missed by alpha
+        // accident (`widget` > `vector`).
+        Scenario {
+            name: "cpp_add_local_sorts_before_system",
+            ext: "cpp",
+            input: "#include <vector>\n\nint main() { return 0; }\n",
+            ops: &[Op::AddForm {
+                module: "\"aaa.hpp\"",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
         Scenario {
             name: "c_remove_include",
             ext: "c",
