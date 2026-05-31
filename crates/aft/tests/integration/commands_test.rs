@@ -314,7 +314,7 @@ fn test_zoom_success_with_annotations() {
     let file = fixture_path("calls.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"z-1","command":"zoom","file":{},"symbol":"compute"}}"#,
+        r#"{{"id":"z-1","command":"zoom","file":{},"symbol":"compute","callgraph":true}}"#,
         crate::helpers::json_string(&file.display())
     ));
 
