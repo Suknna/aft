@@ -84,7 +84,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v8: entry-point recognition seeds npm `scripts` source files as liveness
 /// roots (baked into per-file liveness_roots), and dead_code/unused_exports
 /// exclude test-support files (fixtures/corpora/mocks) from reporting.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 8;
+/// v9: unused_exports resolves NodeNext `./x.js` import specifiers to their
+/// `.ts` source (alters resolved import edges), fixing false-unused on symbols
+/// re-exported/imported with a `.js` extension in a `.ts` source tree.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 9;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1343,6 +1346,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 8);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 9);
     }
 }

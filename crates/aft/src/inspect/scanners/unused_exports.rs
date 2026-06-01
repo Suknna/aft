@@ -869,7 +869,19 @@ fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     candidates.push(base.to_path_buf());
 
-    if base.extension().is_none() {
+    // TypeScript/NodeNext resolution rewrites a `./x.js` import specifier to its
+    // `./x.ts` source. So when the specifier carries a JS-family extension we
+    // must also probe the source equivalents (.ts/.tsx/...), not just the
+    // literal `.js` path (which does not exist in a `src/` tree). Without this,
+    // every `from "./mod.js"` re-export/import fails to resolve and the imported
+    // symbols are falsely reported unused.
+    let has_remappable_ext = base
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| JS_MODULE_EXTENSIONS.contains(&ext))
+        .unwrap_or(false);
+
+    if base.extension().is_none() || has_remappable_ext {
         for extension in JS_MODULE_EXTENSIONS {
             candidates.push(base.with_extension(extension));
         }
@@ -967,4 +979,43 @@ fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
 
 fn line_number(node: &Node) -> u32 {
     (node.start_position().row + 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_paths_remaps_js_specifier_to_ts_source() {
+        // NodeNext: `from "./active-logger.js"` must resolve to `active-logger.ts`.
+        let base = Path::new("/proj/src/active-logger.js");
+        let candidates = candidate_paths(base);
+        assert!(
+            candidates.contains(&PathBuf::from("/proj/src/active-logger.ts")),
+            "expected .ts source candidate, got: {candidates:?}"
+        );
+        // The literal specifier is still probed first (real .js trees still work).
+        assert_eq!(candidates[0], PathBuf::from("/proj/src/active-logger.js"));
+    }
+
+    #[test]
+    fn candidate_paths_remaps_mjs_and_jsx_specifiers() {
+        for (specifier, expected_ts) in [
+            ("/proj/src/x.mjs", "/proj/src/x.ts"),
+            ("/proj/src/x.jsx", "/proj/src/x.tsx"),
+        ] {
+            let candidates = candidate_paths(Path::new(specifier));
+            assert!(
+                candidates.contains(&PathBuf::from(expected_ts)),
+                "{specifier}: expected {expected_ts} candidate, got: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_paths_extensionless_still_probes_all_extensions() {
+        let candidates = candidate_paths(Path::new("/proj/src/mod"));
+        assert!(candidates.contains(&PathBuf::from("/proj/src/mod.ts")));
+        assert!(candidates.contains(&PathBuf::from("/proj/src/mod/index.ts")));
+    }
 }
