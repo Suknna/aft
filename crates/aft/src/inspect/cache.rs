@@ -87,7 +87,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v9: unused_exports resolves NodeNext `./x.js` import specifiers to their
 /// `.ts` source (alters resolved import edges), fixing false-unused on symbols
 /// re-exported/imported with a `.js` extension in a `.ts` source tree.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 9;
+/// v10: public-API entry resolution remaps build-output entries (dist/index.js)
+/// to their src/ source equivalent, so the source barrel is recognized as a
+/// public-API file and its re-exports are suppressed (changes public-API set).
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 10;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1346,6 +1349,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 9);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 10);
     }
 }

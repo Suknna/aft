@@ -424,23 +424,67 @@ fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let entry_path = if is_relative_module(entry) {
-        package_dir.join(entry)
+    let rel = if is_relative_module(entry) {
+        entry.trim_start_matches("./").to_string()
     } else {
-        package_dir.join(entry.trim_start_matches('/'))
+        entry.trim_start_matches('/').to_string()
     };
 
-    candidate_paths(&entry_path)
-        .into_iter()
+    // package.json `main`/`module`/`exports`/`bin` point at BUILD OUTPUT (e.g.
+    // dist/index.js), but the inspect scanner only sees SOURCE — `dist/` is
+    // build output excluded from the walk. Prefer the source equivalent
+    // (src/index.ts) so the source barrel/entry file is the one recognized as a
+    // public-API file (and its re-exports suppressed). Falls back to the literal
+    // path when the package's source already lives where the entry points.
+    // Try the source-remapped path first, then the literal entry. `find`
+    // returns the first existing file, so a package whose source lives where the
+    // entry points still resolves via the literal fallback.
+    let mut bases = Vec::new();
+    if let Some(src_rel) = remap_build_output_to_src(&rel) {
+        bases.push(package_dir.join(src_rel));
+    }
+    bases.push(package_dir.join(&rel));
+
+    bases
+        .iter()
+        .flat_map(|base| candidate_paths(base))
         .map(|candidate| normalize_path(&candidate))
         .find(|candidate| candidate.is_file())
+}
+
+/// Map a built entry path (`dist/index.js`) to its likely source location
+/// (`src/index.js`, which `candidate_paths` then remaps to `src/index.ts`).
+/// Returns `None` when the path is not under a recognized build-output dir, in
+/// which case the caller uses the literal path. `lib` is intentionally excluded
+/// — it is as commonly a source dir as a build dir, so remapping it risks
+/// pointing at an unrelated `src/` file.
+fn remap_build_output_to_src(rel: &str) -> Option<String> {
+    const BUILD_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
+    let mut components = rel.split('/');
+    let first = components.next()?;
+    if !BUILD_DIRS.contains(&first) {
+        return None;
+    }
+    let rest: Vec<&str> = components.collect();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("src/{}", rest.join("/")))
 }
 
 fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     candidates.push(base.to_path_buf());
 
-    if base.extension().is_none() {
+    // A `.js`/`.mjs`/... specifier (NodeNext) resolves to its `.ts`/`.tsx`/...
+    // source; probe those too, not just the literal extension.
+    let has_remappable_ext = base
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| JS_MODULE_EXTENSIONS.contains(&ext))
+        .unwrap_or(false);
+
+    if base.extension().is_none() || has_remappable_ext {
         for extension in JS_MODULE_EXTENSIONS {
             candidates.push(base.with_extension(extension));
         }
@@ -562,5 +606,49 @@ mod tests {
         assert!(!entry_points.is_liveness_root_file(&root.join("src/does-not-exist.ts")));
         // Script roots are liveness roots, not public-API surfaces.
         assert!(!entry_points.is_public_api_file(&root.join("src/runner.ts")));
+    }
+
+    #[test]
+    fn public_api_entry_pointing_at_dist_resolves_to_src_source() {
+        // package.json `main`/`exports` point at built output (dist/index.js),
+        // but the scanner only sees source. The SOURCE barrel (src/index.ts)
+        // must be the file recognized as public-API so its re-exports are
+        // suppressed — not the never-scanned dist path.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/index.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "@scope/pkg",
+                "main": "dist/index.js",
+                "module": "dist/index.js",
+                "exports": { ".": { "import": "./dist/index.js" } }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        assert!(
+            entry_points.is_public_api_file(&root.join("src/index.ts")),
+            "src/index.ts should be recognized as public-API via dist->src remap"
+        );
+    }
+
+    #[test]
+    fn remap_build_output_to_src_excludes_ambiguous_lib() {
+        assert_eq!(
+            remap_build_output_to_src("dist/index.js").as_deref(),
+            Some("src/index.js")
+        );
+        assert_eq!(
+            remap_build_output_to_src("build/sub/mod.js").as_deref(),
+            Some("src/sub/mod.js")
+        );
+        // `lib` is ambiguous (often a source dir) — not remapped.
+        assert_eq!(remap_build_output_to_src("lib/index.js"), None);
+        // Non-build top-level dirs pass through unremapped.
+        assert_eq!(remap_build_output_to_src("src/index.ts"), None);
     }
 }
