@@ -183,13 +183,13 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.33.0";
+const ANNOUNCEMENT_VERSION = "0.34.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "New `aft_inspect` — one call for codebase health: diagnostics, metrics, TODOs, dead code, unused exports, and duplicates.",
-  "Diagnostics now flow through `aft_inspect` (run it after a batch of edits) instead of arriving automatically on every edit.",
-  "`aft_navigate` is renamed to `aft_callgraph`; the Rust call graph now resolves cross-file callers.",
-  "Edits no longer echo the whole file back to the agent — much lower token cost per edit.",
-  "Batch of `aft_search` correctness fixes and undo-history/SSRF/Windows hardening.",
+  "`aft_import` now supports 12 more languages (Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, Perl, C/C++, Vue) — 17 total.",
+  "New YAML + Kubernetes/CRD support across outline, zoom, search, and ast_grep.",
+  "`aft_conflicts` takes an optional `path` to inspect any repo or git worktree, and names the repository it checked.",
+  "`.aftignore` (layered on `.gitignore`) plus ripgrep-style `grep` that searches an explicitly-named file even when ignored.",
+  "`aft_zoom` call-graph annotations are now opt-in (`callgraph: true`); `semantic.max_files` and `bash.foreground_wait_window_ms` are configurable.",
 ];
 
 /**
