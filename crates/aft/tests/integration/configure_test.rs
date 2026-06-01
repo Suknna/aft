@@ -411,7 +411,8 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
             "id": "cfg-missing-format-check",
             "command": "configure",
             "harness": "opencode",
-            "project_root": dir.path()
+            "project_root": dir.path(),
+            "validate_on_edit": "syntax"
         })
         .to_string(),
     );
@@ -433,6 +434,45 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
     let checker = warning_with_kind(&configure, "checker_not_installed", "tool", "biome")
         .expect("missing checker warning");
     assert_eq!(checker["language"], "typescript");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
+fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
+    std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-no-format-warnings",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "format_on_edit": false,
+            "validate_on_edit": "off"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+    let configure = aft.merge_configure_warnings(configure);
+    assert!(
+        warning_with_kind(&configure, "formatter_not_installed", "tool", "biome").is_none(),
+        "format_on_edit:false should suppress formatter warnings: {configure:?}"
+    );
+    assert!(
+        warning_with_kind(&configure, "checker_not_installed", "tool", "biome").is_none(),
+        "validate_on_edit:off should suppress checker warnings: {configure:?}"
+    );
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());

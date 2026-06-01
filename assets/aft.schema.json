@@ -65,6 +65,16 @@
       },
       "description": "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go')."
     },
+    "configure_warnings_delivery": {
+      "type": "string",
+      "enum": [
+        "toast",
+        "log",
+        "chat"
+      ],
+      "default": "toast",
+      "description": "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead."
+    },
     "hoist_builtin_tools": {
       "type": "boolean",
       "default": true,

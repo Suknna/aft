@@ -5,6 +5,18 @@ use std::fs;
 
 use super::helpers::{fixture_path, AftProcess};
 
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn file_contains(content: &str, needle: &str) -> bool {
+    normalize_newlines(content).contains(normalize_newlines(needle).as_str())
+}
+
+fn file_find(content: &str, needle: &str) -> Option<usize> {
+    normalize_newlines(content).find(normalize_newlines(needle).as_str())
+}
+
 /// Helper: copy a fixture to a uniquely-named temp file for mutation testing.
 fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,7 +93,7 @@ fn add_derive_create_new() {
 
     let content = fs::read_to_string(&tmp).unwrap();
     assert!(
-        content.contains("#[derive(Debug, Clone)]\npub struct Config"),
+        file_contains(&content, "#[derive(Debug, Clone)]\npub struct Config"),
         "Expected new derive attribute. Content:\n{}",
         content
     );
@@ -293,7 +305,7 @@ fn add_decorator_to_plain_function() {
 
     let content = fs::read_to_string(&tmp).unwrap();
     assert!(
-        content.contains("@cache\ndef plain_function"),
+        file_contains(&content, "@cache\ndef plain_function"),
         "Expected decorator before function. Content:\n{}",
         content
     );
@@ -320,7 +332,7 @@ fn add_decorator_to_decorated_function_first() {
 
     let content = fs::read_to_string(&tmp).unwrap();
     // @login_required should appear before @app.route("/users")
-    let login_pos = content.find("@login_required\n@app.route(\"/users\")");
+    let login_pos = file_find(&content, "@login_required\n@app.route(\"/users\")");
     assert!(
         login_pos.is_some(),
         "Expected @login_required before @app.route. Content:\n{}",
@@ -343,7 +355,7 @@ fn add_decorator_to_decorated_function_last() {
     let content = fs::read_to_string(&tmp).unwrap();
     // @cache should appear after @app.route and before def
     assert!(
-        content.contains("@app.route(\"/users\")\n@cache\ndef get_users"),
+        file_contains(&content, "@app.route(\"/users\")\n@cache\ndef get_users"),
         "Expected @cache between existing decorator and def. Content:\n{}",
         content
     );
@@ -364,7 +376,7 @@ fn add_decorator_preserves_indentation() {
     let content = fs::read_to_string(&tmp).unwrap();
     // Should have 4-space indent for the decorator inside a class
     assert!(
-        content.contains("    @cache\n    @staticmethod"),
+        file_contains(&content, "    @cache\n    @staticmethod"),
         "Expected indented decorator. Content:\n{}",
         content
     );

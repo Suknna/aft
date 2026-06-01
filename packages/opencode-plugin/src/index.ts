@@ -22,6 +22,10 @@ import {
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
 import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import {
+  enqueueConfigureWarningsForSession,
+  flushConfigureWarningsOnIdle,
+} from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, debug, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls, runAutoInstall } from "./lsp-auto-install.js";
@@ -124,11 +128,6 @@ function throwSentinel(command: string): never {
 // value pushed into the hooks array — `undefined` returns then crash
 // the host on every `hook.config?.(cfg)` / `hook.provider?.(...)` /
 // etc. iteration. Helpers stay in sibling modules.
-import {
-  drainPendingEagerWarnings,
-  handleConfigureWarningsForSession,
-} from "./configure-warnings.js";
-
 async function sendIgnoredMessage(client: unknown, sessionID: string, text: string): Promise<void> {
   const typedClient = client as {
     session?: {
@@ -499,21 +498,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     onConfigureWarnings: ({ projectRoot, sessionId, client, warnings }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
-      const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];
-      // Avoid re-entering bridge.send() from the synchronous configure callback
-      // before aft-bridge marks the lazy-spawned bridge configured.
-      setTimeout(() => {
-        void handleConfigureWarningsForSession({
-          projectRoot,
-          sessionId,
-          client,
-          bridge,
-          warnings: [...pendingWarnings, ...warnings],
-          fallbackClient: input.client,
-          storageDir: configOverrides.storage_dir as string,
-          pluginVersion: PLUGIN_VERSION,
-        });
-      }, 0);
+      const projectConfig = loadAftConfig(projectRoot);
+      enqueueConfigureWarningsForSession({
+        projectRoot,
+        sessionId,
+        client,
+        bridge,
+        warnings,
+        fallbackClient: input.client,
+        storageDir: configOverrides.storage_dir as string,
+        pluginVersion: PLUGIN_VERSION,
+        serverUrl: input.serverUrl?.toString(),
+        delivery: projectConfig.configure_warnings_delivery ?? "toast",
+      });
     },
     onBashCompletion: (completion) => {
       // Prefer the cached session directory; fall back to plugin-init cwd
@@ -980,6 +977,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         client: input.client,
         serverUrl: input.serverUrl?.toString(),
       });
+      await flushConfigureWarningsOnIdle(sessionID);
     },
     "chat.message": async (messageInput: {
       sessionID?: string;

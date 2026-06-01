@@ -10,6 +10,11 @@ fn fixture_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Normalize `\r\n` from Windows bind mounts so fixture comparisons are portable.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn load_filter(name: &str) -> aft::compress::toml_filter::TomlFilter {
     let (_, content) = ALL
         .iter()
@@ -25,8 +30,8 @@ fn run_fixture(name: &str) {
     let filter = load_filter(name);
     let actual = apply_filter(&filter, &input);
     assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
+        normalize_newlines(actual.trim_end()),
+        normalize_newlines(expected.trim_end()),
         "fixture mismatch for {name}",
     );
 }

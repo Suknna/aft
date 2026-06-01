@@ -2,122 +2,208 @@
 
 ## Pattern Overview
 
-**Overall:** TypeScript plugin + Rust worker process over a session-scoped NDJSON bridge
+**Overall:** TypeScript plugin + Rust worker process over a session-scoped NDJSON bridge. A unified CLI (`packages/aft-cli/`) serves setup/doctor across all harnesses; shared transport, binary resolution, and ONNX helpers live in `packages/aft-bridge/`.
 
 **Key Characteristics:**
-- Use `packages/opencode-plugin/src/index.ts` to register OpenCode tools and map them onto Rust commands.
-- Use `packages/opencode-plugin/src/bridge.ts` and `packages/opencode-plugin/src/pool.ts` to isolate one `aft` process per session.
+- Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto Rust commands.
+- Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` as the shared transport layer, isolating one `aft` process per project root.
+- Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
 ## Layers
 
 **OpenCode integration layer:**
 - Purpose: Register tools, load config, and attach post-execution metadata.
 - Location: `packages/opencode-plugin/src/index.ts`
-- Contains: Plugin bootstrap, tool-surface selection, hoisting logic, disabled-tool filtering
-- Depends on: `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/src/tools/*.ts`, `packages/opencode-plugin/src/pool.ts`
+- Contains: Plugin bootstrap, tool-surface selection, hoisting logic, disabled-tool filtering, session-directory management, RPC server, auto-update checker hook
+- Depends on: `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/src/tools/*.ts`, `packages/aft-bridge/`
 - Used by: OpenCode plugin loading through `@cortexkit/aft-opencode`
 
-**Plugin transport layer:**
-- Purpose: Resolve or download the binary, start worker processes, and forward requests.
-- Location: `packages/opencode-plugin/src/bridge.ts`, `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/resolver.ts`, `packages/opencode-plugin/src/downloader.ts`
-- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery, binary download
-- Depends on: Node child-process APIs, GitHub releases, `packages/opencode-plugin/src/logger.ts`
-- Used by: `packages/opencode-plugin/src/tools/*.ts` and `packages/opencode-plugin/src/index.ts`
+**Pi integration layer:**
+- Purpose: Register tools, load config, and manage Pi host notifications.
+- Location: `packages/pi-plugin/src/index.ts`
+- Contains: Plugin bootstrap, tool-surface selection, hoisting logic, LSP auto-install (npm/github/project-relevance probes), `aft-status` command
+- Depends on: `packages/pi-plugin/src/config.ts`, `packages/pi-plugin/src/tools/*.ts`, `packages/pi-plugin/src/commands/*.ts`, `packages/aft-bridge/`
+- Used by: Pi coding agent through `@cortexkit/aft-pi`
 
-**Tool definition layer:**
+**Shared bridge layer:**
+- Purpose: Resolve or download the binary, start worker processes, manage ONNX runtime, format output, and forward requests. All harness adapters share this layer.
+- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/zoom-format.ts`
+- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger
+- Depends on: Node child-process APIs, GitHub releases, `onnxruntime-node`
+- Used by: `packages/opencode-plugin/src/index.ts`, `packages/pi-plugin/src/index.ts`
+
+**Unified CLI layer:**
+- Purpose: Provide a single `npx @cortexkit/aft` entry point for setup, doctor, and LSP management across all harnesses.
+- Location: `packages/aft-cli/src/index.ts`, `packages/aft-cli/src/commands/`
+- Contains: `setup`, `doctor`, `doctor lsp`, `doctor --fix`, `doctor --clear`, `doctor --issue`; harness auto-detection (OpenCode/Pi) with `--harness` override
+- Depends on: `packages/aft-bridge/`, harness adapter config paths
+- Used by: End users via `npx @cortexkit/aft`
+
+**Tool definition layer (OpenCode):**
 - Purpose: Convert OpenCode tool arguments into protocol requests and permission checks.
 - Location: `packages/opencode-plugin/src/tools/`
-- Contains: Hoisted tools, reading tools, import tools, transform tools, navigation tools, refactoring tools, safety tools, conflict tools, permissions helpers
-- Depends on: `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/metadata-store.ts`, `packages/opencode-plugin/src/lsp.ts`
+- Contains: Hoisted tools (edit/write/apply_patch), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, LSP tools, search tools, semantic tools, inspect tools, permissions helpers
+- Depends on: `packages/aft-bridge/src/pool.ts`, `packages/opencode-plugin/src/shared/`, `packages/opencode-plugin/src/metadata-store.ts`
 - Used by: `packages/opencode-plugin/src/index.ts`
+
+**Tool definition layer (Pi):**
+- Purpose: Convert Pi tool arguments into protocol requests and permission checks.
+- Location: `packages/pi-plugin/src/tools/`
+- Contains: Hoisted tools (read/write/edit/grep), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper
+- Depends on: `packages/aft-bridge/src/pool.ts`, `packages/pi-plugin/src/shared/`
+- Used by: `packages/pi-plugin/src/index.ts`
 
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests and route each command to a focused handler.
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
-- Contains: Request dispatch, response encoding, command handlers for read/edit/refactor/LSP/conflicts
-- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`
-- Used by: `packages/opencode-plugin/src/bridge.ts`
+- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
+- Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
+- Used by: `packages/aft-bridge/src/bridge.ts`
 
 **Analysis and mutation engine layer:**
-- Purpose: Parse code, compute call graphs, apply edits, format files, and manage imports.
-- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports.rs`, `crates/aft/src/extract.rs`
-- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, refactor helpers
-- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes
+- Purpose: Parse code, compute call graphs, apply edits, format files, manage imports, index code semantically, and search with trigram indexes.
+- Location: `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/imports/`, `crates/aft/src/extract.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/symbols.rs`, `crates/aft/src/calls.rs`, `crates/aft/src/symbol_cache_disk.rs`, `crates/aft/src/fuzzy_match.rs`, `crates/aft/src/ast_grep_hints.rs`, `crates/aft/src/ast_grep_lang.rs`, `crates/aft/src/query_shape.rs`, `crates/aft/src/pattern_compile.rs`
+- Contains: Tree-sitter parsing, symbol extraction, diff generation, formatter detection, type-checker integration, import engines (Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C/C++, Perl, Solidity, Vue), refactor helpers, semantic embedding index, trigram search index, disk-backed symbol cache, AST-grep integration
+- Depends on: tree-sitter grammars, ast-grep, external formatter and checker processes, ONNX Runtime (optional), fastembed / OpenAI-compatible / Ollama backends (optional)
 - Used by: `crates/aft/src/commands/*.rs`
 
 **State and diagnostics layer:**
-- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, and LSP state.
-- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`
-- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store
-- Depends on: `notify`, LSP transport helpers, Rust `RefCell`
+- Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
+- Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`
+- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool
+- Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/`), `serde`
 - Used by: All command handlers through `AppContext`
 
 ## Data Flow
 
 **Tool invocation flow:**
 
-1. Register tool definitions and config-driven surface selection — `packages/opencode-plugin/src/index.ts`
-2. Get a session bridge and send a command over NDJSON — `packages/opencode-plugin/src/pool.ts`, `packages/opencode-plugin/src/bridge.ts`
-3. Dispatch the request to a Rust handler and return structured JSON — `crates/aft/src/main.rs`, `crates/aft/src/commands/mod.rs`
+1. Register tool definitions and config-driven surface selection -- `packages/opencode-plugin/src/index.ts` or `packages/pi-plugin/src/index.ts`
+2. Get a session bridge and send a command over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
+3. Dispatch the request to a Rust handler and return structured JSON -- `crates/aft/src/main.rs`, `crates/aft/src/commands/mod.rs`
 
 **Edit pipeline:**
 
-1. Validate permissions and map tool arguments to protocol params — `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/permissions.ts`
-2. Snapshot, mutate, diff, and validate content — `crates/aft/src/edit.rs`
-3. Auto-format and optionally collect diagnostics after write — `crates/aft/src/format.rs`, `crates/aft/src/context.rs`
+1. Validate permissions and map tool arguments to protocol params -- `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents)
+2. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
+3. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`
 
 **Call-graph and navigation flow:**
 
-1. Configure project root and initialize file watching — `crates/aft/src/commands/configure.rs`
-2. Build or query lazy file-level graph data — `crates/aft/src/callgraph.rs`
-3. Serve navigation commands such as callers, impact, and trace-data — `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`
+1. Configure project root and initialize file watching -- `crates/aft/src/commands/configure.rs`
+2. Build or query lazy file-level graph data -- `crates/aft/src/callgraph.rs`
+3. Serve navigation commands such as callers, call-tree, impact, trace-to, and trace-data -- `crates/aft/src/commands/call_tree.rs`, `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`, `crates/aft/src/commands/trace_to.rs`, `crates/aft/src/commands/trace_to_symbol.rs`
+
+**Search and retrieval flow:**
+
+1. Index project files with trigram-based search index -- `crates/aft/src/search_index.rs`
+2. Optionally index with dense embeddings (fastembed, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`
+3. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`
+
+**Bash execution flow:**
+
+1. Rewrite high-level commands (cat to read, grep to grep tool) -- `crates/aft/src/bash_rewrite/`
+2. Scan for dangerous commands and prompt for permission -- `crates/aft/src/bash_permissions/`
+3. Execute foreground, background, or PTY modes -- `crates/aft/src/bash_background/`
+4. Compress output through the tiered compressor -- `crates/aft/src/compress/`
 
 **Binary resolution flow:**
 
-1. Check cache, npm platform package, PATH, and cargo install locations — `packages/opencode-plugin/src/resolver.ts`
-2. Download and checksum-verify a release asset when local resolution fails — `packages/opencode-plugin/src/downloader.ts`
-3. Start bridges against the resolved binary and hot-swap after version mismatch — `packages/opencode-plugin/src/bridge.ts`, `packages/opencode-plugin/src/pool.ts`
+1. Check cache, npm platform package, PATH, and cargo install locations -- `packages/aft-bridge/src/resolver.ts`
+2. Download and checksum-verify a release asset when local resolution fails -- `packages/aft-bridge/src/downloader.ts`
+3. Start bridges against the resolved binary and hot-swap after version mismatch -- `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`
 
 ## Key Abstractions
 
 **BinaryBridge:**
 - Purpose: Keep one live `aft` subprocess available for request/response traffic.
-- Location: `packages/opencode-plugin/src/bridge.ts`
+- Location: `packages/aft-bridge/src/bridge.ts`
 - Pattern: Persistent child-process adapter with timeout-triggered restart
 
 **BridgePool:**
-- Purpose: Scope bridges per OpenCode session and preserve isolated undo history.
-- Location: `packages/opencode-plugin/src/pool.ts`
+- Purpose: Scope bridges per OpenCode/Pi session and preserve isolated undo history.
+- Location: `packages/aft-bridge/src/pool.ts`
 - Pattern: Session-keyed object pool with LRU eviction
 
-**Tool groups:**
+**Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.
-- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`
+- Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/bash_watch.ts`, `packages/opencode-plugin/src/tools/bash_write.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/permissions.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`
 - Pattern: Thin TypeScript adapters over shared bridge transport
+
+**Tool groups (Pi):**
+- Purpose: Group related Pi tool definitions by capability surface.
+- Location: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/structure.ts`, `packages/pi-plugin/src/tools/navigate.ts`, `packages/pi-plugin/src/tools/refactor.ts`, `packages/pi-plugin/src/tools/safety.ts`, `packages/pi-plugin/src/tools/conflicts.ts`, `packages/pi-plugin/src/tools/ast.ts`, `packages/pi-plugin/src/tools/bash.ts`, `packages/pi-plugin/src/tools/semantic.ts`, `packages/pi-plugin/src/tools/inspect.ts`, `packages/pi-plugin/src/tools/fs.ts`, `packages/pi-plugin/src/tools/diff-format.ts`, `packages/pi-plugin/src/tools/render-helpers.ts`
+- Pattern: Thin TypeScript adapters over shared bridge transport with Pi-specific argument mapping
 
 **AppContext:**
 - Purpose: Centralize runtime state for commands inside the Rust worker.
 - Location: `crates/aft/src/context.rs`
 - Pattern: Interior-mutable service container for a single-threaded request loop
+- Contains: `CallGraph`, `SearchIndex`, `SemanticIndex`, `BgTaskRegistry`, `FilterRegistry`, database connections, LSP manager, undo history
 
 **CallGraph:**
 - Purpose: Cache per-file call data and answer callers, call-tree, impact, and trace queries.
 - Location: `crates/aft/src/callgraph.rs`
 - Pattern: Lazy workspace index with invalidation on watcher events
 
+**SearchIndex:**
+- Purpose: Provide fast trigram-based full-text search across the project.
+- Location: `crates/aft/src/search_index.rs`
+- Pattern: On-disk trigram index rebuilt on watcher events, served from a background thread
+
+**SemanticIndex:**
+- Purpose: Provide dense-embedding semantic search across the project.
+- Location: `crates/aft/src/semantic_index.rs`
+- Pattern: Optional index backed by fastembed (local), OpenAI-compatible, or Ollama; configurable `max_files` cap
+
+**BgTaskRegistry:**
+- Purpose: Manage background bash tasks and PTY sessions.
+- Location: `crates/aft/src/bash_background/registry.rs`
+- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup
+
+**Compressor:**
+- Purpose: Reduce hoisted-bash output to relevant tokens.
+- Location: `crates/aft/src/compress/` (multiple modules), `crates/aft/src/compress/mod.rs`
+- Pattern: Trait-based dispatch with per-command Rust modules, output-shape sniffers, package-manager modules, declarative TOML filters, and a generic fallback
+
+**Harness:**
+- Purpose: Represent the coding-agent harness (OpenCode or Pi) for config and CLI dispatch.
+- Location: `crates/aft/src/harness.rs`
+- Pattern: Simple enum with serde round-trip and display/from-str
+
 ## Entry Points
 
 **OpenCode plugin entry point:**
 - Location: `packages/opencode-plugin/src/index.ts`
 - Triggers: OpenCode loads the `@cortexkit/aft-opencode` plugin
-- Responsibilities: Load config, resolve the binary, create the bridge pool, and register tool definitions
+- Responsibilities: Load config, resolve the binary via `@cortexkit/aft-bridge`, create the bridge pool, register tool definitions, manage session lifecycle, run auto-update checker, handle background completion push frames
+
+**Pi plugin entry point:**
+- Location: `packages/pi-plugin/src/index.ts`
+- Triggers: Pi loads the `@cortexkit/aft-pi` plugin
+- Responsibilities: Load config, resolve the binary via `@cortexkit/aft-bridge`, create the bridge pool, register tool definitions, manage LSP auto-install (npm + GitHub), handle background completion push frames
+
+**Unified CLI entry point:**
+- Location: `packages/aft-cli/src/index.ts`
+- Triggers: `npx @cortexkit/aft` invocation
+- Responsibilities: Parse argv, auto-detect harness, dispatch to `setup`, `doctor`, or `doctor lsp` commands
+
+**Shared bridge entry point:**
+- Location: `packages/aft-bridge/src/index.ts`
+- Triggers: Imported by `@cortexkit/aft-opencode` and `@cortexkit/aft-pi`
+- Responsibilities: Export `BinaryBridge`, `BridgePool`, binary resolution (`downloadBinary`, `ensureBinary`, `findBinary`), ONNX runtime detection (`ensureOnnxRuntime`, `isOrtAutoDownloadSupported`), storage migration (`ensureStorageMigrated`), compact formatting helpers
 
 **Rust protocol entry point:**
 - Location: `crates/aft/src/main.rs`
-- Triggers: `packages/opencode-plugin/src/bridge.ts` spawns the `aft` binary
-- Responsibilities: Read NDJSON requests from stdin, dispatch handlers, drain watcher and LSP events, and write JSON responses
+- Triggers: `packages/aft-bridge/src/bridge.ts` spawns the `aft` binary
+- Responsibilities: Read NDJSON requests from stdin, dispatch handlers, drain watcher and LSP events, compress background task output, and write JSON responses
+
+**Rust binary CLI subcommands:**
+- Location: `crates/aft/src/cli/`
+- Triggers: `aft warmup` or `aft migrate-storage` invocations
+- Responsibilities: Pre-warm tree-sitter grammars, migrate storage between legacy and CortexKit paths
 
 **Release automation entry point:**
 - Location: `.github/workflows/release.yml`
@@ -126,7 +212,7 @@
 
 ## Error Handling
 
-**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/opencode-plugin/src/bridge.ts`.
+**Strategy:** Return structured Rust `Response::error` payloads from command handlers, convert failed responses into plugin-side exceptions, and restart hung or crashed worker processes in `packages/aft-bridge/src/bridge.ts`.
 
 ## Honest Reporting Convention
 
@@ -134,22 +220,22 @@
 
 **Rule (tri-state):**
 
-1. **`success: false` + `code` + `message`** — the requested work could not be performed. Codes are machine-actionable strings such as `"path_not_found"`, `"no_lsp_server"`, `"project_too_large"`, `"invalid_request"`, `"ambiguous_match"`. The agent must read the message before continuing.
+1. **`success: false` + `code` + `message`** -- the requested work could not be performed. Codes are machine-actionable strings such as `"path_not_found"`, `"no_lsp_server"`, `"project_too_large"`, `"invalid_request"`, `"ambiguous_match"`. The agent must read the message before continuing.
 
-2. **`success: true` + completion signaling** — the work was performed. Tools that produce results MUST report whether the result is complete and, if not, name the gaps. Conventional fields:
-    - `complete: true` — the agent can trust absence of items in the result
-    - `complete: false` + a named gap field — partial result. Gap fields include `pending_files`, `unchecked_files`, `scope_warnings`, `skipped_files: [{file, reason}]`, `walk_truncated`
-    - `removed: bool` (mutations) — did the file actually change? `false` is a valid success when the requested change was a no-op.
-    - `no_files_matched_scope: bool` (search tools) — distinguishes "the path/glob you gave me resolved to zero files" from "I searched N files and found nothing"
+2. **`success: true` + completion signaling** -- the work was performed. Tools that produce results MUST report whether the result is complete and, if not, name the gaps. Conventional fields:
+    - `complete: true` -- the agent can trust absence of items in the result
+    - `complete: false` + a named gap field -- partial result. Gap fields include `pending_files`, `unchecked_files`, `scope_warnings`, `skipped_files: [{file, reason}]`, `walk_truncated`
+    - `removed: bool` (mutations) -- did the file actually change? `false` is a valid success when the requested change was a no-op.
+    - `no_files_matched_scope: bool` (search tools) -- distinguishes "the path/glob you gave me resolved to zero files" from "I searched N files and found nothing"
 
-3. **Side-effect skip codes** — when the main work succeeded but a non-essential side step was skipped (e.g. post-write formatting), use a `<step>_skipped_reason` field so the agent gets specific feedback without treating the whole call as a failure. Approved values:
+3. **Side-effect skip codes** -- when the main work succeeded but a non-essential side step was skipped (e.g. post-write formatting), use a `<step>_skipped_reason` field so the agent gets specific feedback without treating the whole call as a failure. Approved values:
     - `format_skipped_reason`: `"unsupported_language"` | `"no_formatter_configured"` | `"formatter_not_installed"` | `"formatter_excluded_path"` | `"timeout"` | `"error"`
     - `validate_skipped_reason`: `"unsupported_language"` | `"no_checker_configured"` | `"checker_not_installed"` | `"timeout"` | `"error"`
 
 **Anti-patterns this convention exists to prevent:**
 
-- Returning `success: true` with empty results when the scope (path/glob) didn't resolve to any files — the agent reads it as "all clear" but really nothing was checked. Return `no_files_matched_scope: true` (when the scope was syntactically valid but matched zero files) or `success: false, code: "path_not_found"` (when a passed path doesn't exist).
-- Reusing one skip-reason string for two distinct causes (e.g., `"not_found"` for both "language has no formatter configured" and "configured formatter binary missing"). The agent has different remediations for each — split them.
+- Returning `success: true` with empty results when the scope (path/glob) didn't resolve to any files -- the agent reads it as "all clear" but really nothing was checked. Return `no_files_matched_scope: true` (when the scope was syntactically valid but matched zero files) or `success: false, code: "path_not_found"` (when a passed path doesn't exist).
+- Reusing one skip-reason string for two distinct causes (e.g., `"not_found"` for both "language has no formatter configured" and "configured formatter binary missing"). The agent has different remediations for each -- split them.
 - Silently dropping files that fail to parse / open / decode inside a multi-file or directory operation. Always include a `skipped_files: [{file, reason}]` array so the agent knows X out of Y files were actually processed.
 - Asserting `success: true` after a partial transaction without a `complete: false` flag and a list of pending work.
 
@@ -159,14 +245,20 @@
 
 **Goal:** reduce hoisted-bash output to fewer tokens while keeping the information the agent actually needs (errors, summaries, ref updates) and discarding the noise (progress bars, repeated headers, deep nested directory listings).
 
-**Three-tier dispatch in `crates/aft/src/compress/mod.rs`:**
+**Five-tier dispatch in `crates/aft/src/compress/mod.rs`:**
 
-1. **Rust [`Compressor`] modules** — stateful, hand-written parsers for high-traffic tools where heuristics like JSON parsing or section detection are required. Always wins when matched. Each module lives in its own file under `crates/aft/src/compress/` (e.g. `git.rs`, `cargo.rs`, `eslint.rs`) and implements the `Compressor` trait (`fn matches(&str) -> bool` + `fn compress(&str, &str) -> String`).
-2. **Declarative TOML filters** — strip + truncate + cap + shortcircuit rules for the long tail of CLI tools, loaded from three sources at startup with project > user > builtin priority by filename:
-    - **Builtin**: shipped via `include_str!()` from `crates/aft/src/compress/builtin_filters/*.toml`, registered in `crates/aft/src/compress/builtin_filters.rs::ALL`
+1. **Specific Rust `Compressor` modules** -- hand-written parsers for high-traffic tools identified by tool tokens (e.g. `git`, `cargo`, `vitest`). Always wins when matched. Each module lives in its own file under `crates/aft/src/compress/` (e.g. `git.rs`, `cargo.rs`, `eslint.rs`) and implements the `Compressor` trait (`fn tokens(&[&str]) -> bool` + `fn compress(&str, &str) -> String`). Modules include `biome`, `bun`, `cargo`, `eslint`, `git`, `go`, `mypy`, `next`, `npm`, `playwright`, `pnpm`, `prettier`, `pytest`, `ruff`, `tsc`, `vitest`.
+
+2. **Output-shape `Compressor` sniffers** -- inner-tool parsers that recognize their own private summaries even when invoked through wrappers such as `npm test`, `make test`, or `./scripts/check.sh`. Tried after specific modules, before package-manager modules.
+
+3. **Package-manager `Compressor` modules** -- broad head-token matchers (`npm`, `pnpm`, `bun`) that compress unclaimed package-manager output.
+
+4. **Declarative TOML filters** -- strip + truncate + cap + shortcircuit rules for the long tail of CLI tools, loaded from three sources at startup with project > user > builtin priority by filename:
+    - **Builtin**: shipped via `include_str!()` from `crates/aft/src/compress/builtin_filters/*.toml`, registered in `crates/aft/src/compress/builtin_filters.rs::ALL`. Currently 22 filters: ansible-playbook, aws, curl, deno, df, docker, du, find, gh, gradle, helm, kubectl, ls, make, pip, psql, terraform, tree, uv, wc, wget, xcodebuild.
     - **User**: `<storage_dir>/filters/*.toml` (XDG-aware via the active `storage_dir`)
-    - **Project**: `<project_root>/.aft/filters/*.toml` — gated by [`crate::compress::trust`]; never loaded for an untrusted project
-3. **Generic fallback** — ANSI strip + consecutive-line dedup + middle-truncate. Always applies when no Rust module or TOML filter matches.
+    - **Project**: `<project_root>/.aft/filters/*.toml` -- gated by `crate::compress::trust`; never loaded for an untrusted project
+
+5. **Generic fallback** -- ANSI strip + consecutive-line dedup + middle-truncate. Always applies when no Rust module or TOML filter matches.
 
 **Pipeline for TOML filters** (in `crates/aft/src/compress/toml_filter.rs::apply_filter`):
 
@@ -186,8 +278,8 @@
 
 ## Cross-Cutting Concerns
 
-**Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.
+**Logging:** Write plugin logs through `packages/opencode-plugin/src/logger.ts` or `packages/pi-plugin/src/logger.ts` and Rust logs through `env_logger` in `crates/aft/src/main.rs`.
 
-**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/opencode-plugin/src/downloader.ts`, cache session bridges in `packages/opencode-plugin/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, and cache call-graph state in `crates/aft/src/callgraph.rs`.
+**Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/opencode-plugin/src/downloader.ts`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.

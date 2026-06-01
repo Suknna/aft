@@ -347,12 +347,8 @@ pub(crate) fn resolve_tool_uncached(command: &str, project_root: Option<&Path>) 
         }
     }
 
-    // 2. Try PATH lookup first. This is the fast common path: spawning the
-    // tool with command-specific availability arguments and waiting briefly
-    // for it to exit. When the editor (OpenCode, Pi, etc.) is launched from a
-    // login shell the PATH is usually complete, so this finds Homebrew/cargo/etc.
-    // binaries.
-    if let Some(path) = try_path_lookup(command) {
+    // 2. PATH via `which` + manual walk (mirrors magic-context findOnPath).
+    if let Some(path) = crate::tool_path::resolve_on_path(command) {
         return Some(path);
     }
 
@@ -412,51 +408,6 @@ fn windows_local_node_bin_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<S
     ordered
 }
 
-/// Try spawning the tool via the inherited PATH. Returns the bare command
-/// name on success (downstream `Command::new` re-resolves through PATH),
-/// or None if the spawn fails or the tool exits with non-zero status.
-fn try_path_lookup(command: &str) -> Option<PathBuf> {
-    let probe_args = path_lookup_probe_args(command);
-    let mut child = Command::new(command)
-        .args(probe_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    let timeout = Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Some(PathBuf::from(command))
-                } else {
-                    None
-                };
-            }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
-        }
-    }
-}
-
-fn path_lookup_probe_args(command: &str) -> &'static [&'static str] {
-    match command {
-        // Go uses `go version` rather than a POSIX-style `--version` flag.
-        "go" => &["version"],
-        // `gofmt` has no version flag. It exits successfully with empty stdin,
-        // which is sufficient for PATH availability probing.
-        "gofmt" => &[],
-        _ => &["--version"],
-    }
-}
-
 /// Look up `command` in the well-known install locations that GUI-launched
 /// editors commonly miss from PATH. Returns the absolute path so the caller
 /// invokes the tool via `Command::new(absolute_path)` regardless of PATH.
@@ -484,11 +435,14 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
         return None;
     }
     if cfg!(windows) {
-        // On Windows, check common install locations that GUI-launched editors
-        // may miss from PATH: Go SDK, Cargo, and user-local Go binaries.
-        let candidates =
-            well_known_windows_search_paths(command, std::env::var_os("USERPROFILE").as_deref());
-        return try_well_known_path_lookup_in(&candidates);
+        for dir in crate::tool_path::well_known_windows_bin_dirs(
+            std::env::var_os("USERPROFILE").as_deref(),
+        ) {
+            if let Some(found) = crate::tool_path::probe_tool_in_dir(&dir, command) {
+                return Some(found);
+            }
+        }
+        return None;
     }
     let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
     try_well_known_path_lookup_in(&candidates)
@@ -527,36 +481,6 @@ fn well_known_search_paths(command: &str, home: Option<&std::ffi::OsStr>) -> Vec
 /// 3. `%USERPROFILE%\.cargo\bin\<command>.exe` — `cargo install`
 /// 4. `%USERPROFILE%\go\bin\<command>.exe` — `go install` with default GOPATH
 ///
-/// Each candidate appends `.exe` because Windows executables require the
-/// extension for `std::fs::metadata` to resolve the correct file.
-#[cfg(windows)]
-fn well_known_windows_search_paths(
-    command: &str,
-    userprofile: Option<&std::ffi::OsStr>,
-) -> Vec<PathBuf> {
-    let exe_name = format!("{}.exe", command);
-    let mut candidates: Vec<PathBuf> = Vec::with_capacity(5);
-    // Go SDK installations
-    candidates.push(PathBuf::from(r"C:\Go\bin").join(&exe_name));
-    candidates.push(PathBuf::from(r"C:\Program Files\Go\bin").join(&exe_name));
-    if let Some(up) = userprofile {
-        let up_path = PathBuf::from(up);
-        // Cargo-installed tools (rustfmt, cargo-outdated, etc.)
-        candidates.push(up_path.join(r".cargo\bin").join(&exe_name));
-        // Go-installed tools (gopls, staticcheck, goimports, etc.)
-        candidates.push(up_path.join(r"go\bin").join(&exe_name));
-    }
-    candidates
-}
-
-#[cfg(not(windows))]
-fn well_known_windows_search_paths(
-    _command: &str,
-    _userprofile: Option<&std::ffi::OsStr>,
-) -> Vec<PathBuf> {
-    Vec::new() // dead code on POSIX, included for compile-time completeness
-}
-
 /// Walk a pre-built candidate list, returning the first file that exists and
 /// is executable. Extracted from `try_well_known_path_lookup` so tests can
 /// inject candidates anchored at a tempdir.
@@ -592,6 +516,15 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 /// `NOT_YET_IMPLEMENTED_*` stubs instead of formatted code. We parse the
 /// version from `ruff --version` (format: "ruff X.Y.Z") and require >= 0.1.2.
 /// Falls back to false if ruff is not found or version cannot be parsed.
+/// Whether a tool referenced by configure missing-tool warnings is resolvable.
+pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path>) -> bool {
+    if tool == "ruff" {
+        return resolve_tool_uncached("ruff", project_root).is_some()
+            && ruff_format_available(project_root);
+    }
+    resolve_tool_uncached(tool, project_root).is_some()
+}
+
 fn ruff_format_available(project_root: Option<&Path>) -> bool {
     let key = availability_cache_key("ruff-format", project_root);
     if let Ok(cache) = TOOL_AVAILABILITY_CACHE.lock() {
@@ -1220,13 +1153,13 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "rust-analyzer" => "Install: `rustup component add rust-analyzer`".to_string(),
         "cargo" => "Install Rust from https://rustup.rs/.".to_string(),
         "go" => if cfg!(windows) {
-            "Install Go from https://go.dev/dl/. Common install paths: \
+            "Install Go from https://go.dev/dl/. Common install paths:\
                  C:\\Go\\bin, C:\\Program Files\\Go\\bin. \
                  GUI-launched editors often don't inherit login-shell PATH."
         } else {
-            "Install Go from https://go.dev/dl/, or — if it's already installed — \
-                 ensure its bin directory is on PATH (Homebrew typically uses \
-                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS). \
+            "Install Go from https://go.dev/dl/, or — if it's already installed —\
+                 ensure its bin directory is on PATH (Homebrew typically uses\
+                 /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel macOS).\
                  GUI-launched editors often don't inherit login-shell PATH."
         }
         .to_string(),
@@ -2381,13 +2314,6 @@ mod tests {
     }
 
     #[test]
-    fn path_lookup_probe_args_match_go_tool_conventions() {
-        assert_eq!(path_lookup_probe_args("go"), &["version"]);
-        assert!(path_lookup_probe_args("gofmt").is_empty());
-        assert_eq!(path_lookup_probe_args("rustfmt"), &["--version"]);
-    }
-
-    #[test]
     fn auto_format_unsupported_language() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
@@ -2845,8 +2771,12 @@ mod tests {
         let result = detect_type_checker(&path, LangId::Go, &config);
         if resolve_tool("go", config.project_root.as_deref()).is_some() {
             let (cmd, _args) = result.unwrap();
-            // Could be staticcheck or go vet depending on what's installed
-            assert!(cmd == "go" || cmd == "staticcheck");
+            // Resolved paths may be absolute after PATH / well-known lookup.
+            let name = checker_executable_name(&cmd);
+            assert!(
+                name == "go" || name == "staticcheck",
+                "expected go or staticcheck, got {cmd}"
+            );
         } else {
             assert!(result.is_none());
         }
@@ -3049,10 +2979,30 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn try_well_known_path_lookup_is_noop_on_windows() {
-        // On Windows we deliberately skip POSIX well-known paths; only PATH
-        // lookup applies. The public entry point should always return None.
-        assert!(try_well_known_path_lookup("biome").is_none());
+    fn try_well_known_path_lookup_finds_npm_global_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let npm_bin = dir.path().join("npm");
+        fs::create_dir_all(&npm_bin).unwrap();
+        let shim = npm_bin.join("biome.cmd");
+        fs::write(&shim, "@echo off\n").unwrap();
+
+        let saved_disable = std::env::var_os("AFT_DISABLE_WELL_KNOWN_LOOKUP");
+        std::env::remove_var("AFT_DISABLE_WELL_KNOWN_LOOKUP");
+        let saved_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", dir.path());
+
+        let found = try_well_known_path_lookup("biome");
+
+        if let Some(value) = saved_appdata {
+            std::env::set_var("APPDATA", value);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+        if let Some(value) = saved_disable {
+            std::env::set_var("AFT_DISABLE_WELL_KNOWN_LOOKUP", value);
+        }
+
+        assert_eq!(found.as_deref(), Some(shim.as_path()));
     }
 
     // GitHub issue #47: wording must not claim "but not installed" — the tool

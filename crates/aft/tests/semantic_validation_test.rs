@@ -158,12 +158,15 @@ fn build_rejects_unsupported_embedding_dimensions() {
 
 #[test]
 fn from_bytes_accepts_and_rejects_dimension_boundaries() {
-    let index = SemanticIndex::from_bytes(&build_empty_v6_bytes(4096), Path::new("/"))
+    // Use std::env::temp_dir() for a cross-platform absolute path —
+    // Path::new("/") is not absolute on Windows.
+    let abs_root = std::env::temp_dir();
+    let index = SemanticIndex::from_bytes(&build_empty_v6_bytes(4096), &abs_root)
         .expect("4096 dimensions should deserialize");
     assert_eq!(index.dimension(), 4096);
 
     for dimension in [0u32, 4097] {
-        let error = SemanticIndex::from_bytes(&build_empty_v6_bytes(dimension), Path::new("/"))
+        let error = SemanticIndex::from_bytes(&build_empty_v6_bytes(dimension), &abs_root)
             .expect_err("unsupported dimension should be rejected");
         assert!(
             error.contains(&format!("invalid embedding dimension: {dimension}"))

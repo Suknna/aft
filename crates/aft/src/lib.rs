@@ -85,6 +85,7 @@ pub mod search_index;
 pub mod semantic_index;
 pub mod symbol_cache_disk;
 pub mod symbols;
+pub mod tool_path;
 pub mod url_fetch;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry

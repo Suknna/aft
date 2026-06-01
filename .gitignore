@@ -84,3 +84,6 @@ packages/npm/*/bin/aft.exe
 smoke-tests/
 .aft-windows-vm
 benchmarks/aft-search/.bench/
+
+# Qartez index (local code intelligence cache)
+.qartez/

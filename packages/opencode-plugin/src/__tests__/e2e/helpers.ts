@@ -330,34 +330,57 @@ export function fileResultBySuffix(
   return match;
 }
 
+async function resolveAftBinaryPath(candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    if (await isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function debugBinaryCandidates(): string[] {
+  return [TARGET_DEBUG_BINARY];
+}
+
+function fallbackBinaryCandidates(): string[] {
+  return [FALLBACK_BINARY];
+}
+
 async function prepareBinaryOnce(): Promise<PreparedBinary> {
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const existing = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (existing) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: existing,
       source: "target",
       buildAttempted: false,
     };
   }
 
   const build = await runCargoBuild();
-  if (await isExecutable(TARGET_DEBUG_BINARY)) {
+  const built = await resolveAftBinaryPath(debugBinaryCandidates());
+  if (built) {
     return {
-      binaryPath: TARGET_DEBUG_BINARY,
+      binaryPath: built,
       source: "target",
       buildAttempted: true,
     };
   }
 
-  if (await isExecutable(FALLBACK_BINARY)) {
+  const fallback = await resolveAftBinaryPath(fallbackBinaryCandidates());
+  if (fallback) {
     return {
-      binaryPath: FALLBACK_BINARY,
+      binaryPath: fallback,
       source: "fallback",
       buildAttempted: true,
     };
   }
 
+  const searched = [...debugBinaryCandidates(), ...fallbackBinaryCandidates()]
+    .map((path) => relative(PROJECT_ROOT, path))
+    .join(" or ");
   const skipReason = build.ok
-    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    ? `aft binary not found at ${searched}`
     : `cargo build failed and no fallback aft binary was found\n${build.output}`;
 
   // In CI the aft binary is always built before the Bun suites run, so a missing
@@ -383,7 +406,9 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
 
 async function isExecutable(filePath: string): Promise<boolean> {
   try {
-    await access(filePath, constants.X_OK);
+    // Windows has no Unix execute bit; existence is enough for .exe discovery.
+    const mode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
+    await access(filePath, mode);
     return true;
   } catch {
     return false;

@@ -21,10 +21,24 @@
  */
 
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import type { ConfigureWarningsDelivery } from "./config.js";
 import { warn } from "./logger.js";
 import { type ConfigureWarning, deliverConfigureWarnings } from "./notifications.js";
 
 const pendingEagerWarnings = new Map<string, ConfigureWarning[]>();
+
+type PendingSessionWarnings = {
+  warnings: ConfigureWarning[];
+  client: unknown;
+  bridge: Pick<BinaryBridge, "send">;
+  storageDir: string;
+  pluginVersion: string;
+  projectRoot: string;
+  serverUrl?: string;
+  delivery: ConfigureWarningsDelivery;
+};
+
+const pendingBySession = new Map<string, PendingSessionWarnings>();
 
 function isConfigureWarning(value: unknown): value is ConfigureWarning {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -47,7 +61,13 @@ export function drainPendingEagerWarnings(projectRoot: string): ConfigureWarning
   return pending;
 }
 
-export async function handleConfigureWarningsForSession(context: {
+/** Test-only reset for queued configure warnings. */
+export function __resetConfigureWarningQueuesForTests(): void {
+  pendingEagerWarnings.clear();
+  pendingBySession.clear();
+}
+
+export function enqueueConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
@@ -56,7 +76,9 @@ export async function handleConfigureWarningsForSession(context: {
   fallbackClient: unknown;
   storageDir: string;
   pluginVersion: string;
-}): Promise<void> {
+  serverUrl?: string;
+  delivery?: ConfigureWarningsDelivery;
+}): void {
   const validWarnings = coerceConfigureWarnings(context.warnings);
 
   if (!context.sessionId) {
@@ -69,18 +91,65 @@ export async function handleConfigureWarningsForSession(context: {
     );
     return;
   }
+
   const pendingWarnings = drainPendingEagerWarnings(context.projectRoot);
   const combinedWarnings = [...pendingWarnings, ...validWarnings];
   if (combinedWarnings.length === 0) return;
+
+  const existing = pendingBySession.get(context.sessionId);
+  if (existing) {
+    existing.warnings.push(...combinedWarnings);
+    return;
+  }
+
+  pendingBySession.set(context.sessionId, {
+    warnings: combinedWarnings,
+    client: context.client ?? context.fallbackClient,
+    bridge: context.bridge,
+    storageDir: context.storageDir,
+    pluginVersion: context.pluginVersion,
+    projectRoot: context.projectRoot,
+    serverUrl: context.serverUrl,
+    delivery: context.delivery ?? "toast",
+  });
+}
+
+/** Deliver queued configure warnings after the session goes idle (avoids mid-turn prompt side effects). */
+export async function flushConfigureWarningsOnIdle(sessionId: string): Promise<void> {
+  const pending = pendingBySession.get(sessionId);
+  if (!pending) return;
+  pendingBySession.delete(sessionId);
+
   await deliverConfigureWarnings(
     {
-      client: context.client ?? context.fallbackClient,
-      sessionId: context.sessionId,
-      bridge: context.bridge,
-      storageDir: context.storageDir,
-      pluginVersion: context.pluginVersion,
-      projectRoot: context.projectRoot,
+      client: pending.client,
+      sessionId,
+      bridge: pending.bridge,
+      storageDir: pending.storageDir,
+      pluginVersion: pending.pluginVersion,
+      projectRoot: pending.projectRoot,
+      serverUrl: pending.serverUrl,
+      delivery: pending.delivery,
     },
-    combinedWarnings,
+    pending.warnings,
   );
+}
+
+/** @deprecated Use {@link enqueueConfigureWarningsForSession} + {@link flushConfigureWarningsOnIdle}. */
+export async function handleConfigureWarningsForSession(context: {
+  projectRoot: string;
+  sessionId?: string | null;
+  client?: unknown;
+  bridge: Pick<BinaryBridge, "send">;
+  warnings: unknown[];
+  fallbackClient: unknown;
+  storageDir: string;
+  pluginVersion: string;
+  serverUrl?: string;
+  delivery?: ConfigureWarningsDelivery;
+}): Promise<void> {
+  enqueueConfigureWarningsForSession(context);
+  if (context.sessionId) {
+    await flushConfigureWarningsOnIdle(context.sessionId);
+  }
 }

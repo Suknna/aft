@@ -22,7 +22,8 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
-import { sessionLog } from "./logger.js";
+import type { ConfigureWarningsDelivery } from "./config.js";
+import { sessionLog, warn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 
 // --- TUI toast helper ---
@@ -263,6 +264,7 @@ async function sendIgnoredMessage(
   client: unknown,
   sessionId: string,
   text: string,
+  options?: { includeAgent?: boolean },
 ): Promise<boolean> {
   try {
     const c = client as {
@@ -278,39 +280,28 @@ async function sendIgnoredMessage(
     // on the appended message, and that recorded context becomes the
     // session's active model/agent for the NEXT real turn.
     //
-    // We therefore pin BOTH agent AND model/variant from the previous
-    // assistant turn:
-    //   - `agent`: without it, configure warnings / auto-update / startup
-    //     announcements / status render under the *default* agent rather
-    //     than the agent the user switched to (issue #62).
-    //   - `model`/`variant`: without them, `createUserMessage` resolves the
-    //     agent's DEFAULT model and pins the session to it — so an ignored
-    //     LSP/formatter warning silently switches the user's session model
-    //     and busts the provider prefix cache. Forwarding the previous
-    //     assistant's {providerID, modelID, variant} keeps the recorded
-    //     model identical to what the session was already using, so the
-    //     synthetic message is a true no-op for model state.
-    //
-    // This mirrors the wake-path preservation in bg-notifications.ts. The
-    // older "model-passing crashes the host" concern traced to the
-    // phantom-export bug (fixed by moving helpers out of index.ts) and the
-    // empty-ignored-message prefill issue — not to model fields themselves.
-    const promptContext = await resolvePromptContext(
-      c as Parameters<typeof resolvePromptContext>[0],
-      sessionId,
-    );
+    // Pin agent AND model/variant from the previous assistant turn for
+    // announcements/status (issue #62). Configure warnings pass
+    // `{ includeAgent: false }` to skip all context pinning and avoid
+    // ModelSwitched / AgentSwitched on the first tool turn.
     const body: Record<string, unknown> = {
       noReply: true,
       parts: [{ type: "text", text, ignored: true }],
     };
-    if (promptContext?.agent) body.agent = promptContext.agent;
-    if (promptContext?.model) {
-      body.model = {
-        providerID: promptContext.model.providerID,
-        modelID: promptContext.model.modelID,
-      };
+    if (options?.includeAgent !== false) {
+      const promptContext = await resolvePromptContext(
+        c as Parameters<typeof resolvePromptContext>[0],
+        sessionId,
+      );
+      if (promptContext?.agent) body.agent = promptContext.agent;
+      if (promptContext?.model) {
+        body.model = {
+          providerID: promptContext.model.providerID,
+          modelID: promptContext.model.modelID,
+        };
+      }
+      if (promptContext?.variant) body.variant = promptContext.variant;
     }
-    if (promptContext?.variant) body.variant = promptContext.variant;
 
     const promptInput = {
       path: { id: sessionId },
@@ -332,6 +323,31 @@ async function sendIgnoredMessage(
     );
   }
   return false;
+}
+
+async function showToastViaHttp(
+  serverUrl: string,
+  title: string,
+  message: string,
+  variant: "info" | "warning" | "error" | "success",
+  duration: number,
+): Promise<boolean> {
+  const auth = getServerAuth();
+  const url = `${serverUrl.replace(/\/$/, "")}/tui/show-toast`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+      },
+      body: JSON.stringify({ title, message, variant, duration }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function deleteMessage(
@@ -383,6 +399,8 @@ export interface ConfigureWarningOptions {
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
+  serverUrl?: string;
+  delivery?: ConfigureWarningsDelivery;
 }
 
 /**
@@ -638,7 +656,7 @@ function warningTitle(warning: ConfigureWarning): string {
   }
 }
 
-function formatConfigureWarning(warning: ConfigureWarning): string {
+function formatConfigureWarningLine(warning: ConfigureWarning): string {
   const details: string[] = [];
   if (warning.language) details.push(`language: ${warning.language}`);
   if (warning.server) details.push(`server: ${warning.server}`);
@@ -648,7 +666,43 @@ function formatConfigureWarning(warning: ConfigureWarning): string {
   }
 
   const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-  return `${WARNING_MARKER} ${warningTitle(warning)}${suffix}\n${warning.hint}`;
+  return `• ${warningTitle(warning)}${suffix}\n  ${warning.hint}`;
+}
+
+function formatConfigureWarningChat(warning: ConfigureWarning): string {
+  return `${WARNING_MARKER} ${formatConfigureWarningLine(warning).replace(/^• /, "")}`;
+}
+
+function formatConfigureWarningsBatch(warnings: ConfigureWarning[]): string {
+  return warnings.map(formatConfigureWarningLine).join("\n\n");
+}
+
+async function deliverConfigureWarningBatch(
+  opts: ConfigureWarningOptions,
+  warnings: ConfigureWarning[],
+): Promise<boolean> {
+  if (warnings.length === 0) return false;
+  const delivery = opts.delivery ?? "toast";
+  const message = formatConfigureWarningsBatch(warnings);
+  const title = warnings.length === 1 ? `AFT: ${warningTitle(warnings[0])}` : "AFT: Missing tools";
+  if (delivery === "log") {
+    warn(`[aft-plugin] configure warnings:\n${message}`);
+    sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+    return true;
+  }
+
+  const toastSent = await showTuiToast(opts.client, title, message, "warning", 10_000);
+  if (toastSent) return true;
+
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
+  if (effectiveServerUrl) {
+    const httpToast = await showToastViaHttp(effectiveServerUrl, title, message, "warning", 10_000);
+    if (httpToast) return true;
+  }
+
+  warn(`[aft-plugin] configure warnings (toast unavailable):\n${message}`);
+  sessionLog(opts.sessionId, `[aft-plugin] configure warnings:\n${message}`);
+  return true;
 }
 
 export async function deliverConfigureWarnings(
@@ -663,11 +717,7 @@ export async function deliverConfigureWarnings(
   }
   if (warnings.length === 0) return;
 
-  // `warned_tools` now persists through the bridge DB state API. This loses the
-  // old file-lock read-modify-write mutex, so two same-process concurrent
-  // recordWarning calls could race and drop one key. Configure warnings are
-  // delivered sequentially in normal plugin flow; if this becomes observable,
-  // add a bridge-side atomic update command rather than reviving file locks.
+  const pending: ConfigureWarning[] = [];
   for (const warning of warnings) {
     const key = warningKey(warning, opts.projectRoot);
     const status = await warnedStatus(opts.bridge, key);
@@ -677,15 +727,31 @@ export async function deliverConfigureWarnings(
     //   the warning to re-fire on every session. The next configured call
     //   reads real state and delivers once.
     if (status !== "fresh") continue;
+    pending.push(warning);
+  }
+  if (pending.length === 0) return;
 
-    const delivered = await sendIgnoredMessage(
-      opts.client,
-      opts.sessionId,
-      formatConfigureWarning(warning),
-    );
-    if (!delivered) continue;
+  const delivery = opts.delivery ?? "toast";
+  if (delivery === "chat") {
+    for (const warning of pending) {
+      const ok = await sendIgnoredMessage(
+        opts.client,
+        opts.sessionId,
+        formatConfigureWarningChat(warning),
+        { includeAgent: false },
+      );
+      if (ok) {
+        await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
+      }
+    }
+    return;
+  }
 
-    await recordWarning(opts.bridge, key);
+  const delivered = await deliverConfigureWarningBatch(opts, pending);
+  if (!delivered) return;
+
+  for (const warning of pending) {
+    await recordWarning(opts.bridge, warningKey(warning, opts.projectRoot));
   }
 }
 

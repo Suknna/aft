@@ -99,6 +99,9 @@ All keys are optional. Example:
     "typescript": "biome"
   },
 
+  // Missing formatter/checker/LSP warnings after configure: "toast" (default), "log", or "chat".
+  "configure_warnings_delivery": "toast",
+
   // Semantic backend (when experimental_semantic_search=true).
   // "fastembed" (default, local ONNX) | "openai_compatible" | "ollama"
   "semantic": {

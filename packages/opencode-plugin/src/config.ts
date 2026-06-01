@@ -34,6 +34,10 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
+/** How configure-time missing-tool warnings reach the user. Default: toast (no chat transcript). */
+export const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
+export type ConfigureWarningsDelivery = z.infer<typeof ConfigureWarningsDeliveryEnum>;
+
 const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
 
 const SemanticConfigSchema = z.object({
@@ -216,6 +220,16 @@ export const AftConfigSchema = z
     formatter: z.record(z.string(), FormatterEnum).optional(),
     /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
     checker: z.record(z.string(), CheckerEnum).optional(),
+    /**
+     * How missing formatter/checker/LSP warnings are shown after configure.
+     * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
+     * - `log`: plugin log only
+     * - `chat`: legacy ignored user messages in the session transcript
+     *
+     * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
+     * `checker` instead.
+     */
+    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
     /**
      * Replace opencode's built-in read/write/edit/apply_patch tools with AFT's
      * faster Rust implementations. Adds backup tracking, auto-formatting,
@@ -1146,6 +1160,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "hoist_builtin_tools",
   "format_on_edit",
   "validate_on_edit",
+  "configure_warnings_delivery",
   // Experimental flags: project-settable so users can enable globally
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",

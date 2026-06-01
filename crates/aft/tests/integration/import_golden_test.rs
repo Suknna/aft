@@ -1636,7 +1636,7 @@ fn import_golden_corpus() {
         }
 
         match fs::read_to_string(&golden_path) {
-            Ok(expected) if expected == actual => {}
+            Ok(expected) if expected.replace('\r', "") == actual.replace('\r', "") => {}
             Ok(expected) => drift.push(format!(
                 "\n=== DRIFT: {} ===\n--- expected (golden) ---\n{}\n--- actual ---\n{}",
                 scenario.name, expected, actual

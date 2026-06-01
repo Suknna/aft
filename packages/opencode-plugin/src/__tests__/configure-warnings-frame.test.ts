@@ -1,9 +1,14 @@
 /// <reference path="../bun-test.d.ts" />
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleConfigureWarningsForSession } from "../configure-warnings.js";
+import {
+  __resetConfigureWarningQueuesForTests,
+  enqueueConfigureWarningsForSession,
+  flushConfigureWarningsOnIdle,
+  handleConfigureWarningsForSession,
+} from "../configure-warnings.js";
 
 const tempRoots = new Set<string>();
 
@@ -44,6 +49,7 @@ function baseWarning() {
 }
 
 afterEach(() => {
+  __resetConfigureWarningQueuesForTests();
   for (const root of tempRoots) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -64,6 +70,7 @@ describe("configure_warnings push-frame handler", () => {
       warnings: [baseWarning()],
       storageDir,
       pluginVersion: "1.0.0",
+      delivery: "chat",
     });
 
     expect(messages).toHaveLength(1);
@@ -89,5 +96,29 @@ describe("configure_warnings push-frame handler", () => {
     ).resolves.toBeUndefined();
 
     expect(messages).toHaveLength(0);
+  });
+
+  test("enqueue then idle flush delivers batched toast warnings", async () => {
+    const storageDir = createStorageDir();
+    const showToast = mock(async () => undefined);
+    const client = { tui: { showToast } };
+
+    enqueueConfigureWarningsForSession({
+      projectRoot: "/repo",
+      sessionId: "session-1",
+      client,
+      bridge,
+      warnings: [baseWarning()],
+      fallbackClient: client,
+      storageDir,
+      pluginVersion: "1.0.0",
+      delivery: "toast",
+    });
+    expect(showToast).not.toHaveBeenCalled();
+
+    await flushConfigureWarningsOnIdle("session-1");
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast.mock.calls[0]?.[0]?.body?.duration).toBe(10_000);
   });
 });

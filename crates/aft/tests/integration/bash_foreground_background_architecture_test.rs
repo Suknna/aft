@@ -76,6 +76,29 @@ fn wait_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+/// `bash_status` can report `completed` before `bash_drain_completions` exposes the
+/// frame (macOS CI flake). Poll drain until the promoted task appears.
+fn wait_terminal_with_drain_completion(aft: &mut AftProcess, task_id: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let _terminal = wait_terminal(aft, task_id);
+        let drained = drain(aft);
+        assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+        let completions = drained["bg_completions"].as_array().unwrap();
+        if completions
+            .iter()
+            .any(|completion| completion["task_id"].as_str() == Some(task_id))
+        {
+            return drained;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for drain completion for {task_id}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn foreground_bash_returns_immediately_and_does_not_block_dispatch_loop() {
     let project = tempfile::tempdir().unwrap();
@@ -182,8 +205,7 @@ fn bash_promote_reenables_completion_delivery() {
         .to_string(),
     );
     assert_eq!(promoted["success"], true, "promote failed: {promoted:?}");
-    let _ = wait_terminal(&mut aft, task_id);
-    let drained = drain(&mut aft);
+    let drained = wait_terminal_with_drain_completion(&mut aft, task_id);
     let completions = drained["bg_completions"].as_array().unwrap();
     assert_eq!(completions.len(), 1, "drained: {drained:?}");
     assert_eq!(completions[0]["task_id"], task_id);

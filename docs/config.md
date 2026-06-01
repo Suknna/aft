@@ -50,6 +50,14 @@ The schema is identical across harnesses. Only file location differs.
     "typescript": "biome"
   },
 
+  // How missing formatter/checker/LSP warnings appear after configure.
+  // Default: "toast" — 10s TUI/HTTP toast, no session chat pollution.
+  // "log" — plugin log only. "chat" — legacy ignored messages in the transcript.
+  // Formatter warnings run only when format_on_edit is true or formatter.<lang> is set.
+  // Checker warnings run only when validate_on_edit is "syntax"/"full" or checker.<lang> is set.
+  // (There is no top-level "formatters" key — use format_on_edit / formatter / checker.)
+  "configure_warnings_delivery": "toast",
+
   // Tool surface level: "minimal" | "recommended" (default) | "all"
   // minimal:     aft_outline, aft_zoom, aft_safety only (no hoisting)
   // recommended: minimal + hoisted tools (read/write/edit/apply_patch/bash)

@@ -32,6 +32,9 @@ export type Checker =
   | "staticcheck"
   | "none";
 
+/** How configure-time missing-tool warnings are delivered (OpenCode plugin). */
+export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
+
 export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
 
 export interface SemanticConfig {
@@ -151,6 +154,8 @@ export interface AftConfig {
   validate_on_edit?: "syntax" | "full";
   formatter?: Record<string, Formatter>;
   checker?: Record<string, Checker>;
+  /** Configure-time missing-tool warning delivery. Default: toast. */
+  configure_warnings_delivery?: ConfigureWarningsDelivery;
   tool_surface?: ToolSurface;
   disabled_tools?: string[];
   restrict_to_project_root?: boolean;
@@ -321,6 +326,8 @@ const CheckerEnum = z.enum([
   "none",
 ]);
 
+const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
+
 const SemanticConfigSchema = z.object({
   backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
   model: z.string().trim().min(1).optional(),
@@ -454,6 +461,7 @@ export const AftConfigSchema = z
     validate_on_edit: z.enum(["syntax", "full"]).optional(),
     formatter: z.record(z.string(), FormatterEnum).optional(),
     checker: z.record(z.string(), CheckerEnum).optional(),
+    configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
     tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
     disabled_tools: z.array(z.string()).optional(),
     restrict_to_project_root: z.boolean().optional(),
@@ -1023,6 +1031,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // (Pi schema does not currently expose `hoist_builtin_tools`; if added, mark safe.)
   "format_on_edit",
   "validate_on_edit",
+  "configure_warnings_delivery",
   // Experimental flags: project-settable so users can enable globally
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",

@@ -261,16 +261,17 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
         .expect("make source parent undeletable");
 
     let mut aft = AftProcess::spawn();
-    configure(&mut aft, Path::new("/"));
+    configure(&mut aft, src_tmp.path());
 
-    let resp = send(
-        &mut aft,
-        json!({
+    let resp = aft.send_with_timeout(
+        &json!({
             "id": "move-partial-delete",
             "command": "move_file",
             "file": src_path.display().to_string(),
             "destination": dst_path.display().to_string(),
-        }),
+        })
+        .to_string(),
+        std::time::Duration::from_secs(120),
     );
 
     std::fs::set_permissions(src_parent, std::fs::Permissions::from_mode(original_mode))

@@ -5,16 +5,28 @@
 ```text
 opencode-aft/
 ├── crates/                    # Rust workspace packages
-│   └── aft/                   # Core AFT library, CLI binary, command handlers, and integration tests
+│   ├── aft/                   # Core AFT library, CLI binary, command handlers, and tests
+│   └── aft-tokenizer/         # Tokenizer library for Claude API token counting
 ├── packages/                  # JavaScript workspace packages
-│   ├── opencode-plugin/       # OpenCode plugin that exposes and hoists AFT tools
+│   ├── aft-bridge/            # Shared transport, binary resolution, ONNX runtime helpers
+│   ├── aft-cli/               # Unified CLI (setup, doctor, LSP management)
+│   ├── opencode-plugin/       # OpenCode plugin (@cortexkit/aft-opencode)
+│   ├── pi-plugin/             # Pi coding-agent plugin (@cortexkit/aft-pi)
 │   └── npm/                   # Platform-specific npm binary packages
-├── benchmarks/                # Bun-based benchmark runner and reporting code
-├── scripts/                   # Release and version-management scripts
-├── assets/                    # Repository assets such as the banner image
-├── .github/workflows/         # Release automation workflows
+├── tests/                     # Cross-platform test infrastructure
+│   ├── docker/                # Docker-based end-to-end tests (Linux)
+│   ├── macos-e2e/             # macOS end-to-end tests
+│   ├── pi-rpc/                # Pi RPC protocol tests
+│   └── windows-e2e/           # Windows end-to-end tests
+├── benchmarks/                # Performance benchmarks (search, compression, retrieval)
+├── scripts/                   # Release, validation, and version-management scripts
+├── docs/                      # User-facing documentation
+├── assets/                    # Repository assets (banner image, etc.)
+├── .github/workflows/         # CI and release automation workflows
 ├── Cargo.toml                 # Rust workspace manifest
 ├── package.json               # JavaScript workspace manifest
+├── ARCHITECTURE.md            # Architecture documentation
+├── STRUCTURE.md               # This file
 └── README.md                  # User-facing product and tool reference
 ```
 
@@ -22,79 +34,149 @@ opencode-aft/
 
 **`crates/aft/`:**
 - Purpose: Keep the Rust execution engine, stdin/stdout protocol binary, and shared analysis logic together.
-- Contains: `src/` Rust modules, `tests/` integration suites, crate manifest
-- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/commands/`, `crates/aft/tests/integration/`
+- Contains: `src/` Rust modules, `tests/` integration suites, `tests/fixtures/` test fixtures, `tests/helpers/` test utilities, `tests/lsp/` LSP integration tests
+- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/bash_background/`, `crates/aft/tests/integration/`
+
+**`crates/aft-tokenizer/`:**
+- Purpose: Ship a standalone tokenizer for Claude API token counting.
+- Contains: `src/` Rust source, `benches/` benchmarks, `tests/` tests, `examples/`
+- Key files: `crates/aft-tokenizer/src/lib.rs`, `crates/aft-tokenizer/src/claude.rs`
 
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
-- Contains: Command-specific request parsing and response generation
-- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/conflicts.rs`
+- Contains: ~60 command-specific request parsing and response generation modules
+- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
+
+**`crates/aft/src/compress/`:**
+- Purpose: Provide tiered output compression for hoisted bash commands.
+- Contains: Rust `Compressor` modules per tool (git, cargo, eslint, etc.), declarative TOML filter pipeline, trust model for project filters, builtin filter definitions (22 .toml files)
+- Key files: `crates/aft/src/compress/mod.rs`, `crates/aft/src/compress/git.rs`, `crates/aft/src/compress/toml_filter.rs`, `crates/aft/src/compress/trust.rs`, `crates/aft/src/compress/builtin_filters.rs`
+
+**`crates/aft/src/imports/`:**
+- Purpose: Host per-language import engines for `aft_import` commands.
+- Contains: Language-specific import parsing, add, remove, and organize logic
+- Key files: `crates/aft/src/imports/mod.rs`, `crates/aft/src/imports/java.rs`, `crates/aft/src/imports/csharp.rs`, `crates/aft/src/imports/php.rs`, `crates/aft/src/imports/kotlin.rs`, `crates/aft/src/imports/scala.rs`, `crates/aft/src/imports/swift.rs`, `crates/aft/src/imports/ruby.rs`, `crates/aft/src/imports/lua.rs`, `crates/aft/src/imports/c.rs`, `crates/aft/src/imports/perl.rs`
+
+**`crates/aft/src/inspect/`:**
+- Purpose: Provide codebase-health scanning (dead code, unused exports, duplicates, metrics, TODOs, LSP diagnostics).
+- Contains: Scanner modules for each inspection category
+- Key files: `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`, `crates/aft/src/inspect/scanners/metrics.rs`, `crates/aft/src/inspect/scanners/todos.rs`
 
 **`crates/aft/src/lsp/`:**
 - Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
 - Contains: LSP lifecycle modules and supporting types
 - Key files: `crates/aft/src/lsp/manager.rs`, `crates/aft/src/lsp/client.rs`, `crates/aft/src/lsp/diagnostics.rs`
 
+**`crates/aft/src/bash_background/`:**
+- Purpose: Manage background bash tasks, PTY sessions, and output compression.
+- Contains: Process pool, PTY runtime, watchdog thread, persistence, buffer management
+- Key files: `crates/aft/src/bash_background/registry.rs`, `crates/aft/src/bash_background/process.rs`, `crates/aft/src/bash_background/pty_process.rs`, `crates/aft/src/bash_background/watchdog.rs`
+
+**`crates/aft/src/db/`:**
+- Purpose: Provide persistent SQLite-backed storage for backups, bash tasks, compression events, and state.
+- Contains: Database modules for each storage domain
+- Key files: `crates/aft/src/db/mod.rs`, `crates/aft/src/db/backups.rs`, `crates/aft/src/db/bash_tasks.rs`, `crates/aft/src/db/compression_events.rs`, `crates/aft/src/db/state.rs`
+
+**`packages/aft-bridge/`:**
+- Purpose: Ship the shared bridge transport layer used by both OpenCode and Pi plugins.
+- Contains: Bridge lifecycle management, binary resolution, download, ONNX runtime detection, storage migration, compact formatting, zoom-format rendering
+- Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`
+
+**`packages/aft-cli/`:**
+- Purpose: Provide a unified `npx @cortexkit/aft` CLI entry point for setup, doctor, and LSP management across all harnesses.
+- Contains: CLI command modules, harness adapter auto-detection (OpenCode/Pi)
+- Key files: `packages/aft-cli/src/index.ts`, `packages/aft-cli/src/commands/setup.ts`, `packages/aft-cli/src/commands/doctor.ts`, `packages/aft-cli/src/commands/lsp.ts`, `packages/aft-cli/src/adapters/`
+
 **`packages/opencode-plugin/`:**
 - Purpose: Ship the OpenCode-facing package that resolves the binary and registers tools.
-- Contains: `src/` TypeScript sources, `dist/` build output, tests, package manifest
-- Key files: `packages/opencode-plugin/src/index.ts`, `packages/opencode-plugin/src/bridge.ts`, `packages/opencode-plugin/package.json`
+- Contains: `src/` TypeScript sources, `src/tools/` tool definitions, `src/shared/` shared utilities, `src/hooks/` lifecycle hooks, `src/tui/` TUI plugin, `__tests__/` unit and e2e tests, package manifest
+- Key files: `packages/opencode-plugin/src/index.ts`, `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/package.json`
 
 **`packages/opencode-plugin/src/tools/`:**
 - Purpose: Group OpenCode tool definitions by capability area.
-- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, AST, LSP, and conflict tools
-- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`
+- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, LSP, search, semantic, and inspect tools; permissions and internals helpers
+- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`
 
-**`packages/opencode-plugin/src/__tests__/`:**
-- Purpose: Verify plugin behavior, resolver logic, tool registration, and end-to-end bridge flows.
-- Contains: Unit tests and `e2e/` test fixtures
-- Key files: `packages/opencode-plugin/src/__tests__/tools.test.ts`, `packages/opencode-plugin/src/__tests__/structure.test.ts`, `packages/opencode-plugin/src/__tests__/e2e/`
+**`packages/pi-plugin/`:**
+- Purpose: Ship the Pi coding-agent facing package that resolves the binary and registers tools.
+- Contains: `src/` TypeScript sources, `src/tools/` tool definitions, `src/commands/` Pi-specific commands, `src/dialogs/` Pi dialog handlers, `src/shared/` shared utilities, `__tests__/` unit and e2e tests
+- Key files: `packages/pi-plugin/src/index.ts`, `packages/pi-plugin/src/config.ts`, `packages/pi-plugin/src/types.ts`, `packages/pi-p
+lugin/src/tools/hoisted.ts`
+
+**`packages/pi-plugin/src/tools/`:**
+- Purpose: Group Pi tool definitions by capability area.
+- Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, semantic, and inspect tools; render helpers, diff-format helper
+- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/fs.ts`
 
 **`packages/npm/`:**
 - Purpose: Publish one npm package per target platform so the plugin can resolve a bundled binary.
 - Contains: Per-platform package manifests and `bin/` payload directories
-- Key files: `packages/npm/darwin-arm64/package.json`, `packages/npm/linux-x64/package.json`, `packages/npm/win32-x64/package.json`
+- Key files: `packages/npm/darwin-arm64/package.json`, `packages/npm/darwin-x64/package.json`, `packages/npm/linux-arm64/package.json`, `packages/npm/linux-x64/package.json`, `packages/npm/win32-arm64/package.json`, `packages/npm/win32-x64/package.json`
 
 **`benchmarks/`:**
-- Purpose: Run benchmark scenarios and post-process benchmark output with Bun.
-- Contains: Benchmark source files, configs, cached results, package manifest
-- Key files: `benchmarks/src/runner.ts`, `benchmarks/src/analyze.ts`, `benchmarks/package.json`
+- Purpose: Run benchmark scenarios for search, compression, and retrieval performance.
+- Contains: Benchmark source files, configs, cached results, corpora data, package manifests
+- Key subdirectories: `benchmarks/src/`, `benchmarks/aft-search/`, `benchmarks/codegraph-replication/`, `benchmarks/codegraph-vs-aft-agent/`, `benchmarks/codegraph-vs-aft-retrieval/`, `benchmarks/compression-tokens/`
 
 **`scripts/`:**
 - Purpose: Automate release, validation, and version synchronization tasks.
-- Contains: Shell and Node scripts
-- Key files: `scripts/release.sh`, `scripts/version-sync.mjs`, `scripts/validate-packages.mjs`
+- Contains: Shell and Node scripts, Windows VM helpers
+- Key files: `scripts/release.sh`, `scripts/version-sync.mjs`, `scripts/validate-packages.mjs`, `scripts/windows-vm/`
+
+**`tests/`:**
+- Purpose: Host cross-platform end-to-end test suites.
+- Contains: Docker-based Linux e2e tests, macOS e2e tests, Pi RPC protocol tests, Windows e2e tests
+- Key files: `tests/docker/fixtures/`, `tests/macos-e2e/`, `tests/pi-rpc/`, `tests/windows-e2e/`
+
+**`crates/aft/tests/`:**
+- Purpose: Host Rust integration tests and test infrastructure.
+- Contains: `integration/` test suites, `fixtures/` test data (callgraph, extract_function, inline_symbol, move_symbol), `helpers/` test utilities, `lsp/` LSP-specific tests, top-level test files (semantic, compress)
+- Key files: `crates/aft/tests/integration/`, `crates/aft/tests/fixtures/`, `crates/aft/tests/semantic_test.rs`
 
 ## Key File Locations
 
-**Entry Points:** `packages/opencode-plugin/src/index.ts`: Register plugin tools and bridge configuration; `crates/aft/src/main.rs`: Start the Rust request loop; `.github/workflows/release.yml`: Drive tagged release publishing.
+**Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `.github/workflows/release.yml` -- drive tagged release publishing.
 
-**Configuration:** `package.json`: Define Bun workspace scripts; `Cargo.toml`: Define the Rust workspace; `packages/opencode-plugin/src/config.ts`: Parse user and project AFT config.
+**Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.).
 
-**Core Logic:** `crates/aft/src/parser.rs`: Extract symbols and languages; `crates/aft/src/callgraph.rs`: Build navigation indexes; `crates/aft/src/edit.rs`: Run shared edit and diff logic; `packages/opencode-plugin/src/bridge.ts`: Manage subprocess transport.
+**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
-**Tests:** `packages/opencode-plugin/src/__tests__/`: Plugin unit and e2e tests; `crates/aft/tests/integration/`: Rust integration tests.
+**Tests:** `packages/opencode-plugin/src/__tests__/` -- plugin unit and e2e tests; `packages/pi-plugin/src/__tests__/` -- Pi plugin unit and e2e tests; `packages/aft-cli/src/__tests__/` -- CLI command tests; `packages/aft-bridge/src/__tests__/` -- bridge transport tests; `crates/aft/tests/integration/` -- Rust integration tests; `crates/aft/tests/semantic_test.rs` -- semantic index tests; `tests/docker/` -- Docker e2e; `tests/macos-e2e/` -- macOS e2e; `tests/windows-e2e/` -- Windows e2e; `tests/pi-rpc/` -- Pi RPC tests.
 
 ## Naming Conventions
 
 **Files:** Use capability-oriented filenames. Put Rust command handlers in snake_case files such as `crates/aft/src/commands/move_symbol.rs`. Put TypeScript tool groups in concise nouns such as `packages/opencode-plugin/src/tools/navigation.ts`. Use `.test.ts` for plugin tests and `_test.rs` for Rust tests.
 
-**Directories:** Use lower-case descriptive directories. Group related runtime code under `packages/opencode-plugin/src/tools/`, `crates/aft/src/commands/`, and `crates/aft/src/lsp/`.
+**Directories:** Use lower-case descriptive directories. Group related runtime code under `packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`, `crates/aft/src/commands/`, `crates/aft/src/lsp/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, and `crates/aft/src/inspect/`.
 
 ## Where to Add New Code
 
-**New hoisted OpenCode file tool:** `packages/opencode-plugin/src/tools/hoisted.ts` — register the tool and map it onto a Rust command.
+**New hoisted OpenCode file tool:** `packages/opencode-plugin/src/tools/hoisted.ts` -- register the tool and map it onto a Rust command.
 
-**New plugin tool group:** `packages/opencode-plugin/src/tools/[capability].ts` — export a `Record<string, ToolDefinition>` and wire it into `packages/opencode-plugin/src/index.ts`.
+**New plugin tool group (OpenCode):** `packages/opencode-plugin/src/tools/[capability].ts` -- export a `Record<string, ToolDefinition>` and wire it into `packages/opencode-plugin/src/index.ts`.
 
-**New Rust command handler:** `crates/aft/src/commands/[command_name].rs` — expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
+**New plugin tool group (Pi):** `packages/pi-plugin/src/tools/[capability].ts` -- export Pi tool definitions and wire them into `packages/pi-plugin/src/index.ts`.
 
-**New shared Rust engine code:** `crates/aft/src/[domain].rs` — keep reusable parser, formatter, import, or analysis logic outside command handlers.
+**New shared bridge export:** `packages/aft-bridge/src/[module].ts` -- add shared transport, resolution, or formatting logic, then export from `packages/aft-bridge/src/index.ts`.
 
-**New LSP behavior:** `crates/aft/src/lsp/[module].rs` — keep transport and server-management code inside the LSP subsystem.
+**New CLI command:** `packages/aft-cli/src/commands/[command].ts` -- add command handler and wire it into `packages/aft-cli/src/index.ts`.
 
-**New platform binary package:** `packages/npm/[platform-key]/` — add `package.json` and ship the platform binary in `bin/`.
+**New Rust command handler:** `crates/aft/src/commands/[command_name].rs` -- expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
 
-**New plugin tests:** `packages/opencode-plugin/src/__tests__/` or `packages/opencode-plugin/src/__tests__/e2e/` — follow the existing `*.test.ts` naming.
+**New shared Rust engine code:** `crates/aft/src/[domain].rs` -- keep reusable parser, formatter, import, search, or analysis logic outside command handlers.
 
-**New Rust integration tests:** `crates/aft/tests/integration/` — follow the existing `*_test.rs` naming.
+**New import language engine:** `crates/aft/src/imports/[language].rs` -- implement the `ImportSyntax` trait and register it in `crates/aft/src/imports/mod.rs`.
+
+**New compression module:** `crates/aft/src/compress/[tool].rs` -- implement the `Compressor` trait and register it in `crates/aft/src/compress/mod.rs`.
+
+**New inspection scanner:** `crates/aft/src/inspect/scanners/[scan].rs` -- add the scanner and register it in `crates/aft/src/inspect/scanners/mod.rs`.
+
+**New LSP behavior:** `crates/aft/src/lsp/[module].rs` -- keep transport and server-management code inside the LSP subsystem.
+
+**New platform binary package:** `packages/npm/[platform-key]/` -- add `package.json` and ship the platform binary in `bin/`.
+
+**New plugin tests:** `packages/opencode-plugin/src/__tests__/` or `packages/pi-plugin/src/__tests__/` -- follow the existing `*.test.ts` naming.
+
+**New Rust integration tests:** `crates/aft/tests/integration/` -- follow the existing `*_test.rs` naming.
+
+**New benchmark:** `benchmarks/[name]/` -- create a benchmark directory with `src/`, `corpora/`, `results/`, and `scripts/` subdirectories.

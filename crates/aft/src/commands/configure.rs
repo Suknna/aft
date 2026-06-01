@@ -939,49 +939,18 @@ fn resolve_tool_cached(
         return *is_available;
     }
 
-    let is_available = resolve_tool_uncached(tool, project_root);
+    let is_available = crate::format::tool_available_for_missing_warning(tool, project_root);
     cache.insert(tool.to_string(), is_available);
     is_available
 }
 
-fn resolve_tool_uncached(tool: &str, project_root: Option<&Path>) -> bool {
-    if tool == "ruff" {
-        return ruff_format_available(project_root);
-    }
-
-    crate::format::resolve_tool_uncached(tool, project_root).is_some()
+fn should_warn_missing_formatters(config: &crate::config::Config, lang: LangId) -> bool {
+    config.format_on_edit || config.formatter.contains_key(lang_key(lang))
 }
 
-fn ruff_format_available(project_root: Option<&Path>) -> bool {
-    let command = match crate::format::resolve_tool_uncached("ruff", project_root) {
-        Some(command) => command,
-        None => return false,
-    };
-
-    let output = match std::process::Command::new(command)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-
-    let version = String::from_utf8_lossy(&output.stdout);
-    let version = version
-        .trim()
-        .strip_prefix("ruff ")
-        .unwrap_or(version.trim());
-    let parts = version
-        .split('.')
-        .take(3)
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>();
-    match parts.as_deref() {
-        Ok([major, minor, patch]) => (*major, *minor, *patch) >= (0, 1, 2),
-        _ => false,
-    }
+fn should_warn_missing_checkers(config: &crate::config::Config, lang: LangId) -> bool {
+    let mode = config.validate_on_edit.as_deref().unwrap_or("off");
+    (mode == "syntax" || mode == "full") || config.checker.contains_key(lang_key(lang))
 }
 
 fn missing_tool_warning(
@@ -1023,38 +992,42 @@ fn detect_missing_tools_for_languages(
     for &lang in languages {
         let language = lang_key(lang);
 
-        for candidate in formatter_candidates(lang, config) {
-            if let Some(warning) = missing_tool_warning(
-                "formatter_not_installed",
-                language,
-                &candidate,
-                config.project_root.as_deref(),
-                &mut tool_cache,
-            ) {
-                if seen.insert((
-                    warning.kind.clone(),
-                    warning.language.clone(),
-                    warning.tool.clone(),
-                )) {
-                    warnings.push(warning);
+        if should_warn_missing_formatters(config, lang) {
+            for candidate in formatter_candidates(lang, config) {
+                if let Some(warning) = missing_tool_warning(
+                    "formatter_not_installed",
+                    language,
+                    &candidate,
+                    config.project_root.as_deref(),
+                    &mut tool_cache,
+                ) {
+                    if seen.insert((
+                        warning.kind.clone(),
+                        warning.language.clone(),
+                        warning.tool.clone(),
+                    )) {
+                        warnings.push(warning);
+                    }
                 }
             }
         }
 
-        for candidate in checker_candidates(lang, config) {
-            if let Some(warning) = missing_tool_warning(
-                "checker_not_installed",
-                language,
-                &candidate,
-                config.project_root.as_deref(),
-                &mut tool_cache,
-            ) {
-                if seen.insert((
-                    warning.kind.clone(),
-                    warning.language.clone(),
-                    warning.tool.clone(),
-                )) {
-                    warnings.push(warning);
+        if should_warn_missing_checkers(config, lang) {
+            for candidate in checker_candidates(lang, config) {
+                if let Some(warning) = missing_tool_warning(
+                    "checker_not_installed",
+                    language,
+                    &candidate,
+                    config.project_root.as_deref(),
+                    &mut tool_cache,
+                ) {
+                    if seen.insert((
+                        warning.kind.clone(),
+                        warning.language.clone(),
+                        warning.tool.clone(),
+                    )) {
+                        warnings.push(warning);
+                    }
                 }
             }
         }
@@ -2468,6 +2441,40 @@ mod tests {
         assert_eq!(warning.kind, "formatter_not_installed");
         assert_eq!(warning.language, "typescript");
         assert_eq!(warning.tool, "oxfmt");
+    }
+
+    #[test]
+    fn detect_missing_tools_skips_formatters_when_format_on_edit_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("biome.json"), "{}\n").unwrap();
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            format_on_edit: false,
+            ..Config::default()
+        };
+        let languages = std::collections::HashSet::from([crate::parser::LangId::TypeScript]);
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+        assert!(
+            warnings.is_empty(),
+            "format_on_edit:false should suppress derived formatter warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missing_tools_still_warns_explicit_formatter_when_format_on_edit_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            format_on_edit: false,
+            ..Config::default()
+        };
+        config
+            .formatter
+            .insert("typescript".to_string(), "biome".to_string());
+        let languages = std::collections::HashSet::from([crate::parser::LangId::TypeScript]);
+        let warnings = super::detect_missing_tools_for_languages(&languages, &config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].tool, "biome");
     }
 
     #[test]

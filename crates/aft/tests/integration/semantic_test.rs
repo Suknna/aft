@@ -315,7 +315,6 @@ fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
     let status = aft.shutdown();
     assert!(status.success());
 }
-
 #[test]
 fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
@@ -350,7 +349,6 @@ fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
     let status = aft.shutdown();
     assert!(status.success());
 }
-
 #[test]
 fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidation() {
     let project = setup_project(&[
@@ -432,7 +430,7 @@ fn semantic_search_stays_queryable_while_file_refreshes_after_watcher_invalidati
             result["source"] == "semantic"
                 && result["file"]
                     .as_str()
-                    .is_some_and(|file| file.ends_with("src/a.rs"))
+                    .is_some_and(|file| file.replace('\\', "/").ends_with("src/a.rs"))
         }),
         "expected semantic result from unchanged file, got {results:?}"
     );

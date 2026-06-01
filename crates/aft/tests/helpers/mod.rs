@@ -143,6 +143,14 @@ impl AftProcess {
 
     /// Send a raw line and read back the JSON response.
     pub fn send(&mut self, request: &str) -> serde_json::Value {
+        self.send_with_timeout(request, DEFAULT_RESPONSE_TIMEOUT)
+    }
+
+    pub fn send_with_timeout(
+        &mut self,
+        request: &str,
+        timeout: Duration,
+    ) -> serde_json::Value {
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
@@ -151,7 +159,7 @@ impl AftProcess {
             .ok()
             .and_then(|value| value["id"].as_str().map(str::to_string));
         loop {
-            let value = self.read_json_line();
+            let value = self.read_json_line_timeout(timeout, "response line");
             if value.get("type").is_some() && value.get("id").is_none() {
                 self.pending_frames.push_back(value);
                 continue;

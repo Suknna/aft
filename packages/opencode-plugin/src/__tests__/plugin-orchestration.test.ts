@@ -5,7 +5,10 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { handleConfigureWarningsForSession } from "../configure-warnings.js";
+import {
+  enqueueConfigureWarningsForSession,
+  flushConfigureWarningsOnIdle,
+} from "../configure-warnings.js";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 
@@ -18,7 +21,7 @@ const bridge = {
 };
 
 describe("Lane G plugin orchestration regressions", () => {
-  test("eager configure warnings buffer and flush exactly once on first session-bound call", async () => {
+  test("eager configure warnings buffer until session idle flush", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-eager-warnings-"));
     const messages: string[] = [];
     const client = {
@@ -34,17 +37,18 @@ describe("Lane G plugin orchestration regressions", () => {
       hint: "Install biome.",
     };
     try {
-      await handleConfigureWarningsForSession({
+      enqueueConfigureWarningsForSession({
         projectRoot: "/repo-eager",
         warnings: [warning],
         bridge,
         fallbackClient: client,
         storageDir: root,
         pluginVersion: "1.0.0",
+        delivery: "chat",
       });
       expect(messages).toHaveLength(0);
 
-      await handleConfigureWarningsForSession({
+      enqueueConfigureWarningsForSession({
         projectRoot: "/repo-eager",
         sessionId: "session-1",
         client,
@@ -53,17 +57,11 @@ describe("Lane G plugin orchestration regressions", () => {
         fallbackClient: client,
         storageDir: root,
         pluginVersion: "1.0.0",
+        delivery: "chat",
       });
-      await handleConfigureWarningsForSession({
-        projectRoot: "/repo-eager",
-        sessionId: "session-1",
-        client,
-        bridge,
-        warnings: [],
-        fallbackClient: client,
-        storageDir: root,
-        pluginVersion: "1.0.0",
-      });
+      expect(messages).toHaveLength(0);
+
+      await flushConfigureWarningsOnIdle("session-1");
 
       expect(messages).toHaveLength(1);
       expect(messages[0]).toContain("Formatter is not installed");

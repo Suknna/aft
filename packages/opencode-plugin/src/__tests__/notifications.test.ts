@@ -174,116 +174,98 @@ describe("Desktop notification session routing", () => {
   });
 });
 
-describe("deliverConfigureWarnings", () => {
-  test("first-time warning delivers via sendIgnoredMessage", async () => {
-    const storageDir = createStorageDir();
-    const { client, messages } = createClient();
-    const { bridge, send } = createStateBridge();
+function createToastClient() {
+  const showToast = mock(async () => undefined);
+  return {
+    client: { tui: { showToast } },
+    showToast,
+  };
+}
 
-    await deliverConfigureWarnings(
-      {
-        client,
-        sessionId: "session-1",
-        bridge,
-        storageDir,
-        pluginVersion: "1.0.0",
-        projectRoot: "/repo",
-      },
-      [baseWarning()],
-    );
-
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain("🔧 AFT: ⚠️");
-    expect(messages[0]).toContain("Formatter is not installed");
-    expect(messages[0]).toContain("Install biome");
-    expect(dbSetCalls(send)).toHaveLength(1);
-  });
-
-  test("second call with same warning skips delivery", async () => {
-    const storageDir = createStorageDir();
-    const { client, messages } = createClient();
-    const { bridge } = createStateBridge();
-    const opts = {
-      client,
+function createConfigureDeliveryOpts(
+  storageDir: string,
+  bridge: Pick<BinaryBridge, "send">,
+  delivery: "toast" | "log" | "chat" = "toast",
+) {
+  const toast = createToastClient();
+  const chat = createClient();
+  return {
+    opts: {
+      client: delivery === "chat" ? chat.client : toast.client,
       sessionId: "session-1",
       bridge,
       storageDir,
       pluginVersion: "1.0.0",
       projectRoot: "/repo",
-    };
+      delivery,
+    },
+    showToast: toast.showToast,
+    messages: chat.messages,
+  };
+}
+
+describe("deliverConfigureWarnings", () => {
+  test("first-time warning delivers via TUI toast by default", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    const { opts, showToast } = createConfigureDeliveryOpts(storageDir, bridge);
 
     await deliverConfigureWarnings(opts, [baseWarning()]);
-    await deliverConfigureWarnings(opts, [baseWarning()]);
 
-    expect(messages).toHaveLength(1);
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast.mock.calls[0]?.[0]?.body?.message).toContain("Formatter is not installed");
+    expect(showToast.mock.calls[0]?.[0]?.body?.duration).toBe(10_000);
+    expect(dbSetCalls(send)).toHaveLength(1);
   });
 
-  test("different warnings deliver independently", async () => {
+  test("second call with same warning skips delivery", async () => {
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
     const { bridge } = createStateBridge();
+    const { opts, showToast } = createConfigureDeliveryOpts(storageDir, bridge);
 
-    await deliverConfigureWarnings(
-      {
-        client,
-        sessionId: "session-1",
-        bridge,
-        storageDir,
-        pluginVersion: "1.0.0",
-        projectRoot: "/repo",
-      },
-      [
-        baseWarning(),
-        baseWarning({ kind: "checker_not_installed", tool: "tsc", hint: "Install typescript." }),
-      ],
-    );
+    await deliverConfigureWarnings(opts, [baseWarning()]);
+    await deliverConfigureWarnings(opts, [baseWarning()]);
 
-    expect(messages).toHaveLength(2);
-    expect(messages[0]).toContain("Formatter is not installed");
-    expect(messages[1]).toContain("Checker is not installed");
+    expect(showToast).toHaveBeenCalledTimes(1);
+  });
+
+  test("different warnings batch into one toast", async () => {
+    const storageDir = createStorageDir();
+    const { bridge } = createStateBridge();
+    const { opts, showToast } = createConfigureDeliveryOpts(storageDir, bridge);
+
+    await deliverConfigureWarnings(opts, [
+      baseWarning(),
+      baseWarning({ kind: "checker_not_installed", tool: "tsc", hint: "Install typescript." }),
+    ]);
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    const body = showToast.mock.calls[0]?.[0]?.body?.message ?? "";
+    expect(body).toContain("Formatter is not installed");
+    expect(body).toContain("Checker is not installed");
   });
 
   test("plugin version bump does not re-fire stale warnings", async () => {
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
     const { bridge, send } = createStateBridge();
+    const { opts, showToast } = createConfigureDeliveryOpts(storageDir, bridge);
 
-    await deliverConfigureWarnings(
-      {
-        client,
-        sessionId: "session-1",
-        bridge,
-        storageDir,
-        pluginVersion: "1.0.0",
-        projectRoot: "/repo",
-      },
-      [baseWarning()],
-    );
-    await deliverConfigureWarnings(
-      {
-        client,
-        sessionId: "session-1",
-        bridge,
-        storageDir,
-        pluginVersion: "2.0.0",
-        projectRoot: "/repo",
-      },
-      [baseWarning()],
-    );
+    await deliverConfigureWarnings(opts, [baseWarning()]);
+    await deliverConfigureWarnings({ ...opts, pluginVersion: "2.0.0" }, [baseWarning()]);
 
-    expect(messages).toHaveLength(1);
+    expect(showToast).toHaveBeenCalledTimes(1);
     expect(dbSetCalls(send)).toHaveLength(1);
   });
 
   test("corrupt bridge state and missing storage_dir are non-fatal", async () => {
     const storageDir = createStorageDir();
     const missingStorageDir = join(storageDir, "missing", "nested");
-    const { client, messages } = createClient();
+    const toast = createToastClient();
     const { bridge } = createStateBridge("not json");
 
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -294,7 +276,7 @@ describe("deliverConfigureWarnings", () => {
     );
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir: missingStorageDir,
@@ -304,12 +286,12 @@ describe("deliverConfigureWarnings", () => {
       [baseWarning({ tool: "prettier", hint: "Install prettier." })],
     );
 
-    expect(messages).toHaveLength(2);
+    expect(toast.showToast).toHaveBeenCalledTimes(2);
   });
 
   test("lsp_binary_missing warnings dedup across project roots", async () => {
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
+    const toast = createToastClient();
     const { bridge } = createStateBridge();
     const warning = baseWarning({
       kind: "lsp_binary_missing",
@@ -322,7 +304,7 @@ describe("deliverConfigureWarnings", () => {
 
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -333,7 +315,7 @@ describe("deliverConfigureWarnings", () => {
     );
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -343,17 +325,17 @@ describe("deliverConfigureWarnings", () => {
       [warning],
     );
 
-    expect(messages).toHaveLength(1);
+    expect(toast.showToast).toHaveBeenCalledTimes(1);
   });
 
   test("formatter warnings remain project-scoped", async () => {
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
+    const toast = createToastClient();
     const { bridge } = createStateBridge();
 
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -364,7 +346,7 @@ describe("deliverConfigureWarnings", () => {
     );
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -374,28 +356,19 @@ describe("deliverConfigureWarnings", () => {
       [baseWarning()],
     );
 
-    expect(messages).toHaveLength(2);
+    expect(toast.showToast).toHaveBeenCalledTimes(2);
   });
 
   test("recordWarning_sends_db_set_state_with_merged_map", async () => {
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
     const { bridge, send } = createStateBridge();
-    const opts = {
-      client,
-      sessionId: "session-1",
-      bridge,
-      storageDir,
-      pluginVersion: "1.0.0",
-      projectRoot: "/repo",
-    };
+    const { opts } = createConfigureDeliveryOpts(storageDir, bridge);
 
     await deliverConfigureWarnings(opts, [baseWarning()]);
     await deliverConfigureWarnings(opts, [
       baseWarning({ kind: "checker_not_installed", tool: "tsc", hint: "Install typescript." }),
     ]);
 
-    expect(messages).toHaveLength(2);
     const sets = dbSetCalls(send);
     expect(sets).toHaveLength(2);
     const first = JSON.parse(sets[0].value) as Record<string, boolean>;
@@ -410,12 +383,12 @@ describe("deliverConfigureWarnings", () => {
     // db_get_state succeeds with a null value (configured bridge, nothing
     // recorded yet) → "fresh" → deliver once.
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
+    const toast = createToastClient();
     const { bridge } = createStateBridge(null);
 
     await deliverConfigureWarnings(
       {
-        client,
+        client: toast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -425,7 +398,7 @@ describe("deliverConfigureWarnings", () => {
       [baseWarning()],
     );
 
-    expect(messages).toHaveLength(1);
+    expect(toast.showToast).toHaveBeenCalledTimes(1);
   });
 
   test("does_not_deliver_when_state_read_fails_success_false", async () => {
@@ -461,12 +434,12 @@ describe("deliverConfigureWarnings", () => {
 
   test("skips_redelivery_when_key_already_recorded", async () => {
     const storageDir = createStorageDir();
-    const firstClient = createClient();
+    const toast = createToastClient();
     const first = createStateBridge();
 
     await deliverConfigureWarnings(
       {
-        client: firstClient.client,
+        client: toast.client,
         sessionId: "session-1",
         bridge: first.bridge,
         storageDir,
@@ -476,11 +449,11 @@ describe("deliverConfigureWarnings", () => {
       [baseWarning()],
     );
 
-    const { client, messages } = createClient();
+    const secondToast = createToastClient();
     const { bridge } = createStateBridge(first.value);
     await deliverConfigureWarnings(
       {
-        client,
+        client: secondToast.client,
         sessionId: "session-1",
         bridge,
         storageDir,
@@ -490,7 +463,105 @@ describe("deliverConfigureWarnings", () => {
       [baseWarning()],
     );
 
-    expect(messages).toHaveLength(0);
+    expect(secondToast.showToast).not.toHaveBeenCalled();
+  });
+
+  test("delivery chat writes ignored messages without agent", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    const { opts, messages } = createConfigureDeliveryOpts(storageDir, bridge, "chat");
+
+    await deliverConfigureWarnings(opts, [baseWarning()]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("🔧 AFT: ⚠️");
+    expect(dbSetCalls(send)).toHaveLength(1);
+  });
+
+  test("chat_delivery_omits_agent_from_prompt_body", async () => {
+    const storageDir = createStorageDir();
+    const { bridge } = createStateBridge();
+    const promptBodies: Array<Record<string, unknown>> = [];
+    const client = {
+      session: {
+        prompt(input: { body?: Record<string, unknown> }) {
+          if (input.body) promptBodies.push(input.body);
+        },
+      },
+    };
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "chat",
+      },
+      [baseWarning()],
+    );
+
+    expect(promptBodies).toHaveLength(1);
+    expect(promptBodies[0]?.agent).toBeUndefined();
+    expect(promptBodies[0]?.model).toBeUndefined();
+  });
+
+  test("chat_partial_delivery_records_only_successful_warnings", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    let calls = 0;
+    const client = {
+      session: {
+        prompt() {
+          calls += 1;
+          if (calls === 1) {
+            throw new Error("prompt failed");
+          }
+        },
+      },
+    };
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "chat",
+      },
+      [
+        baseWarning({ tool: "biome", hint: "first" }),
+        baseWarning({ tool: "prettier", hint: "second" }),
+      ],
+    );
+
+    expect(calls).toBe(2);
+    expect(dbSetCalls(send)).toHaveLength(1);
+  });
+
+  test("toast_delivery_when_tui_unavailable_still_records_warning", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    const client = {};
+
+    await deliverConfigureWarnings(
+      {
+        client,
+        sessionId: "session-1",
+        bridge,
+        storageDir,
+        pluginVersion: "1.0.0",
+        projectRoot: "/repo",
+        delivery: "toast",
+      },
+      [baseWarning()],
+    );
+
+    expect(dbSetCalls(send)).toHaveLength(1);
   });
 
   test("bridge_error_suppresses_delivery_and_is_non_fatal", async () => {
@@ -501,13 +572,13 @@ describe("deliverConfigureWarnings", () => {
     // once), while remaining non-fatal — deliverConfigureWarnings must still
     // resolve cleanly.
     const storageDir = createStorageDir();
-    const { client, messages } = createClient();
+    const toast = createToastClient();
     const { bridge } = createFailingBridge();
 
     await expect(
       deliverConfigureWarnings(
         {
-          client,
+          client: toast.client,
           sessionId: "session-1",
           bridge,
           storageDir,
@@ -517,7 +588,7 @@ describe("deliverConfigureWarnings", () => {
         [baseWarning()],
       ),
     ).resolves.toBeUndefined();
-    expect(messages).toHaveLength(0);
+    expect(toast.showToast).not.toHaveBeenCalled();
   });
 });
 
