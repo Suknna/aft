@@ -79,7 +79,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// version, so a logic-only change is invisible to existing caches unless the
 /// version moves. v6: dead_code now propagates liveness through dispatch-only
 /// method bodies (free fns reached only via `obj.method()` were false-dead).
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 6;
+/// v7: duplicates now collapses nested/overlapping fragments (a duplicated
+/// block no longer reports every nested subtree as its own group).
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 7;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1338,6 +1340,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 6);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 7);
     }
 }

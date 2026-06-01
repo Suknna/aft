@@ -347,19 +347,34 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         }
     }
 
+    // Collapse nested/overlapping duplicate fragments. tree-sitter records a
+    // duplicate hash for EVERY named subtree, so one duplicated block emits the
+    // outer node PLUS every nested descendant as a separate group — inflating
+    // the count by an order of magnitude (e.g. one shared file → dozens of
+    // overlapping groups). A duplicate fragment whose every occurrence is
+    // spatially enclosed by a LARGER duplicate fragment in the same file is
+    // redundant: its duplication is already implied by the enclosing block.
+    // Keep only "maximal" groups — those with at least one occurrence that is
+    // NOT enclosed by any other duplicate fragment. A group that is sometimes
+    // standalone (a shared idiom duplicated widely on its own AND nested inside
+    // a larger dup elsewhere) is preserved, because that standalone occurrence
+    // is unenclosed.
+    let surfaced_hashes = surfaced_duplicate_hashes(&by_hash);
+
     let mut groups = by_hash
-        .into_values()
-        .filter_map(|mut occurrences| {
+        .iter()
+        .filter(|(hash, occurrences)| {
+            occurrences.len() >= 2 && surfaced_hashes.contains(hash.as_str())
+        })
+        .map(|(_, occurrences)| {
+            let mut occurrences = occurrences.clone();
             occurrences.sort_by(|left, right| {
                 left.file
                     .cmp(&right.file)
                     .then(left.start_line.cmp(&right.start_line))
                     .then(left.end_line.cmp(&right.end_line))
             });
-            if occurrences.len() < 2 {
-                return None;
-            }
-            Some(occurrences_to_group(&occurrences))
+            occurrences_to_group(&occurrences)
         })
         .collect::<Vec<_>>();
 
@@ -387,6 +402,60 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         "scanned_files": parsed.len(),
         "languages_skipped": languages_skipped,
     })
+}
+
+/// Hashes of duplicate fragments that are "maximal" — i.e. have at least one
+/// occurrence NOT spatially enclosed by another duplicate fragment in the same
+/// file. A fragment whose every occurrence is enclosed by a larger duplicate
+/// fragment is collapsed away (its duplication is implied by the enclosing
+/// block). tree-sitter node spans nest properly, so within a file a stack of
+/// currently-open intervals yields each fragment's enclosing ancestors.
+fn surfaced_duplicate_hashes(
+    by_hash: &BTreeMap<String, Vec<FragmentOccurrence>>,
+) -> BTreeSet<String> {
+    // Per-file intervals, restricted to fragments whose hash is actually
+    // duplicated (>= 2 occurrences project-wide). Only such fragments can
+    // subsume — and only such fragments are eligible to surface.
+    let mut by_file: BTreeMap<&str, Vec<(u32, u32, &str)>> = BTreeMap::new();
+    for (hash, occurrences) in by_hash {
+        if occurrences.len() < 2 {
+            continue;
+        }
+        for occ in occurrences {
+            by_file.entry(occ.file.as_str()).or_default().push((
+                occ.start_line,
+                occ.end_line,
+                hash.as_str(),
+            ));
+        }
+    }
+
+    let mut surfaced = BTreeSet::new();
+    for intervals in by_file.values_mut() {
+        // Enclosing-first: a parent (smaller start, then larger end) precedes
+        // its descendants. Equal spans (a wrapper node and its sole child) sort
+        // adjacently; the first surfaces and the rest are treated as enclosed,
+        // collapsing the pair to one region.
+        intervals.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let mut open: Vec<(u32, u32)> = Vec::new();
+        for &(start, end, hash) in intervals.iter() {
+            while let Some(&(_, top_end)) = open.last() {
+                if top_end < start {
+                    open.pop();
+                } else {
+                    break;
+                }
+            }
+            // Unenclosed by any larger duplicate fragment in this file → this
+            // occurrence is maximal here, so the group surfaces.
+            if open.is_empty() {
+                surfaced.insert(hash.to_string());
+            }
+            open.push((start, end));
+        }
+    }
+
+    surfaced
 }
 
 fn skipped_languages_from_file_scans(file_scans: &[FileScan]) -> Vec<String> {
@@ -443,6 +512,113 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::Lua
             | LangId::Perl
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache_freshness::FileFreshness;
+    use serde_json::json;
+
+    fn freshness() -> FileFreshness {
+        FileFreshness {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            content_hash: blake3::hash(b""),
+        }
+    }
+
+    /// Build a duplicates FileContribution from (start, end, cost, hash) fragments.
+    fn contribution(file: &str, fragments: &[(u32, u32, u32, &str)]) -> FileContribution {
+        let frag_json = fragments
+            .iter()
+            .map(|(start, end, cost, hash)| {
+                json!({
+                    "hash": hash,
+                    "start_line": start,
+                    "end_line": end,
+                    "cost": cost,
+                })
+            })
+            .collect::<Vec<_>>();
+        FileContribution::new(
+            InspectCategory::Duplicates,
+            file,
+            freshness(),
+            json!({ "file": file, "fragments": frag_json }),
+        )
+    }
+
+    fn group_count(aggregate: &serde_json::Value) -> u64 {
+        aggregate["count"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn nested_fragments_of_one_duplicated_block_collapse_to_one_group() {
+        // A duplicated block (hash "block", lines 1-20) whose nested child
+        // (hash "child", lines 3-8) is ALSO duplicated across the same files.
+        // Without collapse this is 2 groups; the child is enclosed by the block
+        // in every occurrence, so it must collapse to 1 maximal group.
+        let contributions = vec![
+            contribution("src/a.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "child")]),
+            contribution("src/b.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "child")]),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+        assert_eq!(group_count(&aggregate), 1, "aggregate: {aggregate:#}");
+        assert_eq!(aggregate["items"][0]["cost"], 1000);
+    }
+
+    #[test]
+    fn widely_duplicated_idiom_survives_even_when_nested_elsewhere() {
+        // "idiom" is nested inside "block" in a.ts/b.ts, BUT also appears
+        // standalone (unenclosed) in c.ts/d.ts. Its standalone occurrences are
+        // maximal, so the idiom group must be preserved alongside the block.
+        let contributions = vec![
+            contribution("src/a.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "idiom")]),
+            contribution("src/b.ts", &[(1, 20, 1000, "block"), (3, 8, 400, "idiom")]),
+            contribution("src/c.ts", &[(40, 45, 400, "idiom")]),
+            contribution("src/d.ts", &[(70, 75, 400, "idiom")]),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+        assert_eq!(group_count(&aggregate), 2, "aggregate: {aggregate:#}");
+    }
+
+    #[test]
+    fn disjoint_sibling_duplications_are_both_kept() {
+        // Two unrelated duplicated blocks, side by side (no enclosure). Both
+        // are maximal → both kept.
+        let contributions = vec![
+            contribution("src/a.ts", &[(1, 10, 300, "alpha"), (20, 30, 300, "beta")]),
+            contribution("src/b.ts", &[(1, 10, 300, "alpha"), (20, 30, 300, "beta")]),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+        assert_eq!(group_count(&aggregate), 2, "aggregate: {aggregate:#}");
+    }
+
+    #[test]
+    fn non_duplicated_fragment_does_not_subsume() {
+        // The enclosing "block" appears only once (NOT duplicated), so it must
+        // not subsume the genuinely-duplicated nested "child". The child is the
+        // only real duplication and must surface.
+        let contributions = vec![
+            contribution(
+                "src/a.ts",
+                &[(1, 20, 1000, "uniqueA"), (3, 8, 400, "child")],
+            ),
+            contribution(
+                "src/b.ts",
+                &[(1, 20, 1000, "uniqueB"), (3, 8, 400, "child")],
+            ),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+        assert_eq!(group_count(&aggregate), 1, "aggregate: {aggregate:#}");
+        // The surfaced group is the child, not either unique block.
+        assert_eq!(aggregate["items"][0]["cost"], 400);
+    }
 }
 
 fn language_name(lang: LangId) -> &'static str {
