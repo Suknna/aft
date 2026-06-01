@@ -172,6 +172,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Compile-only gate that DENIES warnings. Catches cross-target warnings
+      # (e.g. unix-`cfg` code unused on Windows) that the mac/Linux clippy gates
+      # structurally cannot see, without running the flaky Windows test runtime.
+      # Registry deps are unaffected (cargo caps their lints to `allow`).
+      - name: Cargo check (deny warnings)
+        run: cargo check --workspace --all-targets
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-D warnings"
+
       - name: Cargo test
         run: cargo test --workspace
         shell: pwsh
