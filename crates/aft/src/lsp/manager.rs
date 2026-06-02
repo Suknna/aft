@@ -750,6 +750,19 @@ impl LspManager {
         &self.diagnostics
     }
 
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn diagnostics_store_mut_for_test(&mut self) -> &mut DiagnosticsStore {
+        &mut self.diagnostics
+    }
+
+    /// Error/warning counts across the entire warm diagnostics set (all files
+    /// any server has published for this session). Powers the agent status bar;
+    /// reads the continuously-drained store with no extra LSP round-trip.
+    pub fn warm_error_warning_counts(&self) -> (usize, usize) {
+        self.diagnostics.error_warning_counts()
+    }
+
     /// Snapshot the current per-server epoch for every entry that exists
     /// for `file_path`. Servers without an entry yet (never published)
     /// are absent from the map; for those, `pre = 0` (any first publish
@@ -1353,6 +1366,41 @@ impl LspManager {
         self.diagnostics.for_file(&normalized)
     }
 
+    /// Drop all cached diagnostics for a file across every server. Called when a
+    /// file is deleted/renamed away so its diagnostics don't linger in the warm
+    /// set (no server republishes for a vanished path), inflating the
+    /// error/warning counts in the status bar and `aft_inspect`.
+    ///
+    /// The store key is the canonical path from publish time, but a deleted file
+    /// can no longer be canonicalized directly (`canonicalize` needs the file to
+    /// exist). We therefore try several equivalent forms: the raw path, the
+    /// canonicalize-or-fallback form, and — crucially — a reconstruction that
+    /// canonicalizes the still-present parent directory and rejoins the file
+    /// name, which reproduces the publish-time key even across `/var`↔
+    /// `/private/var`-style symlink aliasing. Returns true if anything was
+    /// removed.
+    pub fn clear_diagnostics_for_file(&mut self, file: &Path) -> bool {
+        let mut removed = self.diagnostics.clear_for_file(file);
+
+        let normalized = normalize_lookup_path(file);
+        if normalized != file {
+            removed |= self.diagnostics.clear_for_file(&normalized);
+        }
+
+        // Reconstruct the canonical key via the parent dir (which still exists
+        // for a just-deleted file) so symlink-aliased roots still match.
+        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let reconstructed = canonical_parent.join(name);
+                if reconstructed != file && reconstructed != normalized {
+                    removed |= self.diagnostics.clear_for_file(&reconstructed);
+                }
+            }
+        }
+
+        removed
+    }
+
     pub fn get_diagnostics_for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         let normalized = normalize_lookup_path(dir);
         self.diagnostics.for_directory(&normalized)
@@ -1639,9 +1687,34 @@ fn failure_hint(binary: &str, stderr_tail: &str) -> String {
         format!(
             "Your package-manager shim resolves to a missing file. Try reinstalling: {package_manager} install -g {binary} --force. Common cause: hard-link breakage from fs migration or store prune."
         )
+    } else if let Some(component) = rustup_missing_component(stderr_tail) {
+        // The binary on PATH is rustup's proxy shim, but the toolchain
+        // component isn't installed, so rustup rejects the dispatch with
+        // "Unknown binary '<name>' in ... toolchain". The actionable fix is to
+        // add the component, not anything about the binary itself.
+        format!("'{component}' is a rustup proxy but the component is not installed. Install it: rustup component add {component}")
     } else {
         format!("Hint: see stderr above for '{binary}' failure details.")
     }
+}
+
+/// Detect the rustup "proxy shim without installed component" failure and
+/// return the component name to add. rustup prints
+/// `error: Unknown binary '<name>' in official toolchain '<triple>'` when a
+/// `~/.cargo/bin/<name>` proxy is on PATH but the component was never installed
+/// (the canonical case is `rust-analyzer`, which ships as an opt-in component).
+fn rustup_missing_component(stderr_tail: &str) -> Option<String> {
+    let marker = "Unknown binary '";
+    let start = stderr_tail.find(marker)? + marker.len();
+    let rest = &stderr_tail[start..];
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    // Only treat it as a rustup-component issue when the toolchain phrasing is
+    // present, so an unrelated "Unknown binary" message doesn't mislead.
+    if name.is_empty() || !stderr_tail.contains("toolchain") {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 fn infer_package_manager(stderr_tail: &str) -> &'static str {
@@ -1742,4 +1815,107 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
         .collect();
     let key = format!("AFT_LSP_{suffix}_BINARY");
     std::env::var_os(key).map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod failure_hint_tests {
+    use super::{failure_hint, rustup_missing_component};
+
+    #[test]
+    fn detects_rustup_proxy_without_component() {
+        // The exact rustup stderr for a proxy shim whose component is missing.
+        let stderr = "error: Unknown binary 'rust-analyzer' in official toolchain 'stable-aarch64-apple-darwin'.";
+        assert_eq!(
+            rustup_missing_component(stderr).as_deref(),
+            Some("rust-analyzer")
+        );
+        let hint = failure_hint("rust-analyzer", stderr);
+        assert!(
+            hint.contains("rustup component add rust-analyzer"),
+            "expected actionable rustup hint, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_binary_without_toolchain_phrasing() {
+        // "Unknown binary" without the rustup toolchain phrasing must not be
+        // misattributed to a rustup component issue.
+        let stderr = "fatal: Unknown binary 'foo' was requested by the linker.";
+        assert_eq!(rustup_missing_component(stderr), None);
+        assert!(failure_hint("foo", stderr).starts_with("Hint: see stderr"));
+    }
+
+    #[test]
+    fn npm_module_not_found_still_wins() {
+        // The existing package-manager-shim case is unaffected.
+        let stderr = "Error: Cannot find module '/x/typescript-language-server/lib/cli.mjs'";
+        let hint = failure_hint("typescript-language-server", stderr);
+        assert!(hint.contains("install -g"), "got: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod clear_diagnostics_tests {
+    use std::path::PathBuf;
+
+    use super::LspManager;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::lsp::roots::ServerKey;
+    use crate::lsp::registry::ServerKind;
+
+    fn err_diag(file: &PathBuf) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "boom".into(),
+            code: None,
+            source: None,
+        }
+    }
+
+    // A just-deleted file can no longer be canonicalized directly, but its
+    // store key was the canonical path from publish time. The manager must
+    // reconstruct that key via the still-present parent dir so symlink-aliased
+    // roots (macOS /var -> /private/var) still match and the diagnostic clears.
+    #[test]
+    fn clear_diagnostics_for_deleted_file_matches_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize the parent the way publish time would have.
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical_file = canonical_dir.join("gone.ts");
+        // Write then remove the file so its parent exists but the file does not,
+        // mirroring the post-delete state the watcher observes.
+        std::fs::write(&canonical_file, "x").unwrap();
+
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: canonical_dir.clone(),
+        };
+        manager
+            .diagnostics_store_mut_for_test()
+            .publish(key, canonical_file.clone(), vec![err_diag(&canonical_file)]);
+        assert_eq!(manager.warm_error_warning_counts(), (1, 0));
+
+        std::fs::remove_file(&canonical_file).unwrap();
+
+        // Clear by the NON-canonical path the watcher might hand us (the raw
+        // tempdir path, which on macOS differs from the canonical /private form).
+        let watcher_path = dir.path().join("gone.ts");
+        let removed = manager.clear_diagnostics_for_file(&watcher_path);
+
+        assert!(removed, "expected the deleted file's diagnostic to clear");
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
+
+    #[test]
+    fn clear_diagnostics_for_unknown_file_is_noop() {
+        let mut manager = LspManager::new();
+        assert!(!manager.clear_diagnostics_for_file(&PathBuf::from("/nope/missing.ts")));
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
 }

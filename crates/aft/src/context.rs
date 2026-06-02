@@ -33,6 +33,38 @@ pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 
+/// Agent status-bar counts — the IDE-style "status bar" surfaced to the agent
+/// on every tool result (emit-on-change). `errors`/`warnings` are read LIVE
+/// from the continuously-drained LSP diagnostics store; the Tier-2 counts
+/// (`dead_code`/`unused_exports`/`duplicates`) and `todos` are last-known,
+/// refreshed when `aft_inspect` runs or a background Tier-2 scan completes.
+/// `tier2_stale` marks the Tier-2 counts as not-yet-reconciled with the latest
+/// edits (rendered with a `~` marker so the agent never reads them as live).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusBarCounts {
+    pub errors: usize,
+    pub warnings: usize,
+    pub dead_code: usize,
+    pub unused_exports: usize,
+    pub duplicates: usize,
+    pub todos: usize,
+    pub tier2_stale: bool,
+}
+
+/// Last-known Tier-2 + todos counts, refreshed off the hot path. `errors` and
+/// `warnings` are intentionally NOT cached here — they're read live per attach.
+#[derive(Debug, Clone, Default)]
+struct StatusBarTier2 {
+    dead_code: usize,
+    unused_exports: usize,
+    duplicates: usize,
+    todos: usize,
+    stale: bool,
+    /// Set once the first refresh has populated real counts, so we never emit a
+    /// bar claiming "0 dead code" before any scan has actually run.
+    populated: bool,
+}
+
 pub struct StatusEmitter {
     latest: Arc<Mutex<Option<StatusPayload>>>,
     notify: mpsc::Sender<()>,
@@ -515,6 +547,10 @@ pub struct AppContext {
     /// root is configured or when the project has no gitignore files; in that
     /// case the watcher falls back to a small hardcoded infra-directory skip.
     gitignore: RefCell<Option<Arc<ignore::gitignore::Gitignore>>>,
+    /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
+    /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
+    /// Errors/warnings are read live and not stored here.
+    status_bar_tier2: RefCell<StatusBarTier2>,
 }
 
 impl AppContext {
@@ -576,7 +612,64 @@ impl AppContext {
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: RefCell::new(None),
+            status_bar_tier2: RefCell::new(StatusBarTier2::default()),
         }
+    }
+
+    /// Current agent status-bar counts. `errors`/`warnings` are read LIVE from
+    /// the LSP diagnostics store (continuously drained, no round-trip); the
+    /// Tier-2 + todos counts are the last-known cached values. Returns `None`
+    /// until the Tier-2 cache has been populated at least once, so we never
+    /// surface a bar that misleadingly claims "0 dead code" before any scan.
+    pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
+        let tier2 = self.status_bar_tier2.borrow();
+        if !tier2.populated {
+            return None;
+        }
+        let (errors, warnings) = self.lsp_manager.borrow().warm_error_warning_counts();
+        Some(StatusBarCounts {
+            errors,
+            warnings,
+            dead_code: tier2.dead_code,
+            unused_exports: tier2.unused_exports,
+            duplicates: tier2.duplicates,
+            todos: tier2.todos,
+            tier2_stale: tier2.stale,
+        })
+    }
+
+    /// Mark the status-bar Tier-2 counts stale (rendered with `~`) without
+    /// changing the numbers — called when the watcher sees a source-file change,
+    /// so the bar honestly signals the counts predate the latest edit until the
+    /// next background scan completes. No-op before the first populate.
+    pub fn mark_status_bar_tier2_stale(&self) {
+        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        if tier2.populated {
+            tier2.stale = true;
+        }
+    }
+
+    /// Refresh the cached Tier-2 + todos counts for the status bar. `stale`
+    /// marks the Tier-2 numbers as not-yet-reconciled with the latest edits.
+    /// `todos` is `None` when the caller didn't recompute it (preserves the
+    /// last-known todo count).
+    pub fn update_status_bar_tier2(
+        &self,
+        dead_code: usize,
+        unused_exports: usize,
+        duplicates: usize,
+        todos: Option<usize>,
+        stale: bool,
+    ) {
+        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        tier2.dead_code = dead_code;
+        tier2.unused_exports = unused_exports;
+        tier2.duplicates = duplicates;
+        if let Some(todos) = todos {
+            tier2.todos = todos;
+        }
+        tier2.stale = stale;
+        tier2.populated = true;
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no
@@ -1303,6 +1396,19 @@ impl AppContext {
         }
     }
 
+    /// Drop cached LSP diagnostics for a deleted/renamed-away file so its
+    /// errors/warnings don't linger in the warm set (no server republishes for
+    /// a vanished path), keeping the status bar and `aft_inspect` honest.
+    /// Returns true if any entry was removed. Best-effort: a contended borrow is
+    /// skipped silently (the watcher drain retries on subsequent events).
+    pub fn lsp_clear_diagnostics_for_file(&self, file_path: &Path) -> bool {
+        if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
+            lsp.clear_diagnostics_for_file(file_path)
+        } else {
+            false
+        }
+    }
+
     /// Notify LSP and optionally wait for diagnostics.
     ///
     /// Call this after `write_format_validate` when the request has `"diagnostics": true`.
@@ -1725,6 +1831,106 @@ mod status_emitter_tests {
         let (ctx, rx) = ctx_with_frame_rx();
         drop(ctx);
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx() -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn status_bar_counts_none_until_tier2_populated() {
+        let ctx = ctx();
+        // No scan has run yet — never surface a bar claiming "0 dead code".
+        assert!(ctx.status_bar_counts().is_none());
+
+        ctx.update_status_bar_tier2(5, 3, 7, Some(2), false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.dead_code, 5);
+        assert_eq!(counts.unused_exports, 3);
+        assert_eq!(counts.duplicates, 7);
+        assert_eq!(counts.todos, 2);
+        assert!(!counts.tier2_stale);
+        // Errors/warnings are read live from an empty LSP store → 0.
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.warnings, 0);
+    }
+
+    #[test]
+    fn update_with_none_todos_preserves_last_known_todos() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(1, 1, 1, Some(9), false);
+        // A background-scan refresh passes todos=None → todo count preserved.
+        ctx.update_status_bar_tier2(2, 2, 2, None, false);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!(counts.todos, 9);
+        assert_eq!(counts.dead_code, 2);
+    }
+
+    #[test]
+    fn mark_stale_sets_flag_only_after_populate() {
+        let ctx = ctx();
+        // No-op before first populate.
+        ctx.mark_status_bar_tier2_stale();
+        assert!(ctx.status_bar_counts().is_none());
+
+        ctx.update_status_bar_tier2(4, 0, 0, Some(0), false);
+        ctx.mark_status_bar_tier2_stale();
+        assert!(ctx.status_bar_counts().expect("populated").tier2_stale);
+
+        // A completed scan clears stale.
+        ctx.update_status_bar_tier2(4, 0, 0, None, false);
+        assert!(!ctx.status_bar_counts().expect("populated").tier2_stale);
+    }
+
+    // End-to-end wiring: a diagnostic for a file inflates the status-bar `E`
+    // count (read live from the warm LSP set); clearing that file's diagnostics
+    // (the deleted-file path) drops it back. This is the AppContext glue between
+    // the watcher-drain clear and the agent-visible bar.
+    #[test]
+    fn clearing_diagnostics_for_deleted_file_drops_status_bar_errors() {
+        use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(0, 0, 0, Some(0), false); // populate so the bar surfaces
+
+        let file = std::path::PathBuf::from("/proj/gone.ts");
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test().publish(
+                ServerKey {
+                    kind: ServerKind::TypeScript,
+                    root: std::path::PathBuf::from("/proj"),
+                },
+                file.clone(),
+                vec![StoredDiagnostic {
+                    file: file.clone(),
+                    line: 1,
+                    column: 1,
+                    end_line: 1,
+                    end_column: 2,
+                    severity: DiagnosticSeverity::Error,
+                    message: "boom".into(),
+                    code: None,
+                    source: None,
+                }],
+            );
+        }
+
+        // Bar reflects the live warm-set error.
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+
+        // Clearing the (now-deleted) file's diagnostics drops the count.
+        let removed = ctx.lsp_clear_diagnostics_for_file(&file);
+        assert!(removed);
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
     }
 }
 

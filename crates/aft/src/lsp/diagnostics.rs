@@ -276,6 +276,24 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// Count of errors and warnings across the entire warm set (every file any
+    /// server has published for). Allocation-free — used to refresh the agent
+    /// status bar on each request drain without materializing a Vec.
+    pub fn error_warning_counts(&self) -> (usize, usize) {
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for entry in self.entries.values() {
+            for diagnostic in &entry.diagnostics {
+                match diagnostic.severity {
+                    DiagnosticSeverity::Error => errors += 1,
+                    DiagnosticSeverity::Warning => warnings += 1,
+                    _ => {}
+                }
+            }
+        }
+        (errors, warnings)
+    }
+
     /// Drop all entries for a server kind (e.g., on server crash/restart).
     /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
     /// same kind are not wiped.
@@ -294,6 +312,24 @@ impl DiagnosticsStore {
         self.entries.remove(&cache_key);
         self.order.retain(|entry_key| entry_key != &cache_key);
         self.last_publish_at_for_file.remove(&cache_key);
+    }
+
+    /// Drop every cached report for a file across all servers. Used when a file
+    /// is deleted/renamed away — its diagnostics would otherwise linger in the
+    /// warm set forever (no server republishes for a path that no longer
+    /// exists), inflating the error/warning counts surfaced in the status bar
+    /// and `aft_inspect`. Returns true if any entry was removed.
+    pub fn clear_for_file(&mut self, file: &Path) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|(_, stored_file), _| stored_file != file);
+        let removed = self.entries.len() != before;
+        if removed {
+            self.order.retain(|(_, stored_file)| stored_file != file);
+            self.last_publish_at_for_file
+                .retain(|(_, stored_file), _| stored_file != file);
+        }
+        removed
     }
 
     /// Drop all entries for a specific server instance.
@@ -728,5 +764,48 @@ mod tests {
         store.clear_server(ServerKind::Python);
         assert!(!store.has_any_report_for_file(Path::new("/a.py")));
         assert!(store.has_any_report_for_file(Path::new("/b.rs")));
+    }
+
+    #[test]
+    fn clear_for_file_drops_every_server_entry_and_updates_counts() {
+        let mut store = DiagnosticsStore::new();
+        let py_key = server_key(ServerKind::Python);
+        let biome_key = server_key(ServerKind::Biome);
+
+        // Two servers both report for the SAME deleted file, plus an unrelated
+        // file that must survive.
+        store.publish(
+            py_key,
+            PathBuf::from("/gone.ts"),
+            vec![diag("/gone.ts", 4, "type error", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            biome_key,
+            PathBuf::from("/gone.ts"),
+            vec![diag(
+                "/gone.ts",
+                7,
+                "lint warning",
+                DiagnosticSeverity::Warning,
+            )],
+        );
+        store.publish(
+            server_key(ServerKind::Rust),
+            PathBuf::from("/keep.rs"),
+            vec![diag("/keep.rs", 1, "live error", DiagnosticSeverity::Error)],
+        );
+
+        assert_eq!(store.error_warning_counts(), (2, 1));
+
+        // Clearing the deleted file drops both server entries for it.
+        let removed = store.clear_for_file(Path::new("/gone.ts"));
+        assert!(removed);
+        assert!(!store.has_any_report_for_file(Path::new("/gone.ts")));
+        // The unrelated file's diagnostic is untouched.
+        assert!(store.has_any_report_for_file(Path::new("/keep.rs")));
+        assert_eq!(store.error_warning_counts(), (1, 0));
+
+        // Clearing again is a no-op (nothing left for that file).
+        assert!(!store.clear_for_file(Path::new("/gone.ts")));
     }
 }

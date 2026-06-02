@@ -188,6 +188,7 @@ fn main() {
                 match dispatch_result {
                     Ok(mut response) => {
                         attach_bg_completions(&mut response, &ctx, &session_id, &command);
+                        attach_status_bar(&mut response, &ctx, &command);
                         response
                     }
                     Err(payload) => {
@@ -387,7 +388,19 @@ fn drain_configure_warning_events(ctx: &AppContext) {
 }
 
 fn drain_inspect_events(ctx: &AppContext) {
-    ctx.inspect_manager().drain_completions();
+    let drained = ctx.inspect_manager().drain_completions();
+    // A completed background Tier-2 scan refreshes the agent status-bar counts
+    // to the freshly-persisted aggregate, and clears the stale marker — so the
+    // bar reflects the new numbers on the next tool result without waiting for
+    // an explicit aft_inspect call.
+    if drained > 0 {
+        if let Some(project_root) = ctx.config().project_root.clone() {
+            let (dead_code, unused_exports, duplicates) = ctx
+                .inspect_manager()
+                .latest_tier2_counts(ctx.inspect_dir(), project_root);
+            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, false);
+        }
+    }
 }
 
 fn attach_bg_completions(
@@ -422,6 +435,51 @@ fn attach_bg_completions(
         }
         None => {
             response.data = serde_json::json!({ "bg_completions": value });
+        }
+    }
+}
+
+/// Attach the agent status-bar counts to the response envelope so the plugin
+/// after-hook can surface the IDE-style status bar (emit-on-change). Skips
+/// internal/transport commands that don't represent agent tool calls (their
+/// responses never reach the agent, and bash-lifecycle commands fire rapidly).
+/// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
+/// last-known. Omitted entirely until the Tier-2 cache is populated once.
+fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
+    if matches!(
+        command,
+        "configure"
+            | "ping"
+            | "version"
+            | "status"
+            | "bash_status"
+            | "bash_write"
+            | "bash_promote"
+            | "bash_drain_completions"
+            | "bash_notify"
+            | "bash_unnotify"
+            | "bash_ack_completions"
+    ) {
+        return;
+    }
+    let Some(counts) = ctx.status_bar_counts() else {
+        return;
+    };
+    let value = serde_json::json!({
+        "errors": counts.errors,
+        "warnings": counts.warnings,
+        "dead_code": counts.dead_code,
+        "unused_exports": counts.unused_exports,
+        "duplicates": counts.duplicates,
+        "todos": counts.todos,
+        "tier2_stale": counts.tier2_stale,
+    });
+    match response.data.as_object_mut() {
+        Some(data) => {
+            data.insert("status_bar".to_string(), value);
+        }
+        None => {
+            response.data = serde_json::json!({ "status_bar": value });
         }
     }
 }
@@ -1067,6 +1125,11 @@ fn drain_watcher_events(ctx: &AppContext) {
         return;
     }
 
+    // A real source change makes the last-known Tier-2 counts stale until the
+    // next background scan reconciles them — surface that in the status bar
+    // immediately (the `~` marker) so the agent never reads them as live.
+    ctx.mark_status_bar_tier2_stale();
+
     if ctx.search_index_rx().borrow().is_some() {
         ctx.add_pending_search_index_paths(changed.iter().cloned());
     }
@@ -1133,6 +1196,19 @@ fn drain_watcher_events(ctx: &AppContext) {
 
     drop(semantic_index_ref);
     drop(index_ref);
+
+    // A vanished file's LSP diagnostics would otherwise linger in the warm set
+    // forever (no server republishes for a path that no longer exists),
+    // inflating the error/warning counts in the status bar and `aft_inspect`.
+    // Clear them here so every deletion source is covered (AFT delete, `rm`,
+    // `git checkout`, branch switch) — not just the delete command. The agent
+    // status bar reads E/W live from the warm set on each response, so clearing
+    // the store is sufficient; the next tool call's bar reflects the new count.
+    for path in &changed {
+        if !path.exists() && watcher_path_is_source(path) {
+            ctx.lsp_clear_diagnostics_for_file(path);
+        }
+    }
 
     if !semantic_refresh_paths.is_empty() {
         let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {

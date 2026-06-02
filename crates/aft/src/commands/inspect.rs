@@ -69,8 +69,52 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.request_tier2_refresh_pull();
     }
 
+    refresh_status_bar_counts(ctx, &outcomes);
+
     let payload = build_inspect_payload(&snapshot, &outcomes, &sections, top_k, ctx);
     Response::success(&req.id, payload)
+}
+
+/// Refresh the agent status-bar's last-known Tier-2 + todos counts from the
+/// outcomes just computed. Tier-2 counts come from whatever the read-only cache
+/// returned (Fresh or Stale-cached); a Stale/Pending outcome marks them stale
+/// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
+/// they're read live from the LSP store at attach time.
+fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
+    let count_of = |category: InspectCategory| -> usize {
+        outcomes
+            .get(&category)
+            .and_then(JobOutcome::payload)
+            .and_then(|payload| payload.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+    let any_tier2_stale = [
+        InspectCategory::DeadCode,
+        InspectCategory::UnusedExports,
+        InspectCategory::Duplicates,
+    ]
+    .iter()
+    .any(|category| {
+        matches!(
+            outcomes.get(category),
+            Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. })
+        )
+    });
+    let todos = outcomes
+        .get(&InspectCategory::Todos)
+        .and_then(JobOutcome::payload)
+        .and_then(|payload| payload.get("count"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize);
+
+    ctx.update_status_bar_tier2(
+        count_of(InspectCategory::DeadCode),
+        count_of(InspectCategory::UnusedExports),
+        count_of(InspectCategory::Duplicates),
+        todos,
+        any_tier2_stale,
+    );
 }
 
 pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response {
