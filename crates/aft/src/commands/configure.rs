@@ -533,31 +533,9 @@ fn required_string(value: Option<&Value>, index: usize, field: &str) -> Result<S
     Ok(raw.to_string())
 }
 
-fn required_string_array(
-    value: Option<&Value>,
-    index: usize,
-    field: &str,
-) -> Result<Vec<String>, String> {
-    let values = optional_string_array(value, index, field)?;
-    if values.is_empty() {
-        return Err(format!(
-            "configure: lsp_servers[{index}].{field} must not be empty"
-        ));
-    }
-    Ok(values)
-}
-
-fn required_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
-    let values = required_string_array(value, index, "extensions")?;
-    Ok(values
-        .into_iter()
-        .map(|value| value.trim_start_matches('.').to_string())
-        .collect())
-}
-
-/// Like `required_extension_array` but treats an absent value as an empty list
-/// (no validation error). Used so a partial override of a built-in server can
-/// omit `extensions` and inherit the built-in's set downstream.
+/// Parse the `extensions` array for an LSP server override. An absent value is
+/// an empty list (no validation error) so a partial override of a built-in
+/// server can omit `extensions` and inherit the built-in's set downstream.
 fn optional_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
     let values = optional_string_array(value, index, "extensions")?;
     Ok(values
