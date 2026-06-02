@@ -1860,8 +1860,8 @@ mod clear_diagnostics_tests {
 
     use super::LspManager;
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-    use crate::lsp::roots::ServerKey;
     use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
 
     fn err_diag(file: &PathBuf) -> StoredDiagnostic {
         StoredDiagnostic {
@@ -1896,9 +1896,11 @@ mod clear_diagnostics_tests {
             kind: ServerKind::TypeScript,
             root: canonical_dir.clone(),
         };
-        manager
-            .diagnostics_store_mut_for_test()
-            .publish(key, canonical_file.clone(), vec![err_diag(&canonical_file)]);
+        manager.diagnostics_store_mut_for_test().publish(
+            key,
+            canonical_file.clone(),
+            vec![err_diag(&canonical_file)],
+        );
         assert_eq!(manager.warm_error_warning_counts(), (1, 0));
 
         std::fs::remove_file(&canonical_file).unwrap();
