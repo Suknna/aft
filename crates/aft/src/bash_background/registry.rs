@@ -1853,7 +1853,13 @@ impl BgTaskRegistry {
                 state.pending_terminal_override = None;
                 task.mark_terminal_now();
                 match &mut state.runtime {
-                    TaskRuntime::Piped(child) => *child = None,
+                    // Exit marker already present: the child finished on its
+                    // own before this kill observed it. Reap it rather than
+                    // dropping the handle so it doesn't become a zombie
+                    // (issue #91). The active-kill branch below already
+                    // `wait()`s after signaling, so this is the only kill
+                    // path that needed the explicit reap.
+                    TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
                     TaskRuntime::Pty(runtime) => *runtime = None,
                 }
                 state.detached = true;
@@ -2033,7 +2039,11 @@ impl BgTaskRegistry {
             state.metadata = updated;
             task.mark_terminal_now();
             match &mut state.runtime {
-                TaskRuntime::Piped(child) => *child = None,
+                // Reap the exited direct child instead of dropping it, so it
+                // does not linger as a `<defunct>` zombie (issue #91). The
+                // wrapper writes the exit marker as its final act, so the
+                // child is already exiting and `wait()` returns immediately.
+                TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
                 TaskRuntime::Pty(runtime) => {
                     pty_reader_done = runtime
                         .as_ref()
@@ -2946,6 +2956,44 @@ impl BgTask {
     }
 }
 
+/// Reap an exited direct child handle, then clear the slot.
+///
+/// Dropping a [`std::process::Child`] does NOT `wait()` on the underlying OS
+/// process. On Unix a finished-but-unreaped child lingers as a `<defunct>`
+/// zombie until the AFT process itself exits (issue #91: `[mv] <defunct>`).
+/// The terminal-transition paths that learn of completion from the
+/// exit-marker file — rather than from [`BgTaskRegistry::reap_child`]'s
+/// `try_wait()` — must therefore reap the handle explicitly instead of just
+/// nulling it.
+///
+/// The exit marker is written by the wrapper's final statement (an atomic
+/// `mv` rename), so by the time we observe the marker the direct child has
+/// finished its work and is exiting; `wait()` returns essentially
+/// immediately. We attempt a non-blocking `try_wait()` first so the common
+/// case never blocks at all, falling back to a (bounded) `wait()` only to
+/// cover the microsecond window between the rename and process teardown.
+///
+/// Callers hold the task state mutex, so this is serialized against
+/// `reap_child` — there is no double-`wait()` hazard: whichever path acquires
+/// the lock first reaps and clears the slot, and the other observes `None`.
+#[cfg(unix)]
+fn reap_piped_child(child_slot: &mut Option<Child>) {
+    if let Some(mut child) = child_slot.take() {
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Windows has no zombie/`<defunct>` concept: dropping the [`Child`] closes
+/// the process handle, which is the correct release. Preserve the historical
+/// behavior of simply clearing the slot so the documented Windows PID-recycle
+/// handling in `reap_child` is unaffected.
+#[cfg(windows)]
+fn reap_piped_child(child_slot: &mut Option<Child>) {
+    *child_slot = None;
+}
+
 fn terminal_metadata_from_marker(
     mut metadata: PersistedTask,
     marker: ExitMarker,
@@ -3816,6 +3864,243 @@ mod tests {
             state.metadata.status,
             BgTaskStatus::Running,
             "reap_child must defer to poll_task when marker exists"
+        );
+    }
+
+    /// Read a process's `ps` state string ("Z", "S", "R", etc). Returns
+    /// `None` once the PID has been fully reaped (no row), which is the
+    /// post-reap state we want.
+    #[cfg(unix)]
+    fn pid_stat(pid: u32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stat.is_empty() {
+            None
+        } else {
+            Some(stat)
+        }
+    }
+
+    /// A `<defunct>` zombie carries `ps` state starting with 'Z'.
+    #[cfg(unix)]
+    fn is_zombie(pid: u32) -> bool {
+        pid_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
+    }
+
+    /// Spawn a child that exits immediately and wait — via `ps`, NOT
+    /// `try_wait()`/`wait()` — until it is observably a `<defunct>` zombie,
+    /// then return the still-unreaped handle. This reproduces the exact
+    /// state issue #91 leaves behind: an exited OS child whose parent has
+    /// not reaped it.
+    #[cfg(unix)]
+    fn spawn_unreaped_zombie() -> std::process::Child {
+        let child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn zombie stand-in");
+        let pid = child.id();
+        let started = Instant::now();
+        while !is_zombie(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "stand-in child should become a zombie within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Return WITHOUT reaping — the handle still owns an unwaited zombie.
+        child
+    }
+
+    /// Regression test for issue #91: the exit-marker terminal path
+    /// (`poll_task` -> `finalize_from_marker`) must REAP the direct child
+    /// handle, not merely drop it. Dropping a `std::process::Child` does not
+    /// `wait()` on Unix, so the exited child lingers as a `[mv] <defunct>`
+    /// zombie until AFT exits.
+    ///
+    /// We install a known-unreaped zombie into the task's child slot and
+    /// drive the marker finalize path, then assert the child is gone (reaped)
+    /// rather than still `<defunct>`.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_from_marker_reaps_child_no_zombie() {
+        use std::sync::atomic::Ordering;
+
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+
+        // Stop the watchdog so the ONLY terminal-transition path under test
+        // is the exit-marker finalize (not reap_child's try_wait, which would
+        // reap the child for us and mask the bug).
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        // Wait for the wrapper's exit marker to land. We deliberately do NOT
+        // call try_wait()/wait() on the real child here — doing so would reap
+        // it and defeat the test.
+        let started = Instant::now();
+        while !task.paths.exit.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "exit marker should land quickly for `true`"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Reset to a fresh Running shape and install a guaranteed-unreaped
+        // zombie as the child handle, so the finalize path's reap behavior is
+        // exercised deterministically regardless of how the real child was
+        // handled. Persist Running so update_task's terminal-rollback guard
+        // sees a non-terminal starting point.
+        let zombie_pid;
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            state.metadata.exit_code = None;
+            state.metadata.finished_at = None;
+            state.metadata.duration_ms = None;
+            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
+                .expect("persist reset Running metadata");
+            let zombie = spawn_unreaped_zombie();
+            zombie_pid = zombie.id();
+            state.runtime = TaskRuntime::Piped(Some(zombie));
+        }
+        *task.terminal_at.lock().unwrap() = None;
+
+        // Precondition: the installed child is genuinely a `<defunct>` zombie.
+        assert!(
+            is_zombie(zombie_pid),
+            "precondition: stand-in child {zombie_pid} must be a zombie before finalize"
+        );
+
+        // Drive the exit-marker terminal path. Before the fix this nulled the
+        // Child handle without wait(), leaving the zombie behind.
+        registry.poll_task(&task).unwrap();
+
+        {
+            let state = task.state.lock().unwrap();
+            assert!(
+                matches!(state.runtime, TaskRuntime::Piped(None)),
+                "child handle must be released after marker finalize"
+            );
+            assert!(
+                state.metadata.status.is_terminal(),
+                "task must be terminal after marker finalize: {:?}",
+                state.metadata.status
+            );
+        }
+
+        // The core assertion: the child must have been REAPED, not just
+        // dropped. A reaped PID has no `ps` row (or at minimum is not 'Z').
+        assert!(
+            !is_zombie(zombie_pid),
+            "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
+             after the exit-marker terminal transition"
+        );
+    }
+
+    /// Companion to the above for the kill path: when a kill observes an
+    /// already-present exit marker (the child finished on its own first), it
+    /// must reap the child handle rather than dropping it.
+    #[cfg(unix)]
+    #[test]
+    fn kill_with_existing_marker_reaps_child_no_zombie() {
+        use std::sync::atomic::Ordering;
+
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        let started = Instant::now();
+        while !task.paths.exit.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "exit marker should land quickly for `true`"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let zombie_pid;
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            state.metadata.exit_code = None;
+            state.metadata.finished_at = None;
+            state.metadata.duration_ms = None;
+            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
+                .expect("persist reset Running metadata");
+            let zombie = spawn_unreaped_zombie();
+            zombie_pid = zombie.id();
+            state.runtime = TaskRuntime::Piped(Some(zombie));
+        }
+        *task.terminal_at.lock().unwrap() = None;
+
+        assert!(
+            is_zombie(zombie_pid),
+            "precondition: stand-in child {zombie_pid} must be a zombie before kill"
+        );
+
+        // Kill observes the existing marker and finalizes from it.
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .expect("kill should succeed");
+
+        {
+            let state = task.state.lock().unwrap();
+            assert!(
+                matches!(state.runtime, TaskRuntime::Piped(None)),
+                "child handle must be released after marker-aware kill"
+            );
+            assert!(state.metadata.status.is_terminal());
+        }
+
+        assert!(
+            !is_zombie(zombie_pid),
+            "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
+             after a marker-aware kill"
         );
     }
 
